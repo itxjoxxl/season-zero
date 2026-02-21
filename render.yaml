@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: stremio-tmdb-best-of
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node addon.js
+    envVars:
+      - key: PORT
+        value: 10000
+    healthCheckPath: /manifest.json
