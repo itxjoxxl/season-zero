@@ -38,24 +38,6 @@ function parseConfig(str) {
   catch { return {}; }
 }
 
-// Some Stremio clients URL-encode the ':' in IDs (bestof%3A123).
-// Normalize IDs so both "bestof:123" and "bestof%3A123" work everywhere.
-function normalizeId(raw) {
-  try { return decodeURIComponent(raw); } catch (e) { return raw; }
-}
-
-// customSeasons can be stored as either:
-//  - { [tmdbId]: [{season, episode}, ...] }  (what we put in the manifest config)
-//  - { [tmdbId]: { episodes: [{season, episode}, ...] } } (legacy UI state shape)
-// This helper makes the server tolerant to both.
-function getCustomList(customSeasons, tmdbId) {
-  const v = customSeasons && customSeasons[tmdbId];
-  if (!v) return [];
-  if (Array.isArray(v)) return v;
-  if (v && Array.isArray(v.episodes)) return v.episodes;
-  return [];
-}
-
 async function tmdb(path, apiKey, params = {}) {
   const url = new URL(TMDB_BASE + path);
   url.searchParams.set('api_key', apiKey);
@@ -258,7 +240,7 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
     const metas = (await Promise.all(tmdbIds.map(async function(tmdbId) {
       try {
         const series  = await getSeries(tmdbId, apiKey);
-                const epCount = getCustomList(customSeasons, tmdbId).length;
+        const epCount = (customSeasons[tmdbId] || []).length;
         return {
           id:          'bestof:' + tmdbId,
           type:        'series',
@@ -283,13 +265,13 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
 // Virtual series with only the user's hand-picked episodes. Video IDs use the
 // real IMDB tt:season:episode format so stream addons (Torrentio etc.) find them.
 // Must be registered before the generic /:config/meta/series/:id route.
-async function handleBestOfMeta(req, res) {
+app.get('/:config/meta/series/bestof\::tmdbId.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
   const apiKey = cfg.tmdbApiKey;
   const tmdbId = req.params.tmdbId;
   if (!apiKey) return res.status(400).json({ err: 'No API key' });
   const customSeasons = cfg.customSeasons || {};
-    const customList    = getCustomList(customSeasons, tmdbId);
+  const customList    = customSeasons[tmdbId];
   if (!customList || !customList.length) return res.json({ meta: null });
   try {
     const series = await getSeries(tmdbId, apiKey);
@@ -347,9 +329,7 @@ async function handleBestOfMeta(req, res) {
     console.error('[bestof meta]', e.message);
     res.status(500).json({ err: e.message });
   }
-}
-
-app.get('/:config/meta/series/bestof\::tmdbId.json', handleBestOfMeta);
+});
 
 // ─── CATALOG ENDPOINT ────────────────────────────────────────────────────────
 app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
@@ -486,8 +466,7 @@ app.get('/api/genres', async function(req, res) {
 // ─── META ENDPOINTS ──────────────────────────────────────────────────────────
 app.get('/:config/meta/movie/:id.json', async function(req, res) {
   const config = req.params.config;
-  const rawId  = req.params.id;
-  const id     = normalizeId(rawId);
+  const id     = req.params.id;
   const cfg    = parseConfig(config);
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
   if (!id.startsWith('tmdb:')) return res.json({ meta: null });
@@ -529,20 +508,9 @@ app.get('/:config/meta/movie/:id.json', async function(req, res) {
 
 app.get('/:config/meta/series/:id.json', async function(req, res) {
   const config = req.params.config;
-  const rawId  = req.params.id;
-  const id     = normalizeId(rawId);
+  const id     = req.params.id;
   const cfg    = parseConfig(config);
-
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
-
-  // Handle custom Best Of virtual series IDs, even if the ':' was URL-encoded.
-  if (id.startsWith('bestof:')) {
-    const tmdbId = id.split(':')[1];
-    // Reuse the dedicated Best Of handler by calling it directly.
-    req.params.tmdbId = tmdbId;
-    return handleBestOfMeta(req, res);
-  }
-
   if (!id.startsWith('tmdb:')) return res.json({ meta: null });
 
   const tmdbId = extractId(id);
@@ -628,8 +596,7 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
 
 app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
   const config = req.params.config;
-  const rawId  = req.params.id;
-  const id     = normalizeId(rawId);
+  const id     = req.params.id;
   const cfg    = parseConfig(config);
   if (!cfg.tmdbApiKey) return res.json({ videos: [] });
 
@@ -646,7 +613,7 @@ app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
   try {
     const series        = await getSeries(tmdbId, cfg.tmdbApiKey);
     const customSeasons = cfg.customSeasons || {};
-        const customList    = getCustomList(customSeasons, tmdbId);
+    const customList    = customSeasons[tmdbId];
     let target;
 
     if (customList && customList.length > 0) {
