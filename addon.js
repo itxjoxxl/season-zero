@@ -191,7 +191,7 @@ function buildManifest(config) {
     { id: 'tmdb.search_series',  type: 'series', name: 'TMDB Search Series',  extra: [{ name: 'search', isRequired: true }] },
   ];
 
-  const resources = ['catalog', 'meta', 'episodeVideos'];
+  const resources = ['catalog', 'meta'];
 
   return {
     id:          'community.tmdb-metadata-bestof',
@@ -443,6 +443,12 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       bestOfEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
     }
 
+    // Use IMDB ID + real season/episode numbers in video IDs.
+    // Stream addons (Torrentio etc.) filter by idPrefixes: ["tt"], so they only
+    // receive stream requests for tt-prefixed IDs. Using season:0 + rank is also
+    // meaningless to them — they need the real season and episode numbers.
+    const imdbId = series.external_ids && series.external_ids.imdb_id;
+
     bestOfEps.forEach(function(ep, i) {
       const rank   = i + 1;
       const sLabel = String(ep.season).padStart(2, '0');
@@ -450,11 +456,16 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       const ratingLine = ep.vote_average > 0
         ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n'
         : '';
+      // Use tt_id:realSeason:realEpisode so Torrentio and other tt-prefix stream
+      // addons can look up the actual episode. Fall back to tmdb:id:s:e if no IMDB ID.
+      const videoId = imdbId
+        ? imdbId + ':' + ep.season + ':' + ep.episode
+        : id + ':' + ep.season + ':' + ep.episode;
       videos.push({
-        id:        id + ':0:' + rank,
+        id:        videoId,
         title:     '#' + rank + ' - S' + sLabel + 'E' + eLabel + ' - ' + ep.name,
-        season:    0,
-        episode:   rank,
+        season:    ep.season,
+        episode:   ep.episode,
         overview:  ratingLine + (ep.overview || ''),
         thumbnail: ep.still || null,
         released:  ep.air_date ? new Date(ep.air_date) : null,
@@ -492,62 +503,6 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
   }
 });
 
-app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
-  const config = req.params.config;
-  const id     = req.params.id;
-  const cfg    = parseConfig(config);
-  if (!cfg.tmdbApiKey) return res.json({ videos: [] });
-
-  const parts = id.split(':');
-  if (parts.length < 4 || parts[0] !== 'tmdb') return res.json({ videos: [] });
-
-  const tmdbId     = parts[1];
-  const season     = parseInt(parts[2]);
-  const episodeNum = parseInt(parts[3]);
-  const topN       = parseInt(cfg.topN) || 20;
-
-  if (season !== 0) return res.json({ videos: [] });
-
-  try {
-    const series        = await getSeries(tmdbId, cfg.tmdbApiKey);
-    const customSeasons = cfg.customSeasons || {};
-    const customList    = customSeasons[tmdbId];
-    let target;
-
-    if (customList && customList.length > 0) {
-      const allEps = await getAllEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
-      const ref    = customList[episodeNum - 1];
-      if (!ref) return res.json({ videos: [] });
-      target = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
-    } else {
-      const topEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
-      target = topEps[episodeNum - 1];
-    }
-
-    if (!target) return res.json({ videos: [] });
-
-    // Use IMDB ID for the video ID so other addons (e.g. Torrentio) can find streams.
-    // Fall back to TMDB ID format if no IMDB ID is available.
-    const imdbId = series.external_ids && series.external_ids.imdb_id;
-    const videoId = imdbId
-      ? imdbId + ':' + target.season + ':' + target.episode
-      : 'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode;
-
-    res.json({
-      videos: [{
-        id:        videoId,
-        title:     target.name,
-        season:    target.season,
-        episode:   target.episode,
-        thumbnail: target.still,
-        overview:  target.overview,
-      }],
-    });
-  } catch (e) {
-    console.error('[episodeVideos]', e.message);
-    res.json({ videos: [] });
-  }
-});
 
 
 // ─── CONFIGURE PAGE ──────────────────────────────────────────────────────────
