@@ -191,7 +191,13 @@ function buildManifest(config) {
     { id: 'tmdb.search_series',  type: 'series', name: 'TMDB Search Series',  extra: [{ name: 'search', isRequired: true }] },
   ];
 
-  const resources = ['catalog', 'meta'];
+  // Best Of catalog: one virtual entry per show with a custom episode list
+  const bestOfIds = Object.keys(cfg.customSeasons || {});
+  if (bestOfIds.length > 0) {
+    allCatalogs.push({ id: 'tmdb.bestof', type: 'series', name: '⭐ Best Of', extra: [] });
+  }
+
+  const resources = ['catalog', 'meta', 'episodeVideos'];
 
   return {
     id:          'community.tmdb-metadata-bestof',
@@ -202,7 +208,7 @@ function buildManifest(config) {
     catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
     resources:   resources,
     types:       ['movie', 'series'],
-    idPrefixes:  ['tmdb:'],
+    idPrefixes:  ['tmdb:', 'bestof:'],
     behaviorHints: {
       configurable:          true,
       configurationRequired: !cfg.tmdbApiKey,
@@ -219,6 +225,111 @@ app.get('/:config/manifest.json', function(req, res) { res.json(buildManifest(re
 
 app.get('/',          function(req, res) { res.redirect('/configure'); });
 app.get('/configure', function(req, res) { res.send(configurePage()); });
+
+// ─── BEST OF CATALOG ─────────────────────────────────────────────────────────
+// Lists shows with a hand-picked episode list as virtual "⭐ Show" entries.
+// Must be registered before the generic /:config/catalog/:type/:id route.
+app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
+  const cfg    = parseConfig(req.params.config);
+  const apiKey = cfg.tmdbApiKey;
+  if (!apiKey) return res.json({ metas: [] });
+  const customSeasons = cfg.customSeasons || {};
+  const tmdbIds = Object.keys(customSeasons);
+  if (!tmdbIds.length) return res.json({ metas: [] });
+  try {
+    const metas = (await Promise.all(tmdbIds.map(async function(tmdbId) {
+      try {
+        const series  = await getSeries(tmdbId, apiKey);
+        const epCount = (customSeasons[tmdbId] || []).length;
+        return {
+          id:          'bestof:' + tmdbId,
+          type:        'series',
+          name:        '\u2b50 ' + (series.name || 'Unknown'),
+          poster:      series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
+          background:  series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+          description: 'Best Of: ' + epCount + ' hand-picked episode' + (epCount !== 1 ? 's' : '') + ' from ' + (series.name || 'Unknown') + '.\n\n' + (series.overview || ''),
+          releaseInfo: series.first_air_date ? series.first_air_date.substring(0, 4) : '',
+          imdbRating:  series.vote_average ? series.vote_average.toFixed(1) : null,
+          genres:      (series.genres || []).map(function(g) { return g.name; }),
+        };
+      } catch (e) { return null; }
+    }))).filter(Boolean);
+    res.json({ metas });
+  } catch (e) {
+    console.error('[bestof catalog]', e.message);
+    res.json({ metas: [] });
+  }
+});
+
+// ─── BEST OF META ─────────────────────────────────────────────────────────────
+// Virtual series with only the user's hand-picked episodes. Video IDs use the
+// real IMDB tt:season:episode format so stream addons (Torrentio etc.) find them.
+// Must be registered before the generic /:config/meta/series/:id route.
+app.get('/:config/meta/series/bestof\::tmdbId.json', async function(req, res) {
+  const cfg    = parseConfig(req.params.config);
+  const apiKey = cfg.tmdbApiKey;
+  const tmdbId = req.params.tmdbId;
+  if (!apiKey) return res.status(400).json({ err: 'No API key' });
+  const customSeasons = cfg.customSeasons || {};
+  const customList    = customSeasons[tmdbId];
+  if (!customList || !customList.length) return res.json({ meta: null });
+  try {
+    const series = await getSeries(tmdbId, apiKey);
+    const cert   = getSeriesCert(series);
+    const cast   = (series.credits && series.credits.cast || []).slice(0, 8).map(function(c) { return c.name; });
+    const imdbId = series.external_ids && series.external_ids.imdb_id;
+    const allEps = await getAllEpisodes(tmdbId, apiKey, series.number_of_seasons || 1);
+    const bestOfEps = [];
+    for (const ref of customList) {
+      const ep = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
+      if (ep) bestOfEps.push(ep);
+    }
+    const videos = bestOfEps.map(function(ep, i) {
+      const rank   = i + 1;
+      const sLabel = String(ep.season).padStart(2, '0');
+      const eLabel = String(ep.episode).padStart(2, '0');
+      const ratingLine = ep.vote_average > 0
+        ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
+      // Real IMDB ID + real season/episode → stream addons can look up streams.
+      const videoId = imdbId
+        ? imdbId + ':' + ep.season + ':' + ep.episode
+        : 'bestof:' + tmdbId + ':' + ep.season + ':' + ep.episode;
+      return {
+        id:        videoId,
+        title:     '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
+        season:    1,
+        episode:   rank,
+        overview:  ratingLine + (ep.overview || ''),
+        thumbnail: ep.still || null,
+        released:  ep.air_date ? new Date(ep.air_date) : null,
+      };
+    });
+    const startYear   = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
+    const endYear     = series.last_air_date   ? series.last_air_date.substring(0, 4)  : '';
+    const releaseInfo = series.status === 'Ended' && endYear ? startYear + '-' + endYear : startYear;
+    res.json({
+      meta: {
+        id:            'bestof:' + tmdbId,
+        type:          'series',
+        name:          '\u2b50 ' + series.name,
+        poster:        series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
+        background:    series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+        description:   bestOfEps.length + ' hand-picked episodes from ' + series.name + '.\n\n' + (series.overview || ''),
+        releaseInfo:   releaseInfo,
+        runtime:       series.episode_run_time && series.episode_run_time[0] ? series.episode_run_time[0] + ' min' : null,
+        genres:        (series.genres || []).map(function(g) { return g.name; }),
+        imdbRating:    series.vote_average ? series.vote_average.toFixed(1) : null,
+        cast:          cast,
+        certification: cert || null,
+        videos:        videos,
+        links:         imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
+      },
+    });
+  } catch (e) {
+    console.error('[bestof meta]', e.message);
+    res.status(500).json({ err: e.message });
+  }
+});
 
 // ─── CATALOG ENDPOINT ────────────────────────────────────────────────────────
 app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
@@ -429,48 +540,28 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       } catch (e) { /* skip */ }
     }
 
-    const customSeasons = cfg.customSeasons || {};
-    const customList    = customSeasons[tmdbId];
-    let bestOfEps = [];
-
-    if (customList && customList.length > 0) {
-      const allEps = await getAllEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
-      for (const ref of customList) {
-        const ep = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
-        if (ep) bestOfEps.push(ep);
-      }
-    } else {
-      bestOfEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
-    }
-
-    // Use IMDB ID + real season/episode numbers in video IDs.
-    // Stream addons (Torrentio etc.) filter by idPrefixes: ["tt"], so they only
-    // receive stream requests for tt-prefixed IDs. Using season:0 + rank is also
-    // meaningless to them — they need the real season and episode numbers.
-    const imdbId = series.external_ids && series.external_ids.imdb_id;
-
-    bestOfEps.forEach(function(ep, i) {
-      const rank   = i + 1;
-      const sLabel = String(ep.season).padStart(2, '0');
-      const eLabel = String(ep.episode).padStart(2, '0');
-      const ratingLine = ep.vote_average > 0
-        ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n'
-        : '';
-      // Use tt_id:realSeason:realEpisode so Torrentio and other tt-prefix stream
-      // addons can look up the actual episode. Fall back to tmdb:id:s:e if no IMDB ID.
-      const videoId = imdbId
-        ? imdbId + ':' + ep.season + ':' + ep.episode
-        : id + ':' + ep.season + ':' + ep.episode;
-      videos.push({
-        id:        videoId,
-        title:     '#' + rank + ' - S' + sLabel + 'E' + eLabel + ' - ' + ep.name,
-        season:    ep.season,
-        episode:   ep.episode,
-        overview:  ratingLine + (ep.overview || ''),
-        thumbnail: ep.still || null,
-        released:  ep.air_date ? new Date(ep.air_date) : null,
+    // Season 0 — auto Best Of: top-N rated episodes, display only (streams won't work).
+    // Controlled by the showAutoSeason config flag (default: true).
+    if (cfg.showAutoSeason !== false) {
+      const bestOfEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
+      bestOfEps.forEach(function(ep, i) {
+        const rank   = i + 1;
+        const sLabel = String(ep.season).padStart(2, '0');
+        const eLabel = String(ep.episode).padStart(2, '0');
+        const ratingLine = ep.vote_average > 0
+          ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n'
+          : '';
+        videos.push({
+          id:        id + ':0:' + rank,
+          title:     '#' + rank + ' — S' + sLabel + 'E' + eLabel + ' — ' + ep.name,
+          season:    0,
+          episode:   rank,
+          overview:  ratingLine + (ep.overview || ''),
+          thumbnail: ep.still || null,
+          released:  ep.air_date ? new Date(ep.air_date) : null,
+        });
       });
-    });
+    }
 
     const startYear  = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
     const endYear    = series.last_air_date   ? series.last_air_date.substring(0, 4)  : '';
@@ -503,6 +594,55 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
   }
 });
 
+app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
+  const config = req.params.config;
+  const id     = req.params.id;
+  const cfg    = parseConfig(config);
+  if (!cfg.tmdbApiKey) return res.json({ videos: [] });
+
+  const parts = id.split(':');
+  if (parts.length < 4 || parts[0] !== 'tmdb') return res.json({ videos: [] });
+
+  const tmdbId     = parts[1];
+  const season     = parseInt(parts[2]);
+  const episodeNum = parseInt(parts[3]);
+  const topN       = parseInt(cfg.topN) || 20;
+
+  if (season !== 0) return res.json({ videos: [] });
+
+  try {
+    const series        = await getSeries(tmdbId, cfg.tmdbApiKey);
+    const customSeasons = cfg.customSeasons || {};
+    const customList    = customSeasons[tmdbId];
+    let target;
+
+    if (customList && customList.length > 0) {
+      const allEps = await getAllEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
+      const ref    = customList[episodeNum - 1];
+      if (!ref) return res.json({ videos: [] });
+      target = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
+    } else {
+      const topEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
+      target = topEps[episodeNum - 1];
+    }
+
+    if (!target) return res.json({ videos: [] });
+
+    res.json({
+      videos: [{
+        id:        'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode,
+        title:     target.name,
+        season:    target.season,
+        episode:   target.episode,
+        thumbnail: target.still,
+        overview:  target.overview,
+      }],
+    });
+  } catch (e) {
+    console.error('[episodeVideos]', e.message);
+    res.json({ videos: [] });
+  }
+});
 
 
 // ─── CONFIGURE PAGE ──────────────────────────────────────────────────────────
@@ -665,7 +805,7 @@ function configurePage() {
   // Single-quotes are used for JS string delimiters here; HTML attribute values use double-quotes.
   const clientJS = [
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
-    "var state = { apiKey: '', topN: 20, customSeasons: {}, catalogEnabled: {}, customCatalogs: [] };",
+    "var state = { apiKey: '', topN: 20, showAutoSeason: true, customSeasons: {}, catalogEnabled: {}, customCatalogs: [] };",
     "var modalData = { tmdbId: null, tmdbName: null, tmdbPoster: null, allEpisodes: [], filteredSeason: 'all', selected: new Set() };",
     "var genreCache = { movie: null, tv: null };",
     "",
@@ -694,6 +834,7 @@ function configurePage() {
     "    if (d.error) throw new Error(d.error);",
     "    state.apiKey = key;",
     "    state.topN = parseInt(document.getElementById('topN').value) || 20;",
+    "    state.showAutoSeason = document.getElementById('showAutoSeason').checked;",
     "    renderDefaultCatalogs();",
     "    goTo(2);",
     "  } catch(e) {",
@@ -954,7 +1095,7 @@ function configurePage() {
     "  Object.keys(state.customSeasons).forEach(function(tid) {",
     "    flat[tid] = state.customSeasons[tid].episodes.map(function(e) { return { season: e.season, episode: e.episode }; });",
     "  });",
-    "  var cfg = { tmdbApiKey: state.apiKey, topN: state.topN, customSeasons: flat, catalogEnabled: state.catalogEnabled, customCatalogs: state.customCatalogs };",
+    "  var cfg = { tmdbApiKey: state.apiKey, topN: state.topN, showAutoSeason: state.showAutoSeason, customSeasons: flat, catalogEnabled: state.catalogEnabled, customCatalogs: state.customCatalogs };",
     "  var encoded = btoa(JSON.stringify(cfg));",
     "  var manifestUrl = window.location.origin + '/' + encoded + '/manifest.json';",
     "  document.getElementById('manifest-url').value = manifestUrl;",
@@ -964,8 +1105,8 @@ function configurePage() {
     "  document.getElementById('install-summary').innerHTML =",
     "    '<div class=\"summary-row\"><span class=\"summary-label\">Default catalogs enabled</span><span class=\"summary-value accent\">' + enabledDefaultCount + '</span></div>' +",
     "    '<div class=\"summary-row\"><span class=\"summary-label\">Custom catalogs</span><span class=\"summary-value ' + (customCatCount > 0 ? 'gold' : '') + '\">' + (customCatCount > 0 ? customCatCount : 'None') + '</span></div>' +",
-    "    '<div class=\"summary-row\"><span class=\"summary-label\">Custom Best Of seasons</span><span class=\"summary-value ' + (showCount > 0 ? 'gold' : '') + '\">' + (showCount > 0 ? showCount + ' show' + (showCount !== 1 ? 's' : '') : 'None (auto-ranked)') + '</span></div>' +",
-    "    '<div class=\"summary-row\" style=\"margin-bottom:1.4rem\"><span class=\"summary-label\">Default top N</span><span class=\"summary-value accent\">' + state.topN + ' episodes</span></div>';",
+    "    '<div class=\"summary-row\"><span class=\"summary-label\">Auto Best Of (Season 0)</span><span class=\"summary-value ' + (state.showAutoSeason ? 'accent' : '') + '\">' + (state.showAutoSeason ? 'On \u00b7 top ' + state.topN : 'Off') + '</span></div>' +",
+    "    '<div class=\"summary-row\" style=\"margin-bottom:1.4rem\"><span class=\"summary-label\">Custom Best Of catalog entries</span><span class=\"summary-value ' + (showCount > 0 ? 'gold' : '') + '\">' + (showCount > 0 ? showCount + ' show' + (showCount !== 1 ? 's' : '') : 'None') + '</span></div>';",
     "}",
     "",
     "function openStremio() { var url = document.getElementById('manifest-url').value; if (!url) return; window.location.href = url.replace(/^https?:\\/\\//, 'stremio://'); }",
@@ -1026,7 +1167,11 @@ function configurePage() {
     '        <div class="field">\n' +
     '          <label>Default top episodes count</label>\n' +
     '          <input type="number" id="topN" placeholder="20" min="5" max="100"/>\n' +
-    '          <p class="hint">For shows without a custom season, show the top N rated episodes. Default: 20.</p>\n' +
+    '          <p class="hint">Top N episodes shown in Season 0 for every show. Default: 20. Streams do not work from Season 0.</p>\n' +
+    '        </div>\n' +
+    '        <div class="catalog-row" style="margin-bottom:1.2rem">\n' +
+    '          <div class="catalog-row-info"><div class="catalog-row-name">Show auto Best Of (Season 0)</div><div class="catalog-row-type">Adds a Season 0 inside every show with the top-rated episodes. Display only \u2014 streams won\u2019t work. Disable if you only want custom Best Of catalog entries.</div></div>\n' +
+    '          <label class="toggle"><input type="checkbox" id="showAutoSeason" checked/><span class="toggle-slider"></span></label>\n' +
     '        </div>\n' +
     '        <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>\n' +
     '      </div>\n    </div>\n' +
@@ -1067,8 +1212,8 @@ function configurePage() {
     // PAGE 3
     '    <div class="page" id="page-3">\n' +
     '      <div class="card">\n' +
-    '        <div class="card-title">&#9999;&#65039; Custom Best Of Seasons</div>\n' +
-    '        <div class="card-sub">Search for a show and hand-pick which episodes appear in its Best Of season. Shows without a custom season fall back to auto top-rated.</div>\n' +
+    '        <div class="card-title">&#9999;&#65039; Custom Best Of Catalog</div>\n' +
+    '        <div class="card-sub">Hand-pick episodes for any show to create a dedicated \u2b50 Best Of entry in your Stremio catalog. Streams work from these entries. Shows without a custom list still get an auto Season 0 (if enabled above).</div>\n' +
     '        <div class="search-wrap field">\n' +
     '          <span class="search-icon">&#128269;</span>\n' +
     '          <input type="text" id="series-search" placeholder="Search for a TV show..." oninput="debounceSearch(this.value)" autocomplete="off"/>\n' +
