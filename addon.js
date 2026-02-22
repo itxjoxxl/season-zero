@@ -5,20 +5,20 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ─── CORS (required for Stremio) ─────────────────────────────────────────────
+// — CORS (required for Stremio) ———————————————
 app.use((req, res, next) => {
 res.setHeader(‘Access-Control-Allow-Origin’, ‘*’);
 res.setHeader(‘Access-Control-Allow-Headers’, ’*’);
 next();
 });
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// — Constants ––––––––––––––––––––––––––––––––
 const TMDB_IMG_SM = ‘https://image.tmdb.org/t/p/w300’;
 const TMDB_IMG_MD = ‘https://image.tmdb.org/t/p/w500’;
 const TMDB_IMG_LG = ‘https://image.tmdb.org/t/p/w1280’;
 const TMDB_BASE   = ‘https://api.themoviedb.org/3’;
 
-// ─── Config helpers ───────────────────────────────────────────────────────────
+// — Config helpers ———————————————————–
 function parseConfig(str) {
 try { return JSON.parse(Buffer.from(str, ‘base64’).toString(‘utf8’)); }
 catch { return {}; }
@@ -28,7 +28,7 @@ function encodeConfig(obj) {
 return Buffer.from(JSON.stringify(obj)).toString(‘base64’);
 }
 
-// ─── TMDB fetch wrapper ───────────────────────────────────────────────────────
+// — TMDB fetch wrapper —————————————————––
 async function tmdb(path, apiKey, params = {}) {
 const url = new URL(`${TMDB_BASE}${path}`);
 url.searchParams.set(‘api_key’, apiKey);
@@ -38,7 +38,7 @@ const { data } = await axios.get(url.toString());
 return data;
 }
 
-// ─── TMDB helpers ─────────────────────────────────────────────────────────────
+// — TMDB helpers ———————————————————––
 function extractId(id) { return id.replace(/^tmdb:/, ‘’); }
 
 async function getMovie(tmdbId, apiKey) {
@@ -103,7 +103,7 @@ return rel?.certification || null;
 } catch { return null; }
 }
 
-// ─── Manifest ─────────────────────────────────────────────────────────────────
+// — Manifest —————————————————————–
 app.get(’/manifest.json’,         (req, res) => res.json(buildManifest()));
 app.get(’/:config/manifest.json’, (req, res) => res.json(buildManifest(req.params.config)));
 
@@ -113,7 +113,7 @@ return {
 id:          ‘community.tmdb-metadata-bestof’,
 version:     ‘2.1.0’,
 name:        ‘TMDB Metadata + Best Of’,
-description: ‘Full TMDB metadata for movies & series. Injects a “⭐ Best Of” season into every show — auto-ranked or fully custom.’,
+description: ‘Full TMDB metadata for movies & series. Injects a “  Best Of” season into every show – auto-ranked or fully custom.’,
 logo:        ‘https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg’,
 catalogs:    [],
 resources:   [‘meta’, ‘episodeVideos’],
@@ -130,11 +130,11 @@ config: [
 };
 }
 
-// ─── Configure pages ──────────────────────────────────────────────────────────
+// — Configure pages –––––––––––––––––––––––––––––
 app.get(’/’,          (req, res) => res.redirect(’/configure’));
 app.get(’/configure’, (req, res) => res.send(configurePage()));
 
-// ─── API: search series via TMDB ──────────────────────────────────────────────
+// — API: search series via TMDB –––––––––––––––––––––––
 app.get(’/api/search’, async (req, res) => {
 const { q, apiKey } = req.query;
 if (!q || !apiKey) return res.json({ results: [] });
@@ -153,7 +153,7 @@ res.status(500).json({ error: e.message });
 }
 });
 
-// ─── API: get all episodes for a series ───────────────────────────────────────
+// — API: get all episodes for a series —————————————
 app.get(’/api/episodes’, async (req, res) => {
 const { tmdbId, apiKey } = req.query;
 if (!tmdbId || !apiKey) return res.json({ episodes: [] });
@@ -173,7 +173,7 @@ res.status(500).json({ error: e.message });
 }
 });
 
-// ─── Movie meta ───────────────────────────────────────────────────────────────
+// — Movie meta —————————————————————
 app.get(’/:config/meta/movie/:id.json’, async (req, res) => {
 const { config, id } = req.params;
 const cfg = parseConfig(config);
@@ -220,7 +220,7 @@ res.status(500).json({ err: e.message });
 }
 });
 
-// ─── Series meta + Best Of injection ─────────────────────────────────────────
+// — Series meta + Best Of injection —————————————–
 app.get(’/:config/meta/series/:id.json’, async (req, res) => {
 const { config, id } = req.params;
 const cfg = parseConfig(config);
@@ -237,7 +237,7 @@ const cast   = (series.credits?.cast || []).slice(0, 8).map(c => c.name);
 const videos = [];
 
 ```
-// ── Real seasons ──────────────────────────────────────────────────────
+// -- Real seasons ------------------------------------------------------
 for (let s = 1; s <= (series.number_of_seasons || 0); s++) {
   try {
     const season = await getSeason(tmdbId, s, cfg.tmdbApiKey);
@@ -256,7 +256,7 @@ for (let s = 1; s <= (series.number_of_seasons || 0); s++) {
   } catch { /* skip */ }
 }
 
-// ── Virtual Season 0 — Best Of (custom or auto) ───────────────────────
+// -- Virtual Season 0 -- Best Of (custom or auto) -----------------------
 // Check if we have a custom season for this show
 const customSeasons = cfg.customSeasons || {};
 const customList    = customSeasons[tmdbId];
@@ -280,10 +280,10 @@ bestOfEps.forEach((ep, i) => {
   const sLabel = String(ep.season).padStart(2, '0');
   const eLabel = String(ep.episode).padStart(2, '0');
   const title  = ep.customLabel
-    ? `#${rank} — ${ep.customLabel}`
-    : `#${rank} — S${sLabel}E${eLabel} — ${ep.name}`;
+    ? `#${rank} -- ${ep.customLabel}`
+    : `#${rank} -- S${sLabel}E${eLabel} -- ${ep.name}`;
   const ratingLine = ep.vote_average > 0
-    ? `⭐ ${ep.vote_average.toFixed(1)}/10  (${ep.vote_count.toLocaleString()} votes)\n\n`
+    ? `  ${ep.vote_average.toFixed(1)}/10  (${ep.vote_count.toLocaleString()} votes)\n\n`
     : '';
   videos.push({
     id:        `${id}:0:${rank}`,
@@ -299,7 +299,7 @@ bestOfEps.forEach((ep, i) => {
 const startYear = series.first_air_date?.substring(0, 4) || '';
 const endYear   = series.last_air_date?.substring(0, 4)  || '';
 const releaseInfo = series.status === 'Ended' && endYear
-  ? `${startYear}–${endYear}`
+  ? `${startYear}-${endYear}`
   : startYear;
 
 const meta = {
@@ -330,7 +330,7 @@ res.status(500).json({ err: e.message });
 }
 });
 
-// ─── episodeVideos — resolve Best Of virtual ep → real ep ID ─────────────────
+// — episodeVideos – resolve Best Of virtual ep -> real ep ID —————–
 app.get(’/:config/episodeVideos/series/:id.json’, async (req, res) => {
 const { config, id } = req.params;
 const cfg = parseConfig(config);
@@ -384,7 +384,7 @@ res.json({ videos: [] });
 }
 });
 
-// ─── Configure page HTML ──────────────────────────────────────────────────────
+// — Configure page HTML ——————————————————
 function configurePage() {
 return `<!DOCTYPE html>
 
@@ -392,7 +392,7 @@ return `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>TMDB Best Of — Configure</title>
+  <title>TMDB Best Of -- Configure</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
@@ -423,10 +423,10 @@ body {
   min-height: 100vh;
 }
 
-/* ── Layout ── */
+/* -- Layout -- */
 .app { display: flex; flex-direction: column; min-height: 100vh; }
 
-/* ── Top bar ── */
+/* -- Top bar -- */
 .topbar {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -461,10 +461,10 @@ body {
 .step-item.done .step-num   { background: var(--accent2); border-color: var(--accent2); color: #000; }
 .step-divider { color: var(--text-mute); font-size: 0.7rem; }
 
-/* ── Main ── */
+/* -- Main -- */
 .main { flex: 1; padding: 2.5rem 2rem; max-width: 820px; margin: 0 auto; width: 100%; }
 
-/* ── Cards ── */
+/* -- Cards -- */
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -479,7 +479,7 @@ body {
 }
 .card-sub { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 1.5rem; }
 
-/* ── Forms ── */
+/* -- Forms -- */
 .field { margin-bottom: 1.2rem; }
 label { display: block; font-size: 0.78rem; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
 input[type=text], input[type=number], input[type=password] {
@@ -495,7 +495,7 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
 .hint { font-size: 0.72rem; color: var(--text-mute); margin-top: 5px; }
 .hint a { color: var(--accent); text-decoration: none; }
 
-/* ── Buttons ── */
+/* -- Buttons -- */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
   padding: 10px 20px; border-radius: var(--radius);
@@ -522,11 +522,11 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
 .btn-icon { padding: 7px; }
 .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
 
-/* ── Pages ── */
+/* -- Pages -- */
 .page { display: none; }
 .page.active { display: block; }
 
-/* ── Step 1: API key ── */
+/* -- Step 1: API key -- */
 .key-illustration {
   text-align: center; padding: 1rem 0 1.8rem;
   font-size: 4rem; opacity: 0.6;
@@ -544,7 +544,7 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
 }
 .feature-chip .ic { font-size: 1.1rem; }
 
-/* ── Step 2: Custom seasons ── */
+/* -- Step 2: Custom seasons -- */
 .section-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 1.2rem;
@@ -731,7 +731,7 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
 .modal-selected-count { font-size: 0.8rem; color: var(--text-dim); }
 .modal-selected-count span { color: var(--accent); font-weight: 700; }
 
-/* ── Step 3: Generate ── */
+/* -- Step 3: Generate -- */
 .generate-hero { text-align: center; padding: 1.2rem 0 2rem; }
 .generate-hero .icon-big { font-size: 3.5rem; margin-bottom: 12px; }
 .generate-hero h2 { font-size: 1.3rem; font-weight: 700; color: #fff; margin-bottom: 6px; }
@@ -816,18 +816,18 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
   <!-- Top bar -->
 
   <div class="topbar">
-    <div class="topbar-logo"><span>🎬</span> TMDB Best Of</div>
+    <div class="topbar-logo"><span> </span> TMDB Best Of</div>
     <div class="topbar-steps">
       <div class="step-item active" id="step-tab-1">
         <span class="step-num">1</span>
         <span>API Key</span>
       </div>
-      <span class="step-divider">›</span>
+      <span class="step-divider"> </span>
       <div class="step-item" id="step-tab-2">
         <span class="step-num">2</span>
         <span>Custom Seasons</span>
       </div>
-      <span class="step-divider">›</span>
+      <span class="step-divider"> </span>
       <div class="step-item" id="step-tab-3">
         <span class="step-num">3</span>
         <span>Install</span>
@@ -838,25 +838,25 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
   <div class="main">
 
 ```
-<!-- ═══ STEP 1: API KEY ═══ -->
+<!--     STEP 1: API KEY     -->
 <div class="page active" id="page-1">
   <div class="card">
-    <div class="key-illustration">🔑</div>
+    <div class="key-illustration"> </div>
     <div class="card-title">Connect to TMDB</div>
     <div class="card-sub">Enter your free TMDB API key to get started. This powers all metadata and search.</div>
 
     <div class="features-grid">
-      <div class="feature-chip"><span class="ic">🎬</span> Movie metadata</div>
-      <div class="feature-chip"><span class="ic">📺</span> Series metadata</div>
-      <div class="feature-chip"><span class="ic">⭐</span> Auto Best Of season</div>
-      <div class="feature-chip"><span class="ic">✏️</span> Custom episode lists</div>
+      <div class="feature-chip"><span class="ic"> </span> Movie metadata</div>
+      <div class="feature-chip"><span class="ic"> </span> Series metadata</div>
+      <div class="feature-chip"><span class="ic"> </span> Auto Best Of season</div>
+      <div class="feature-chip"><span class="ic">  </span> Custom episode lists</div>
     </div>
 
     <div class="field">
       <label>TMDB API Key (v3)</label>
-      <input type="password" id="apiKey" placeholder="Paste your API key here…" autocomplete="off" spellcheck="false"
+      <input type="password" id="apiKey" placeholder="Paste your API key here " autocomplete="off" spellcheck="false"
         onkeydown="if(event.key==='Enter') validateApiKey()"/>
-      <p class="hint">Free key from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> → Settings → API → v3 auth key</p>
+      <p class="hint">Free key from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> -> Settings -> API -> v3 auth key</p>
     </div>
 
     <div class="field">
@@ -866,22 +866,22 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
     </div>
 
     <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">
-      Continue →
+      Continue ->
     </button>
   </div>
 </div>
 
-<!-- ═══ STEP 2: CUSTOM SEASONS ═══ -->
+<!--     STEP 2: CUSTOM SEASONS     -->
 <div class="page" id="page-2">
 
   <!-- Add custom season -->
   <div class="card">
-    <div class="card-title">✏️ Custom "Best Of" Seasons</div>
-    <div class="card-sub">Search for a show and hand-pick which episodes appear in its Best Of season — in whatever order you like. Shows without a custom season fall back to auto top-rated.</div>
+    <div class="card-title">   Custom "Best Of" Seasons</div>
+    <div class="card-sub">Search for a show and hand-pick which episodes appear in its Best Of season -- in whatever order you like. Shows without a custom season fall back to auto top-rated.</div>
 
     <div class="search-wrap field">
-      <span class="search-icon">🔍</span>
-      <input type="text" id="series-search" placeholder="Search for a TV show…"
+      <span class="search-icon"> </span>
+      <input type="text" id="series-search" placeholder="Search for a TV show "
         oninput="debounceSearch(this.value)" autocomplete="off"/>
     </div>
     <div id="search-results" class="search-results"></div>
@@ -895,23 +895,23 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
     </div>
     <div id="custom-seasons-list">
       <div class="custom-seasons-empty">
-        <div class="big">🎭</div>
+        <div class="big"> </div>
         No custom seasons yet. Search for a show above to get started.
       </div>
     </div>
   </div>
 
   <div class="nav-row">
-    <button class="btn btn-secondary" onclick="goTo(1)">← Back</button>
-    <button class="btn btn-gold btn-lg" onclick="goTo(3)">Generate Install Link →</button>
+    <button class="btn btn-secondary" onclick="goTo(1)">  Back</button>
+    <button class="btn btn-gold btn-lg" onclick="goTo(3)">Generate Install Link -></button>
   </div>
 </div>
 
-<!-- ═══ STEP 3: INSTALL ═══ -->
+<!--     STEP 3: INSTALL     -->
 <div class="page" id="page-3">
   <div class="card">
     <div class="generate-hero">
-      <div class="icon-big">🚀</div>
+      <div class="icon-big"> </div>
       <h2>Ready to install!</h2>
       <p>Your addon is configured and ready. Click below to add it directly to Stremio.</p>
     </div>
@@ -919,9 +919,9 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
     <div id="install-summary"></div>
 
     <button class="btn btn-install" id="btn-stremio" onclick="openStremio()">
-      ⚡ Install in Stremio
+        Install in Stremio
     </button>
-    <div class="or-line">— or add manually —</div>
+    <div class="or-line">-- or add manually --</div>
     <div class="copy-row">
       <input type="text" id="manifest-url" readonly/>
       <button class="btn-copy" id="copy-btn" onclick="copyUrl()">Copy</button>
@@ -929,7 +929,7 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
   </div>
 
   <div class="nav-row">
-    <button class="btn btn-secondary" onclick="goTo(2)">← Back</button>
+    <button class="btn btn-secondary" onclick="goTo(2)">  Back</button>
   </div>
 </div>
 ```
@@ -937,21 +937,21 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
   </div><!-- /main -->
 </div><!-- /app -->
 
-<!-- ═══ EPISODE PICKER MODAL ═══ -->
+<!--     EPISODE PICKER MODAL     -->
 
 <div class="modal-backdrop" id="modal-backdrop" onclick="closeModalOnBackdrop(event)">
   <div class="modal">
     <div class="modal-header">
       <img class="modal-poster" id="modal-poster" src="" alt=""/>
       <div>
-        <div class="modal-title" id="modal-show-name">Loading…</div>
+        <div class="modal-title" id="modal-show-name">Loading </div>
         <div class="modal-sub" id="modal-show-sub"></div>
       </div>
-      <div class="modal-close" onclick="closeModal()">✕</div>
+      <div class="modal-close" onclick="closeModal()"> </div>
     </div>
     <div class="modal-filter" id="modal-season-filters"></div>
     <div class="modal-ep-list" id="modal-ep-list">
-      <div class="loading-overlay"><div class="spinner"></div> Loading episodes…</div>
+      <div class="loading-overlay"><div class="spinner"></div> Loading episodes </div>
     </div>
     <div class="modal-footer">
       <span class="modal-selected-count">Selected: <span id="modal-sel-count">0</span></span>
@@ -964,9 +964,9 @@ input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
 </div>
 
 <script>
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // STATE
-// ═══════════════════════════════════════════════════════════
+//                                                            
 let state = {
   apiKey: '',
   topN: 20,
@@ -981,9 +981,9 @@ let modalData = {
   selected: new Set(), // "s:e" strings
 };
 
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // NAVIGATION
-// ═══════════════════════════════════════════════════════════
+//                                                            
 function goTo(n) {
   document.querySelectorAll('.page').forEach((p, i) => {
     p.classList.toggle('active', i + 1 === n);
@@ -998,16 +998,16 @@ function goTo(n) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // STEP 1: API KEY VALIDATION
-// ═══════════════════════════════════════════════════════════
+//                                                            
 async function validateApiKey() {
   const input = document.getElementById('apiKey');
   const key   = input.value.trim();
   const btn   = document.getElementById('btn-validate');
   if (!key) { flashError(input); return; }
 
-  btn.innerHTML = '<span class="spinner"></span> Validating…';
+  btn.innerHTML = '<span class="spinner"></span> Validating ';
   btn.disabled = true;
 
   try {
@@ -1019,9 +1019,9 @@ async function validateApiKey() {
     goTo(2);
   } catch (e) {
     flashError(input);
-    input.placeholder = 'Invalid API key — try again';
+    input.placeholder = 'Invalid API key -- try again';
   } finally {
-    btn.innerHTML = 'Continue →';
+    btn.innerHTML = 'Continue ->';
     btn.disabled  = false;
   }
 }
@@ -1032,9 +1032,9 @@ function flashError(el) {
   setTimeout(() => el.classList.remove('error'), 2000);
 }
 
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // STEP 2: SEARCH
-// ═══════════════════════════════════════════════════════════
+//                                                            
 let searchTimer;
 function debounceSearch(q) {
   clearTimeout(searchTimer);
@@ -1045,7 +1045,7 @@ function debounceSearch(q) {
 async function doSearch(q) {
   const box = document.getElementById('search-results');
   box.classList.add('visible');
-  box.innerHTML = '<div class="loading-overlay"><div class="spinner"></div> Searching…</div>';
+  box.innerHTML = '<div class="loading-overlay"><div class="spinner"></div> Searching </div>';
 
   try {
     const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&apiKey=' + encodeURIComponent(state.apiKey));
@@ -1056,19 +1056,19 @@ async function doSearch(q) {
       <div class="search-result-item" onclick="openModal(\${s.id},\${JSON.stringify(s.name).replace(/</g,'&lt;')},\${JSON.stringify(s.poster || '')})">
         \${s.poster
           ? \`<img class="search-poster" src="\${s.poster}" alt="" loading="lazy"/>\`
-          : \`<div class="search-poster placeholder">📺</div>\`}
+          : \`<div class="search-poster placeholder"> </div>\`}
         <div>
           <div class="search-name">\${esc(s.name)}</div>
-          <div class="search-meta">\${s.year ? s.year + ' · ' : ''}⭐ \${s.vote_average}</div>
+          <div class="search-meta">\${s.year ? s.year + ' . ' : ''}  \${s.vote_average}</div>
         </div>
       </div>
     \`).join('');
   } catch { box.innerHTML = '<p style="padding:1rem;font-size:0.82rem;color:var(--text-mute)">Error searching.</p>'; }
 }
 
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // MODAL: EPISODE PICKER
-// ═══════════════════════════════════════════════════════════
+//                                                            
 async function openModal(tmdbId, name, poster) {
   // reset
   modalData.tmdbId = tmdbId;
@@ -1081,11 +1081,11 @@ async function openModal(tmdbId, name, poster) {
   modalData.selected = new Set(existing.map(e => e.season + ':' + e.episode));
 
   document.getElementById('modal-show-name').textContent = name;
-  document.getElementById('modal-show-sub').textContent  = 'Loading…';
+  document.getElementById('modal-show-sub').textContent  = 'Loading ';
   document.getElementById('modal-poster').src   = poster || '';
   document.getElementById('modal-season-filters').innerHTML = '';
   document.getElementById('modal-ep-list').innerHTML =
-    '<div class="loading-overlay"><div class="spinner"></div> Loading episodes…</div>';
+    '<div class="loading-overlay"><div class="spinner"></div> Loading episodes </div>';
   updateModalCount();
 
   document.getElementById('modal-backdrop').classList.add('open');
@@ -1103,7 +1103,7 @@ async function openModal(tmdbId, name, poster) {
 
     // update sub
     document.getElementById('modal-show-sub').textContent =
-      d.show.seasons + ' season' + (d.show.seasons !== 1 ? 's' : '') + ' · ' + d.episodes.length + ' episodes';
+      d.show.seasons + ' season' + (d.show.seasons !== 1 ? 's' : '') + ' . ' + d.episodes.length + ' episodes';
 
     // Build season filter buttons
     const seasons = [...new Set(d.episodes.map(e => e.season))].sort((a,b) => a-b);
@@ -1144,12 +1144,12 @@ function renderModalEpisodes() {
       <div class="modal-ep-item \${sel ? 'selected' : ''}" onclick="toggleEp('\${key}',this)">
         \${ep.still
           ? \`<img class="modal-ep-thumb" src="\${ep.still}" alt="" loading="lazy"/>\`
-          : \`<div class="modal-ep-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--text-mute);font-size:1.2rem">🎞</div>\`}
+          : \`<div class="modal-ep-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--text-mute);font-size:1.2rem"> </div>\`}
         <div class="modal-ep-info">
-          <div class="modal-ep-name">S\${sLabel}E\${eLabel} — \${esc(ep.name)}</div>
-          <div class="modal-ep-meta">\${ep.vote_average > 0 ? '⭐ ' + ep.vote_average.toFixed(1) + ' · ' : ''}\${ep.air_date || ''}</div>
+          <div class="modal-ep-name">S\${sLabel}E\${eLabel} -- \${esc(ep.name)}</div>
+          <div class="modal-ep-meta">\${ep.vote_average > 0 ? '  ' + ep.vote_average.toFixed(1) + ' . ' : ''}\${ep.air_date || ''}</div>
         </div>
-        <div class="modal-ep-check">\${sel ? '✓' : ''}</div>
+        <div class="modal-ep-check">\${sel ? ' ' : ''}</div>
       </div>
     \`;
   }).join('');
@@ -1163,7 +1163,7 @@ function toggleEp(key, el) {
   } else {
     modalData.selected.add(key);
     el.classList.add('selected');
-    el.querySelector('.modal-ep-check').textContent = '✓';
+    el.querySelector('.modal-ep-check').textContent = ' ';
   }
   updateModalCount();
 }
@@ -1213,9 +1213,9 @@ function closeModalOnBackdrop(e) {
   if (e.target === document.getElementById('modal-backdrop')) closeModal();
 }
 
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // CUSTOM SEASONS LIST
-// ═══════════════════════════════════════════════════════════
+//                                                            
 function renderCustomSeasonsList() {
   const el  = document.getElementById('custom-seasons-list');
   const cnt = document.getElementById('custom-count');
@@ -1224,7 +1224,7 @@ function renderCustomSeasonsList() {
 
   if (!ids.length) {
     el.innerHTML = \`<div class="custom-seasons-empty">
-      <div class="big">🎭</div>
+      <div class="big"> </div>
       No custom seasons yet. Search for a show above to get started.
     </div>\`;
     return;
@@ -1237,10 +1237,10 @@ function renderCustomSeasonsList() {
         <div class="show-season-header" onclick="toggleCard('\${tid}')">
           \${show.poster
             ? \`<img class="show-season-poster" src="\${show.poster}" alt="" loading="lazy"/>\`
-            : \`<div class="show-season-poster" style="display:flex;align-items:center;justify-content:center;color:var(--text-mute)">📺</div>\`}
+            : \`<div class="show-season-poster" style="display:flex;align-items:center;justify-content:center;color:var(--text-mute)"> </div>\`}
           <span class="show-season-name">\${esc(show.name)}</span>
           <span class="show-season-count">\${show.episodes.length} ep\${show.episodes.length !== 1 ? 's' : ''}</span>
-          <span class="show-season-chevron">›</span>
+          <span class="show-season-chevron"> </span>
         </div>
         <div class="show-season-body">
           <ul class="ep-list" id="eplist-\${tid}" data-tid="\${tid}">
@@ -1248,9 +1248,9 @@ function renderCustomSeasonsList() {
           </ul>
           <div class="ep-list-actions">
             <button class="btn btn-secondary btn-sm" onclick="openModal(\${tid}, \${JSON.stringify(show.name)}, \${JSON.stringify(show.poster || '')})">
-              ✏️ Edit Episodes
+                 Edit Episodes
             </button>
-            <button class="btn btn-danger btn-sm" onclick="removeSeason('\${tid}')">🗑 Remove</button>
+            <button class="btn btn-danger btn-sm" onclick="removeSeason('\${tid}')">  Remove</button>
           </div>
         </div>
       </div>
@@ -1267,16 +1267,16 @@ function renderEpItem(ep, i, tid) {
   return \`
     <li class="ep-item" draggable="true" data-tid="\${tid}" data-idx="\${i}">
       <span class="ep-rank">\${i + 1}</span>
-      <span class="ep-drag">⠿</span>
+      <span class="ep-drag"> </span>
       \${ep.still
         ? \`<img class="ep-thumb" src="\${ep.still}" alt="" loading="lazy"/>\`
-        : \`<div class="ep-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--text-mute)">🎞</div>\`}
+        : \`<div class="ep-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--text-mute)"> </div>\`}
       <div class="ep-info">
-        <div class="ep-label">S\${sLabel}E\${eLabel} — \${esc(ep.name)}</div>
+        <div class="ep-label">S\${sLabel}E\${eLabel} -- \${esc(ep.name)}</div>
         <div class="ep-sublabel">\${ep.air_date || ''}</div>
       </div>
-      \${ep.vote_average > 0 ? \`<span class="ep-rating">⭐\${ep.vote_average.toFixed(1)}</span>\` : ''}
-      <span class="ep-del" onclick="removeEp('\${tid}',\${i})" title="Remove">✕</span>
+      \${ep.vote_average > 0 ? \`<span class="ep-rating"> \${ep.vote_average.toFixed(1)}</span>\` : ''}
+      <span class="ep-del" onclick="removeEp('\${tid}',\${i})" title="Remove"> </span>
     </li>
   \`;
 }
@@ -1296,7 +1296,7 @@ function removeEp(tid, idx) {
   renderCustomSeasonsList();
 }
 
-// ─── Drag-to-reorder ──────────────────────────────────────
+// --- Drag-to-reorder --------------------------------------
 function initDragSort(tid) {
   const list = document.getElementById('eplist-' + tid);
   if (!list) return;
@@ -1331,9 +1331,9 @@ function initDragSort(tid) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // STEP 3: GENERATE INSTALL LINK
-// ═══════════════════════════════════════════════════════════
+//                                                            
 function buildInstallPage() {
   // Flatten customSeasons into the config format the backend expects
   const customSeasonsFlat = {};
@@ -1370,7 +1370,7 @@ function buildInstallPage() {
     </div>
     <div class="summary-row" style="margin-bottom:1.4rem">
       <span class="summary-label">Manifest URL</span>
-      <span class="summary-value" style="font-size:0.65rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${base}/…/manifest.json</span>
+      <span class="summary-value" style="font-size:0.65rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${base}/ /manifest.json</span>
     </div>
   \`;
 }
@@ -1386,14 +1386,14 @@ function copyUrl() {
   input.select();
   try { document.execCommand('copy'); } catch { navigator.clipboard?.writeText(input.value); }
   const btn = document.getElementById('copy-btn');
-  btn.textContent = '✓ Copied';
+  btn.textContent = '  Copied';
   btn.classList.add('copied');
   setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
 }
 
-// ═══════════════════════════════════════════════════════════
+//                                                            
 // UTILS
-// ═══════════════════════════════════════════════════════════
+//                                                            
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -1403,9 +1403,9 @@ function esc(s) {
 </html>`;
 }
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// — Start ––––––––––––––––––––––––––––––––––
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-console.log(`TMDB Best Of addon → http://localhost:${PORT}`);
-console.log(`Configure page     → http://localhost:${PORT}/configure`);
+console.log(`TMDB Best Of addon -> http://localhost:${PORT}`);
+console.log(`Configure page     -> http://localhost:${PORT}/configure`);
 });
