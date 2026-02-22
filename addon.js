@@ -399,8 +399,11 @@ app.get('/api/imdb-list', async function(req, res) {
         const cols = lines[i].match(/("([^"]*)"|([^,]*))(,|$)/g)
           .map(f => f.replace(/^"|"$|,$/g, '').trim());
         const ttId  = cols[constIdx];
-        const ttype = typeIdx !== -1 ? (cols[typeIdx] || '').toLowerCase() : '';
-        // Accept tvEpisode rows, OR if no type column just accept all tt IDs
+        const ttypeRaw = typeIdx !== -1 ? (cols[typeIdx] || '') : '';
+        // IMDb exports sometimes use "TV Episode" (with a space) rather than "tvEpisode".
+        // Normalize aggressively so we don't accidentally filter out all episodes.
+        const ttype = String(ttypeRaw).toLowerCase().replace(/[^a-z0-9]/g, '');
+        // Accept TV episode rows, OR if no type column just accept all tt IDs
         if (ttId && ttId.startsWith('tt') && (typeIdx === -1 || ttype === 'tvepisode')) {
           ttIds.push(ttId);
         }
@@ -1053,7 +1056,13 @@ function configurePage() {
     "    var r = await fetch('/api/imdb-list?url=' + encodeURIComponent(url) + '&apiKey=' + encodeURIComponent(state.apiKey) + '&tmdbId=' + list.tmdbId);",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
-    "    if (!d.episodes || !d.episodes.length) throw new Error('No matching episodes found for this show. Check the list contains TV episodes from this series.');",
+    "    if (!d.episodes || !d.episodes.length) {",
+    "      var hint = '';",
+    "      if (d.errors && d.errors.length) {",
+    "        hint = ' Example: ' + (d.errors[0].ttId || '') + (d.errors[0].reason ? ' — ' + d.errors[0].reason : '');",
+    "      }",
+    "      throw new Error('No matching episodes found for this show. Make sure your IMDb list items are TV Episodes from this exact series.' + hint);",
+    "    }",
     // Merge imported episodes with existing, dedup, preserve order
     "    var existingKeys = new Set(list.episodes.map(function(e) { return e.season + ':' + e.episode; }));",
     "    var allEpsForShow = modalData.tmdbId === list.tmdbId ? modalData.allEpisodes : [];",
