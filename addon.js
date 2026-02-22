@@ -262,101 +262,7 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
   }
 });
 
-// ─── BEST OF META ─────────────────────────────────────────────────────────────
-// FIX 3: Video IDs now use the real IMDB tt:season:episode format so that
-// stream addons (Torrentio, etc.) can find streams. The series itself keeps
-// the 'bestof:' prefix so we can tell it apart from a normal tmdb: series.
-//
-// WHY THIS WORKS:
-//   - Stremio resolves streams by sending the *video* ID to stream addons.
-//   - Torrentio accepts IDs like "tt0944947:1:5" (tt + season + episode).
-//   - The series container ID ("bestof:12345") only matters for THIS addon's
-//     meta handler — stream addons never see it.
-//   - So: series id = bestof:tmdbId, video ids = ttXXXXXXX:S:E  ✓
-//
-// FALLBACK: If a show has no IMDB ID we fall back to tmdb:tmdbId:S:E which
-// won't get streams from Torrentio but is at least consistent.
-app.get('/:config/meta/series/bestof\::tmdbId.json', async function(req, res) {
-  const cfg    = parseConfig(req.params.config);
-  const apiKey = cfg.tmdbApiKey;
-  const tmdbId = req.params.tmdbId;
-  if (!apiKey) return res.status(400).json({ err: 'No API key' });
-  const customSeasons = cfg.customSeasons || {};
-  const customList    = customSeasons[tmdbId];
-  if (!customList || !customList.length) return res.json({ meta: null });
-  try {
-    const series = await getSeries(tmdbId, apiKey);
-    const cert   = getSeriesCert(series);
-    const cast   = (series.credits && series.credits.cast || []).slice(0, 8).map(function(c) { return c.name; });
-    const imdbId = series.external_ids && series.external_ids.imdb_id;
-    const allEps = await getAllEpisodes(tmdbId, apiKey, series.number_of_seasons || 1);
-    const bestOfEps = [];
-    for (const ref of customList) {
-      const ep = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
-      if (ep) bestOfEps.push(ep);
-    }
-    const videos = bestOfEps.map(function(ep, i) {
-      const rank   = i + 1;
-      const sLabel = String(ep.season).padStart(2, '0');
-      const eLabel = String(ep.episode).padStart(2, '0');
-      const ratingLine = ep.vote_average > 0
-        ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
 
-      // FIX 4: Video ID uses real IMDB tt ID + real S/E numbers.
-      // Torrentio and other stream addons look up streams using this exact format.
-      // Season/episode in the video object are set to 1/rank for display ordering
-      // within the single "Best Of" season, but the ID carries the real coordinates.
-      const videoId = imdbId
-        ? imdbId + ':' + ep.season + ':' + ep.episode
-        : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
-
-      return {
-        id:        videoId,
-        title:     '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
-        // FIX 5: Use season:1, episode:rank for display (single "Best Of" season).
-        // The actual stream lookup uses the tt:S:E in the id field above.
-        season:    1,
-        episode:   rank,
-        overview:  ratingLine + (ep.overview || ''),
-        thumbnail: ep.still || null,
-        released:  ep.air_date ? new Date(ep.air_date) : null,
-      };
-    });
-    const startYear   = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
-    const endYear     = series.last_air_date   ? series.last_air_date.substring(0, 4)  : '';
-    const releaseInfo = series.status === 'Ended' && endYear ? startYear + '-' + endYear : startYear;
-    res.json({
-      meta: {
-        id:            'bestof:' + tmdbId,
-        type:          'series',
-        name:          '\u2b50 ' + series.name,
-        poster:        series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
-        background:    series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
-        description:   bestOfEps.length + ' hand-picked episodes from ' + series.name + '.\n\n' + (series.overview || ''),
-        releaseInfo:   releaseInfo,
-        runtime:       series.episode_run_time && series.episode_run_time[0] ? series.episode_run_time[0] + ' min' : null,
-        genres:        (series.genres || []).map(function(g) { return g.name; }),
-        imdbRating:    series.vote_average ? series.vote_average.toFixed(1) : null,
-        cast:          cast,
-        certification: cert || null,
-        videos:        videos,
-        // FIX 6: Expose both the bestof: series link AND the real IMDB link.
-        // This helps some stream addons that look at the series-level IMDB ID.
-        links: [
-          ...(imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : []),
-        ],
-        // FIX 7: behaviorHints tells Stremio this is a standalone virtual season,
-        // not a continuation of another series entry.
-        behaviorHints: {
-          defaultVideoId: null,
-        },
-      },
-    });
-  } catch (e) {
-    console.error('[bestof meta]', e.message);
-    res.status(500).json({ err: e.message });
-  }
-});
 
 // ─── CATALOG ENDPOINT ────────────────────────────────────────────────────────
 app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
@@ -529,6 +435,77 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
   const id     = req.params.id;
   const cfg    = parseConfig(config);
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
+
+  // Route bestof: IDs to the Best Of handler.
+  // Stremio URL-encodes colons, so 'bestof:1396' arrives as the decoded param value
+  // 'bestof:1396' via Express's :id wildcard (Express decodes %3A in params).
+  // A dedicated route like app.get('...bestof\::id...') would NEVER match because
+  // Express matches the raw encoded path where %3A != ':'.
+  if (id.startsWith('bestof:')) {
+    const tmdbId = id.slice('bestof:'.length);
+    const customSeasons = cfg.customSeasons || {};
+    const customList    = customSeasons[tmdbId];
+    if (!customList || !customList.length) return res.json({ meta: null });
+    try {
+      const series = await getSeries(tmdbId, cfg.tmdbApiKey);
+      const cert   = getSeriesCert(series);
+      const cast   = (series.credits && series.credits.cast || []).slice(0, 8).map(function(c) { return c.name; });
+      const imdbId = series.external_ids && series.external_ids.imdb_id;
+      const allEps = await getAllEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
+      const bestOfEps = [];
+      for (const ref of customList) {
+        const ep = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
+        if (ep) bestOfEps.push(ep);
+      }
+      const videos = bestOfEps.map(function(ep, i) {
+        const rank   = i + 1;
+        const sLabel = String(ep.season).padStart(2, '0');
+        const eLabel = String(ep.episode).padStart(2, '0');
+        const ratingLine = ep.vote_average > 0
+          ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
+        // Use real IMDB tt:S:E as the video ID so Torrentio/other stream addons find streams.
+        // season:1 episode:rank is just for display ordering in the single Best Of season.
+        const videoId = imdbId
+          ? imdbId + ':' + ep.season + ':' + ep.episode
+          : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
+        return {
+          id:        videoId,
+          title:     '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
+          season:    1,
+          episode:   rank,
+          overview:  ratingLine + (ep.overview || ''),
+          thumbnail: ep.still || null,
+          released:  ep.air_date ? new Date(ep.air_date) : null,
+        };
+      });
+      const startYear   = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
+      const endYear     = series.last_air_date   ? series.last_air_date.substring(0, 4)  : '';
+      const releaseInfo = series.status === 'Ended' && endYear ? startYear + '-' + endYear : startYear;
+      return res.json({
+        meta: {
+          id:            'bestof:' + tmdbId,
+          type:          'series',
+          name:          '\u2b50 ' + series.name,
+          poster:        series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
+          background:    series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+          description:   bestOfEps.length + ' hand-picked episodes from ' + series.name + '.\n\n' + (series.overview || ''),
+          releaseInfo:   releaseInfo,
+          runtime:       series.episode_run_time && series.episode_run_time[0] ? series.episode_run_time[0] + ' min' : null,
+          genres:        (series.genres || []).map(function(g) { return g.name; }),
+          imdbRating:    series.vote_average ? series.vote_average.toFixed(1) : null,
+          cast:          cast,
+          certification: cert || null,
+          videos:        videos,
+          links:         imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
+          behaviorHints: { defaultVideoId: null },
+        },
+      });
+    } catch (e) {
+      console.error('[bestof meta]', e.message);
+      return res.status(500).json({ err: e.message });
+    }
+  }
+
   if (!id.startsWith('tmdb:')) return res.json({ meta: null });
 
   const tmdbId = extractId(id);
