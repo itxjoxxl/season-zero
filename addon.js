@@ -526,9 +526,16 @@ app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
 
     if (!target) return res.json({ videos: [] });
 
+    // Use IMDB ID for the video ID so other addons (e.g. Torrentio) can find streams.
+    // Fall back to TMDB ID format if no IMDB ID is available.
+    const imdbId = series.external_ids && series.external_ids.imdb_id;
+    const videoId = imdbId
+      ? imdbId + ':' + target.season + ':' + target.episode
+      : 'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode;
+
     res.json({
       videos: [{
-        id:        'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode,
+        id:        videoId,
         title:     target.name,
         season:    target.season,
         episode:   target.episode,
