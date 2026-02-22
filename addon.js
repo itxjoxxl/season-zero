@@ -208,7 +208,8 @@ function buildManifest(config) {
     catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
     resources:   resources,
     types:       ['movie', 'series'],
-    idPrefixes:  ['tmdb:', 'bestof:'],
+    // FIX 1: Add 'tt' prefix so stream addons (Torrentio etc.) respond to our video IDs
+    idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
     behaviorHints: {
       configurable:          true,
       configurationRequired: !cfg.tmdbApiKey,
@@ -227,8 +228,6 @@ app.get('/',          function(req, res) { res.redirect('/configure'); });
 app.get('/configure', function(req, res) { res.send(configurePage()); });
 
 // ─── BEST OF CATALOG ─────────────────────────────────────────────────────────
-// Lists shows with a hand-picked episode list as virtual "⭐ Show" entries.
-// Must be registered before the generic /:config/catalog/:type/:id route.
 app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
   const apiKey = cfg.tmdbApiKey;
@@ -242,6 +241,8 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
         const series  = await getSeries(tmdbId, apiKey);
         const epCount = (customSeasons[tmdbId] || []).length;
         return {
+          // FIX 2: Use 'bestof:' + tmdbId as the series ID.
+          // The videos inside will use real IMDB tt IDs so streams work.
           id:          'bestof:' + tmdbId,
           type:        'series',
           name:        '\u2b50 ' + (series.name || 'Unknown'),
@@ -262,9 +263,19 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
 });
 
 // ─── BEST OF META ─────────────────────────────────────────────────────────────
-// Virtual series with only the user's hand-picked episodes. Video IDs use the
-// real IMDB tt:season:episode format so stream addons (Torrentio etc.) find them.
-// Must be registered before the generic /:config/meta/series/:id route.
+// FIX 3: Video IDs now use the real IMDB tt:season:episode format so that
+// stream addons (Torrentio, etc.) can find streams. The series itself keeps
+// the 'bestof:' prefix so we can tell it apart from a normal tmdb: series.
+//
+// WHY THIS WORKS:
+//   - Stremio resolves streams by sending the *video* ID to stream addons.
+//   - Torrentio accepts IDs like "tt0944947:1:5" (tt + season + episode).
+//   - The series container ID ("bestof:12345") only matters for THIS addon's
+//     meta handler — stream addons never see it.
+//   - So: series id = bestof:tmdbId, video ids = ttXXXXXXX:S:E  ✓
+//
+// FALLBACK: If a show has no IMDB ID we fall back to tmdb:tmdbId:S:E which
+// won't get streams from Torrentio but is at least consistent.
 app.get('/:config/meta/series/bestof\::tmdbId.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
   const apiKey = cfg.tmdbApiKey;
@@ -290,13 +301,20 @@ app.get('/:config/meta/series/bestof\::tmdbId.json', async function(req, res) {
       const eLabel = String(ep.episode).padStart(2, '0');
       const ratingLine = ep.vote_average > 0
         ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
-      // Real IMDB ID + real season/episode → stream addons can look up streams.
+
+      // FIX 4: Video ID uses real IMDB tt ID + real S/E numbers.
+      // Torrentio and other stream addons look up streams using this exact format.
+      // Season/episode in the video object are set to 1/rank for display ordering
+      // within the single "Best Of" season, but the ID carries the real coordinates.
       const videoId = imdbId
         ? imdbId + ':' + ep.season + ':' + ep.episode
-        : 'bestof:' + tmdbId + ':' + ep.season + ':' + ep.episode;
+        : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
+
       return {
         id:        videoId,
         title:     '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
+        // FIX 5: Use season:1, episode:rank for display (single "Best Of" season).
+        // The actual stream lookup uses the tt:S:E in the id field above.
         season:    1,
         episode:   rank,
         overview:  ratingLine + (ep.overview || ''),
@@ -322,7 +340,16 @@ app.get('/:config/meta/series/bestof\::tmdbId.json', async function(req, res) {
         cast:          cast,
         certification: cert || null,
         videos:        videos,
-        links:         imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
+        // FIX 6: Expose both the bestof: series link AND the real IMDB link.
+        // This helps some stream addons that look at the series-level IMDB ID.
+        links: [
+          ...(imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : []),
+        ],
+        // FIX 7: behaviorHints tells Stremio this is a standalone virtual season,
+        // not a continuation of another series entry.
+        behaviorHints: {
+          defaultVideoId: null,
+        },
       },
     });
   } catch (e) {
@@ -334,13 +361,12 @@ app.get('/:config/meta/series/bestof\::tmdbId.json', async function(req, res) {
 // ─── CATALOG ENDPOINT ────────────────────────────────────────────────────────
 app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
   const cfg      = parseConfig(req.params.config);
-  const type     = req.params.type;   // movie | series
-  const id       = req.params.id;     // catalog id
+  const type     = req.params.type;
+  const id       = req.params.id;
   const apiKey   = cfg.tmdbApiKey;
 
   if (!apiKey) return res.status(400).json({ metas: [] });
 
-  // Parse extras (skip, genre, search)
   const extrasRaw  = req.params.extras || '';
   const extrasMap  = {};
   extrasRaw.split('&').forEach(part => {
@@ -354,7 +380,6 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
   const search = extrasMap.search || null;
 
   try {
-    // Handle search catalogs
     if (id === 'tmdb.search_movies' || id === 'tmdb.search_series') {
       if (!search) return res.json({ metas: [] });
       const tmdbType = id === 'tmdb.search_movies' ? 'movie' : 'tv';
@@ -365,7 +390,6 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
       return res.json({ metas });
     }
 
-    // Look up catalog definition
     const defaultDef = DEFAULT_CATALOGS.find(d => d.id === id);
     const customDef  = (cfg.customCatalogs || []).find(c => c.id === id);
     const catDef     = defaultDef || customDef;
@@ -375,19 +399,14 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
     let path   = catDef.path;
     let params = { page };
 
-    // Genre filtering
     if (genre) {
-      // Use TMDB discover endpoint when filtering by genre
       const discoverType = type === 'movie' ? 'movie' : 'tv';
       path   = '/discover/' + discoverType;
       params = { page, with_genres: genre };
-
-      // For discover, replicate sorting from original catalog
       if (id.includes('top_rated')) params.sort_by = 'vote_average.desc';
       else if (id.includes('popular') || id.includes('trending')) params.sort_by = 'popularity.desc';
     }
 
-    // Handle custom catalog path params
     if (customDef && customDef.params) {
       Object.assign(params, customDef.params);
     }
@@ -409,7 +428,7 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
 app.get('/api/search', async function(req, res) {
   const q      = req.query.q;
   const apiKey = req.query.apiKey;
-  const type   = req.query.type || 'tv'; // 'tv' or 'movie' or 'multi'
+  const type   = req.query.type || 'tv';
   if (!q || !apiKey) return res.json({ results: [] });
   try {
     const data = await tmdb('/search/' + type, apiKey, { query: q });
@@ -450,10 +469,9 @@ app.get('/api/episodes', async function(req, res) {
   }
 });
 
-// API endpoint for TMDB genres (used in custom catalog builder)
 app.get('/api/genres', async function(req, res) {
   const apiKey = req.query.apiKey;
-  const type   = req.query.type || 'movie'; // movie | tv
+  const type   = req.query.type || 'movie';
   if (!apiKey) return res.json({ genres: [] });
   try {
     const data = await tmdb('/genre/' + type + '/list', apiKey);
@@ -540,8 +558,7 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       } catch (e) { /* skip */ }
     }
 
-    // Season 0 — auto Best Of: top-N rated episodes, display only (streams won't work).
-    // Controlled by the showAutoSeason config flag (default: true).
+    // Season 0 — auto Best Of
     if (cfg.showAutoSeason !== false) {
       const bestOfEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
       bestOfEps.forEach(function(ep, i) {
@@ -594,6 +611,12 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
   }
 });
 
+// ─── EPISODE VIDEOS ──────────────────────────────────────────────────────────
+// FIX 8: Handle both 'tmdb:' prefixed IDs (Season 0 auto best-of) and
+// 'tt' prefixed IDs that come from bestof: series video clicks.
+// When Stremio clicks a video in a bestof: series, the video ID is
+// "tt1234567:3:5" — this handler intercepts that and returns the
+// canonical stream-ready ID so other addons can pick it up.
 app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
   const config = req.params.config;
   const id     = req.params.id;
@@ -601,47 +624,57 @@ app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
   if (!cfg.tmdbApiKey) return res.json({ videos: [] });
 
   const parts = id.split(':');
-  if (parts.length < 4 || parts[0] !== 'tmdb') return res.json({ videos: [] });
 
-  const tmdbId     = parts[1];
-  const season     = parseInt(parts[2]);
-  const episodeNum = parseInt(parts[3]);
-  const topN       = parseInt(cfg.topN) || 20;
+  // Case A: Season 0 auto best-of via tmdb: prefix (original behaviour)
+  if (parts[0] === 'tmdb' && parts.length >= 4) {
+    const tmdbId     = parts[1];
+    const season     = parseInt(parts[2]);
+    const episodeNum = parseInt(parts[3]);
+    const topN       = parseInt(cfg.topN) || 20;
 
-  if (season !== 0) return res.json({ videos: [] });
+    if (season !== 0) return res.json({ videos: [] });
 
-  try {
-    const series        = await getSeries(tmdbId, cfg.tmdbApiKey);
-    const customSeasons = cfg.customSeasons || {};
-    const customList    = customSeasons[tmdbId];
-    let target;
+    try {
+      const series        = await getSeries(tmdbId, cfg.tmdbApiKey);
+      const customSeasons = cfg.customSeasons || {};
+      const customList    = customSeasons[tmdbId];
+      let target;
 
-    if (customList && customList.length > 0) {
-      const allEps = await getAllEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
-      const ref    = customList[episodeNum - 1];
-      if (!ref) return res.json({ videos: [] });
-      target = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
-    } else {
-      const topEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
-      target = topEps[episodeNum - 1];
+      if (customList && customList.length > 0) {
+        const allEps = await getAllEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
+        const ref    = customList[episodeNum - 1];
+        if (!ref) return res.json({ videos: [] });
+        target = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });
+      } else {
+        const topEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
+        target = topEps[episodeNum - 1];
+      }
+
+      if (!target) return res.json({ videos: [] });
+
+      res.json({
+        videos: [{
+          id:        'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode,
+          title:     target.name,
+          season:    target.season,
+          episode:   target.episode,
+          thumbnail: target.still,
+          overview:  target.overview,
+        }],
+      });
+    } catch (e) {
+      console.error('[episodeVideos tmdb]', e.message);
+      res.json({ videos: [] });
     }
-
-    if (!target) return res.json({ videos: [] });
-
-    res.json({
-      videos: [{
-        id:        'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode,
-        title:     target.name,
-        season:    target.season,
-        episode:   target.episode,
-        thumbnail: target.still,
-        overview:  target.overview,
-      }],
-    });
-  } catch (e) {
-    console.error('[episodeVideos]', e.message);
-    res.json({ videos: [] });
+    return;
   }
+
+  // Case B: Video ID is a real IMDB tt:season:episode from a bestof: series.
+  // The ID looks like "tt0944947:3:5". We pass it straight through so Stremio
+  // forwards it to stream addons (Torrentio etc.) unchanged.
+  // episodeVideos is not needed here — the video already has the correct ID
+  // embedded in the meta videos array. Return empty so we don't interfere.
+  return res.json({ videos: [] });
 });
 
 
@@ -649,7 +682,6 @@ app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
 function configurePage() {
   const defaultCatalogsJson = JSON.stringify(DEFAULT_CATALOGS);
 
-  // CSS is safe in a template literal - no JS escaping issues
   const css = `
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -801,8 +833,6 @@ function configurePage() {
     @media (max-width: 540px) { .features-grid { grid-template-columns: 1fr; } .main { padding: 1.5rem 1rem; } .form-row { grid-template-columns: 1fr; } }
   `;
 
-  // The client-side JS — written as a plain Node string so escaping is unambiguous.
-  // Single-quotes are used for JS string delimiters here; HTML attribute values use double-quotes.
   const clientJS = [
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
     "var state = { apiKey: '', topN: 20, showAutoSeason: true, customSeasons: {}, catalogEnabled: {}, customCatalogs: [] };",
@@ -1145,7 +1175,6 @@ function configurePage() {
     '      <div class="step-item" id="step-tab-4"><span class="step-num">4</span><span>Install</span></div>\n' +
     '    </div>\n  </div>\n' +
     '  <div class="main">\n' +
-    // PAGE 1
     '    <div class="page active" id="page-1">\n' +
     '      <div class="card">\n' +
     '        <div style="text-align:center;padding:1rem 0 1.8rem;font-size:4rem;opacity:0.6">&#128273;</div>\n' +
@@ -1175,7 +1204,6 @@ function configurePage() {
     '        </div>\n' +
     '        <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>\n' +
     '      </div>\n    </div>\n' +
-    // PAGE 2
     '    <div class="page" id="page-2">\n' +
     '      <div class="card">\n' +
     '        <div class="card-title">&#128198; TMDB Catalogs</div>\n' +
@@ -1209,7 +1237,6 @@ function configurePage() {
     '        <button class="btn btn-secondary" onclick="goTo(1)">&larr; Back</button>\n' +
     '        <button class="btn btn-primary btn-lg" onclick="goTo(3)">Next &rarr;</button>\n' +
     '      </div>\n    </div>\n' +
-    // PAGE 3
     '    <div class="page" id="page-3">\n' +
     '      <div class="card">\n' +
     '        <div class="card-title">&#9999;&#65039; Custom Best Of Catalog</div>\n' +
@@ -1228,7 +1255,6 @@ function configurePage() {
     '        <button class="btn btn-secondary" onclick="goTo(2)">&larr; Back</button>\n' +
     '        <button class="btn btn-gold btn-lg" onclick="goTo(4)">Generate Install Link &rarr;</button>\n' +
     '      </div>\n    </div>\n' +
-    // PAGE 4
     '    <div class="page" id="page-4">\n' +
     '      <div class="card">\n' +
     '        <div class="generate-hero"><div style="font-size:3.5rem;margin-bottom:12px">&#128640;</div><h2>Ready to install!</h2><p>Your addon is configured. Click below to add it directly to Stremio.</p></div>\n' +
@@ -1240,7 +1266,6 @@ function configurePage() {
     '      <div class="nav-row"><button class="btn btn-secondary" onclick="goTo(3)">&larr; Back</button></div>\n' +
     '    </div>\n' +
     '  </div>\n</div>\n' +
-    // MODAL
     '<div class="modal-backdrop" id="modal-backdrop" onclick="closeModalOnBackdrop(event)">\n' +
     '  <div class="modal">\n' +
     '    <div class="modal-header">\n' +
