@@ -195,7 +195,10 @@ function buildManifest(config) {
     description: 'Full TMDB metadata, catalogs, and search. Custom Best Of lists with IMDB import.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
     catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
-    resources:   ['catalog', 'meta', 'episodeVideos'],
+    // NOTE: We intentionally do NOT advertise the episodeVideos resource in the manifest.
+    // Stremio shows any declared resource types in the add-on details; removing it keeps
+    // the add-on cleaner while still keeping the endpoint implementation in this same server.
+    resources:   ['catalog', 'meta'],
     types:       ['movie', 'series'],
     idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
     behaviorHints: { configurable: true, configurationRequired: !cfg.tmdbApiKey },
@@ -353,167 +356,85 @@ app.get('/api/genres', async function(req, res) {
 // Fetches the IMDB list CSV export, extracts tvEpisode tt IDs, resolves each
 // to {season, episode} via TMDB's /find endpoint, and returns episode refs.
 // All episodes must belong to the same TMDB series (tmdbId param).
-
-// ─── IMDB LIST IMPORT ─────────────────────────────────────────────────────────
-// Fetches an IMDB list export (CSV when available, otherwise scrapes the list page),
-// extracts episode tt IDs, resolves each to {season, episode} via TMDB's /find endpoint.
-// All matched episodes must belong to the same TMDB series (tmdbId param).
 app.get('/api/imdb-list', async function(req, res) {
-  let { url: listUrl, apiKey, tmdbId } = req.query;
+  const { url: listUrl, apiKey, tmdbId } = req.query;
   if (!listUrl || !apiKey || !tmdbId) return res.status(400).json({ error: 'url, apiKey, and tmdbId required' });
 
-  // Normalize tmdbId (config sometimes stores IDs like "tmdb:12345")
-  tmdbId = String(tmdbId).replace(/^tmdb:/, '').trim();
-
-  // Extract list ID from URL (ls086682535)
-  const listIdMatch = String(listUrl).match(/ls\d+/);
+  // Extract list ID from URL  (ls086682535)
+  const listIdMatch = listUrl.match(/ls\d+/);
   if (!listIdMatch) return res.status(400).json({ error: 'Could not parse IMDB list ID from URL' });
   const listId = listIdMatch[0];
 
-  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-
-  function normType(s) {
-    return String(s || '').toLowerCase().replace(/[^a-z]/g, ''); // "TV Episode" -> "tvepisode"
-  }
-
-  // Minimal CSV parser (handles commas + quotes)
-  function parseCsv(text) {
-    const rows = [];
-    let row = [];
-    let cur = '';
-    let inQuotes = false;
-
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      const next = text[i + 1];
-
-      if (inQuotes) {
-        if (ch === '"' && next === '"') { cur += '"'; i++; continue; }
-        if (ch === '"') { inQuotes = false; continue; }
-        cur += ch;
-        continue;
-      }
-
-      if (ch === '"') { inQuotes = true; continue; }
-      if (ch === ',') { row.push(cur); cur = ''; continue; }
-      if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; continue; }
-      if (ch === '\r') continue;
-
-      cur += ch;
-    }
-    // last cell
-    if (cur.length || row.length) { row.push(cur); rows.push(row); }
-    return rows;
-  }
-
-  async function fetchImdbCsvExport() {
-    const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
-    const resp = await axios.get(csvUrl, {
-      headers: {
-        'Accept': 'text/csv,text/plain,*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'User-Agent': UA,
-      },
-      timeout: 20000,
-      validateStatus: (s) => s >= 200 && s < 400,
-    });
-
-    // Sometimes IMDB returns HTML here (blocked) — treat that as a failure so we fall back to scraping.
-    const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
-    if (ct.includes('text/html')) throw new Error('IMDB export returned HTML (blocked)');
-    return resp.data;
-  }
-
-  async function scrapeImdbListTtIds() {
-    const pageUrl = 'https://www.imdb.com/list/' + listId + '/';
-    const resp = await axios.get(pageUrl, {
-      headers: {
-        'Accept': 'text/html,*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'User-Agent': UA,
-      },
-      timeout: 20000,
-      validateStatus: (s) => s >= 200 && s < 400,
-    });
-
-    const html = String(resp.data || '');
-
-    // Primary: href="/title/ttXXXXXXX/"
-    const hrefMatches = [...html.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
-
-    // Secondary: "url":"https://www.imdb.com/title/ttXXXXXXX/"
-    const urlMatches = [...html.matchAll(/"url"\s*:\s*"https?:\/\/www\.imdb\.com\/title\/(tt\d+)\//g)].map(m => m[1]);
-
-    return [...new Set([...hrefMatches, ...urlMatches])];
-  }
-
   try {
-    let csvText = null;
+    // Fetch CSV export - IMDB provides this publicly
+    const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
+    let csvText;
     try {
-      csvText = await fetchImdbCsvExport();
+      const resp = await axios.get(csvUrl, {
+        headers: { 'Accept': 'text/csv,text/plain,*/*', 'Accept-Language': 'en-US,en;q=0.9' },
+        timeout: 15000,
+      });
+      csvText = resp.data;
     } catch (e) {
-      csvText = null; // fall back to scraping
+      // CSV export may require login for some lists — fall back to scraping list page
+      const pageUrl = 'https://www.imdb.com/list/' + listId + '/';
+      const resp = await axios.get(pageUrl, {
+        headers: { 'Accept-Language': 'en-US,en;q=0.9', 'Accept': 'text/html' },
+        timeout: 15000,
+      });
+      // Extract tt IDs from href="/title/ttXXXXXXX/" patterns in HTML
+      const ttMatches = [...resp.data.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
+      const unique = [...new Set(ttMatches)];
+      csvText = null;  // signal to use ttIds directly
+      req._ttIds = unique;
     }
 
     let ttIds = [];
     if (csvText) {
-      const rows = parseCsv(String(csvText));
-      if (!rows.length) return res.json({ episodes: [], errors: [{ reason: 'Empty CSV export' }], skipped: 0 });
-
-      const header = rows[0].map(h => String(h || '').trim().toLowerCase());
+      // Parse CSV: find header row, locate 'Const' and 'Title Type' columns
+      const lines = csvText.split('\n').filter(l => l.trim());
+      const header = lines[0].split(',').map(h => h.replace(/"/g, '').trim().toLowerCase());
       const constIdx = header.findIndex(h => h === 'const');
       const typeIdx  = header.findIndex(h => h === 'title type');
-
       if (constIdx === -1) return res.status(400).json({ error: 'Unexpected CSV format — missing Const column' });
-
-      for (let i = 1; i < rows.length; i++) {
-        const cols = rows[i] || [];
-        const ttId = String(cols[constIdx] || '').trim();
-        const ttypeNorm = typeIdx !== -1 ? normType(cols[typeIdx]) : '';
-
-        // If there's a Title Type column, only accept episode rows.
-        // If there isn't, accept any tt IDs and let TMDB decide.
-        if (ttId && ttId.startsWith('tt') && (typeIdx === -1 || ttypeNorm === 'tvepisode')) {
+      for (let i = 1; i < lines.length; i++) {
+        // Simple CSV parse (handles quoted fields)
+        const cols = lines[i].match(/("([^"]*)"|([^,]*))(,|$)/g)
+          .map(f => f.replace(/^"|"$|,$/g, '').trim());
+        const ttId  = cols[constIdx];
+        const ttypeRaw = typeIdx !== -1 ? (cols[typeIdx] || '') : '';
+        // IMDb exports sometimes use "TV Episode" (with a space) rather than "tvEpisode".
+        // Normalize aggressively so we don't accidentally filter out all episodes.
+        const ttype = String(ttypeRaw).toLowerCase().replace(/[^a-z0-9]/g, '');
+        // Accept TV episode rows, OR if no type column just accept all tt IDs
+        if (ttId && ttId.startsWith('tt') && (typeIdx === -1 || ttype === 'tvepisode')) {
           ttIds.push(ttId);
         }
       }
     } else {
-      ttIds = await scrapeImdbListTtIds();
+      ttIds = req._ttIds || [];
     }
 
-    ttIds = [...new Set(ttIds)].filter(Boolean);
-
-    if (!ttIds.length) {
-      return res.json({ episodes: [], errors: [{ reason: 'No IMDb title IDs found in list (export blocked and scrape returned none)' }], skipped: 0 });
-    }
+    if (!ttIds.length) return res.json({ episodes: [], errors: [], skipped: 0 });
 
     // Resolve each tt ID to season/episode via TMDB /find
     const results = [];
     const errors  = [];
-
+    // Batch sequentially to avoid rate limiting
     for (const ttId of ttIds) {
       try {
         const found = await tmdb('/find/' + ttId, apiKey, { external_source: 'imdb_id' });
         const epResults = found.tv_episode_results || [];
         if (epResults.length > 0) {
-          // Some IDs can map to multiple results; keep those that match the show_id.
-          const matches = epResults.filter(ep => String(ep.show_id) === String(tmdbId));
-          if (matches.length > 0) {
-            for (const ep of matches) {
-              results.push({ season: ep.season_number, episode: ep.episode_number });
-            }
+          const ep = epResults[0];
+          // Verify it belongs to the requested show
+          if (String(ep.show_id) === String(tmdbId)) {
+            results.push({ season: ep.season_number, episode: ep.episode_number });
           } else {
-            errors.push({ ttId, reason: 'Episode belongs to a different show (show_id=' + String(epResults[0].show_id) + ')' });
+            errors.push({ ttId, reason: 'Episode belongs to a different show (show_id=' + ep.show_id + ')' });
           }
         } else {
-          // Helpful diagnostics: sometimes a list contains series/movie items.
-          const tvRes = (found.tv_results || []).length;
-          const mvRes = (found.movie_results || []).length;
-          if (tvRes || mvRes) {
-            errors.push({ ttId, reason: 'TMDB found non-episode result (tv_results=' + tvRes + ', movie_results=' + mvRes + ')' });
-          } else {
-            errors.push({ ttId, reason: 'Not found as TV episode on TMDB' });
-          }
+          errors.push({ ttId, reason: 'Not found as TV episode on TMDB' });
         }
       } catch (e) {
         errors.push({ ttId, reason: e.message });
@@ -529,13 +450,12 @@ app.get('/api/imdb-list', async function(req, res) {
       return true;
     });
 
-    res.json({ episodes: deduped, errors, skipped: errors.length, totalIds: ttIds.length, matched: deduped.length, tmdbId });
+    res.json({ episodes: deduped, errors, skipped: errors.length });
   } catch (e) {
     console.error('[imdb-list]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
-
 
 // ─── META ENDPOINTS ───────────────────────────────────────────────────────────
 app.get('/:config/meta/movie/:id.json', async function(req, res) {
@@ -1139,7 +1059,13 @@ function configurePage() {
     "    var r = await fetch('/api/imdb-list?url=' + encodeURIComponent(url) + '&apiKey=' + encodeURIComponent(state.apiKey) + '&tmdbId=' + list.tmdbId);",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
-    "    if (!d.episodes || !d.episodes.length) throw new Error('No matching episodes found for this show. Check the list contains TV episodes from this series.');",
+    "    if (!d.episodes || !d.episodes.length) {",
+    "      var hint = '';",
+    "      if (d.errors && d.errors.length) {",
+    "        hint = ' Example: ' + (d.errors[0].ttId || '') + (d.errors[0].reason ? ' — ' + d.errors[0].reason : '');",
+    "      }",
+    "      throw new Error('No matching episodes found for this show. Make sure your IMDb list items are TV Episodes from this exact series.' + hint);",
+    "    }",
     // Merge imported episodes with existing, dedup, preserve order
     "    var existingKeys = new Set(list.episodes.map(function(e) { return e.season + ':' + e.episode; }));",
     "    var allEpsForShow = modalData.tmdbId === list.tmdbId ? modalData.allEpisodes : [];",
