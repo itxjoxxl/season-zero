@@ -136,6 +136,7 @@ function seriesToMeta(s) {
 }
 
 // Build videos array for a bestof list entry
+// FIX: Use imdbId:season:episode format so stream addons can resolve them.
 function buildBestOfVideos(bestOfEps, imdbId, tmdbId) {
   return bestOfEps.map(function(ep, i) {
     const rank = i + 1;
@@ -143,6 +144,8 @@ function buildBestOfVideos(bestOfEps, imdbId, tmdbId) {
     const eLabel = String(ep.episode).padStart(2, '0');
     const ratingLine = ep.vote_average > 0
       ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
+    // Prefer IMDB id format (tt1234:S:E) — stream addons expect this.
+    // Fall back to tmdb: prefix only when no IMDB id is available.
     const videoId = imdbId
       ? imdbId + ':' + ep.season + ':' + ep.episode
       : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
@@ -195,7 +198,7 @@ function buildManifest(config) {
     description: 'Full TMDB metadata, catalogs, and search. Custom Best Of lists with IMDB import.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
     catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
-    resources:   ['catalog', 'meta'],
+    resources:   ['catalog', 'meta', 'episodeVideos'],
     types:       ['movie', 'series'],
     idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
     behaviorHints: { configurable: true, configurationRequired: !cfg.tmdbApiKey },
@@ -219,7 +222,6 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
   const customSeasons = cfg.customSeasons || [];
   if (!customSeasons.length) return res.json({ metas: [] });
   try {
-    // Cache series lookups so we don't hit TMDB multiple times for the same show
     const seriesCache = {};
     const metas = (await Promise.all(customSeasons.map(async function(list) {
       try {
@@ -258,16 +260,22 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
   const apiKey = cfg.tmdbApiKey;
   if (!apiKey) return res.status(400).json({ metas: [] });
 
+  // FIX: Parse extras robustly — Stremio may send them as key=value pairs
+  // separated by & and the whole string may or may not be URL-encoded.
   const extrasRaw = req.params.extras || '';
   const extrasMap = {};
   extrasRaw.split('&').forEach(part => {
-    const [k, v] = part.split('=');
-    if (k && v !== undefined) extrasMap[decodeURIComponent(k)] = decodeURIComponent(v);
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) return;
+    const k = decodeURIComponent(part.slice(0, eqIdx));
+    const v = decodeURIComponent(part.slice(eqIdx + 1));
+    if (k) extrasMap[k] = v;
   });
   const skip   = parseInt(extrasMap.skip) || 0;
   const page   = Math.floor(skip / 20) + 1;
   const genre  = extrasMap.genre  || null;
-  const search = extrasMap.search || null;
+  // FIX: search queries can be double-encoded; normalise
+  const search = extrasMap.search ? extrasMap.search.trim() : null;
 
   try {
     if (id === 'tmdb.search_movies' || id === 'tmdb.search_series') {
@@ -350,22 +358,12 @@ app.get('/api/genres', async function(req, res) {
 });
 
 // ─── IMDB LIST IMPORT ─────────────────────────────────────────────────────────
-// Fetches the IMDB list CSV export, extracts tvEpisode tt IDs, resolves each
-// to {season, episode} via TMDB's /find endpoint, and returns episode refs.
-// All episodes must belong to the same TMDB series (tmdbId param).
-
-// ─── IMDB LIST IMPORT ─────────────────────────────────────────────────────────
-// Fetches an IMDB list export (CSV when available, otherwise scrapes the list page),
-// extracts episode tt IDs, resolves each to {season, episode} via TMDB's /find endpoint.
-// All matched episodes must belong to the same TMDB series (tmdbId param).
 app.get('/api/imdb-list', async function(req, res) {
   let { url: listUrl, apiKey, tmdbId } = req.query;
   if (!listUrl || !apiKey || !tmdbId) return res.status(400).json({ error: 'url, apiKey, and tmdbId required' });
 
-  // Normalize tmdbId (config sometimes stores IDs like "tmdb:12345")
   tmdbId = String(tmdbId).replace(/^tmdb:/, '').trim();
 
-  // Extract list ID from URL (ls086682535)
   const listIdMatch = String(listUrl).match(/ls\d+/);
   if (!listIdMatch) return res.status(400).json({ error: 'Could not parse IMDB list ID from URL' });
   const listId = listIdMatch[0];
@@ -373,10 +371,9 @@ app.get('/api/imdb-list', async function(req, res) {
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
   function normType(s) {
-    return String(s || '').toLowerCase().replace(/[^a-z]/g, ''); // "TV Episode" -> "tvepisode"
+    return String(s || '').toLowerCase().replace(/[^a-z]/g, '');
   }
 
-  // Minimal CSV parser (handles commas + quotes)
   function parseCsv(text) {
     const rows = [];
     let row = [];
@@ -401,7 +398,6 @@ app.get('/api/imdb-list', async function(req, res) {
 
       cur += ch;
     }
-    // last cell
     if (cur.length || row.length) { row.push(cur); rows.push(row); }
     return rows;
   }
@@ -418,7 +414,6 @@ app.get('/api/imdb-list', async function(req, res) {
       validateStatus: (s) => s >= 200 && s < 400,
     });
 
-    // Sometimes IMDB returns HTML here (blocked) — treat that as a failure so we fall back to scraping.
     const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
     if (ct.includes('text/html')) throw new Error('IMDB export returned HTML (blocked)');
     return resp.data;
@@ -437,11 +432,7 @@ app.get('/api/imdb-list', async function(req, res) {
     });
 
     const html = String(resp.data || '');
-
-    // Primary: href="/title/ttXXXXXXX/"
     const hrefMatches = [...html.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
-
-    // Secondary: "url":"https://www.imdb.com/title/ttXXXXXXX/"
     const urlMatches = [...html.matchAll(/"url"\s*:\s*"https?:\/\/www\.imdb\.com\/title\/(tt\d+)\//g)].map(m => m[1]);
 
     return [...new Set([...hrefMatches, ...urlMatches])];
@@ -452,7 +443,7 @@ app.get('/api/imdb-list', async function(req, res) {
     try {
       csvText = await fetchImdbCsvExport();
     } catch (e) {
-      csvText = null; // fall back to scraping
+      csvText = null;
     }
 
     let ttIds = [];
@@ -471,8 +462,6 @@ app.get('/api/imdb-list', async function(req, res) {
         const ttId = String(cols[constIdx] || '').trim();
         const ttypeNorm = typeIdx !== -1 ? normType(cols[typeIdx]) : '';
 
-        // If there's a Title Type column, only accept episode rows.
-        // If there isn't, accept any tt IDs and let TMDB decide.
         if (ttId && ttId.startsWith('tt') && (typeIdx === -1 || ttypeNorm === 'tvepisode')) {
           ttIds.push(ttId);
         }
@@ -487,7 +476,6 @@ app.get('/api/imdb-list', async function(req, res) {
       return res.json({ episodes: [], errors: [{ reason: 'No IMDb title IDs found in list (export blocked and scrape returned none)' }], skipped: 0 });
     }
 
-    // Resolve each tt ID to season/episode via TMDB /find
     const results = [];
     const errors  = [];
 
@@ -496,7 +484,6 @@ app.get('/api/imdb-list', async function(req, res) {
         const found = await tmdb('/find/' + ttId, apiKey, { external_source: 'imdb_id' });
         const epResults = found.tv_episode_results || [];
         if (epResults.length > 0) {
-          // Some IDs can map to multiple results; keep those that match the show_id.
           const matches = epResults.filter(ep => String(ep.show_id) === String(tmdbId));
           if (matches.length > 0) {
             for (const ep of matches) {
@@ -506,7 +493,6 @@ app.get('/api/imdb-list', async function(req, res) {
             errors.push({ ttId, reason: 'Episode belongs to a different show (show_id=' + String(epResults[0].show_id) + ')' });
           }
         } else {
-          // Helpful diagnostics: sometimes a list contains series/movie items.
           const tvRes = (found.tv_results || []).length;
           const mvRes = (found.movie_results || []).length;
           if (tvRes || mvRes) {
@@ -520,7 +506,6 @@ app.get('/api/imdb-list', async function(req, res) {
       }
     }
 
-    // Deduplicate
     const seen = new Set();
     const deduped = results.filter(ep => {
       const key = ep.season + ':' + ep.episode;
@@ -575,9 +560,6 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
 
   // ── bestof: handler ───────────────────────────────────────────────────────
-  // Stremio URL-encodes the colon as %3A in the path, so a dedicated route
-  // like app.get('...bestof\\::id...') never matches (Express matches raw paths).
-  // The generic :id param receives the already-decoded value 'bestof:xxxx'.
   if (id.startsWith('bestof:')) {
     const listId        = id.slice('bestof:'.length);
     const customSeasons = cfg.customSeasons || [];
@@ -628,14 +610,22 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
     const series = await getSeries(tmdbId, cfg.tmdbApiKey);
     const cert   = getSeriesCert(series);
     const cast   = (series.credits && series.credits.cast || []).slice(0, 8).map(c => c.name);
+    // FIX: Use IMDB id in video IDs so that stream addons (torrentio etc.) can
+    // resolve streams. Format: ttXXXXX:season:episode
+    // Fall back to tmdb: prefix only when no external IMDB id is available.
+    const imdbId = series.external_ids && series.external_ids.imdb_id || null;
     const videos = [];
 
     for (let s = 1; s <= (series.number_of_seasons || 0); s++) {
       try {
         const season = await getSeason(tmdbId, s, cfg.tmdbApiKey);
         for (const ep of (season.episodes || [])) {
+          // KEY FIX: video id uses imdbId when available so streams resolve correctly
+          const videoId = imdbId
+            ? imdbId + ':' + s + ':' + ep.episode_number
+            : id + ':' + s + ':' + ep.episode_number;
           videos.push({
-            id: id + ':' + s + ':' + ep.episode_number,
+            id: videoId,
             title: ep.name || 'Episode ' + ep.episode_number,
             season: s, episode: ep.episode_number,
             overview: ep.overview || '',
@@ -655,8 +645,9 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
         const eLabel = String(ep.episode).padStart(2, '0');
         const ratingLine = ep.vote_average > 0
           ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
+        // Season 0 pseudo-episodes use a stable tmdb: id so episodeVideos can remap them
         videos.push({
-          id: id + ':' + ep.season + ':' + ep.episode,
+          id: 'tmdb:' + tmdbId + ':0:' + rank,
           title: '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
           season: 0, episode: rank,
           overview: ratingLine + (ep.overview || ''),
@@ -678,8 +669,8 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       genres:        (series.genres || []).map(g => g.name),
       imdbRating:    series.vote_average ? series.vote_average.toFixed(1) : null,
       cast, certification: cert || null,
-      links: series.external_ids && series.external_ids.imdb_id
-        ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + series.external_ids.imdb_id }] : [],
+      links: imdbId
+        ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
     }});
   } catch (e) {
     console.error('[series meta]', e.message);
@@ -688,6 +679,7 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
 });
 
 // ─── EPISODE VIDEOS ───────────────────────────────────────────────────────────
+// Only needed for Season 0 auto-best-of pseudo-episodes (remaps to real episode id)
 app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
   const id     = req.params.id;
@@ -701,12 +693,17 @@ app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
   if (season !== 0) return res.json({ videos: [] });
   try {
     const series = await getSeries(tmdbId, cfg.tmdbApiKey);
+    const imdbId = series.external_ids && series.external_ids.imdb_id || null;
     const topN   = parseInt(cfg.topN) || 20;
     const topEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
     const target = topEps[episodeNum - 1];
     if (!target) return res.json({ videos: [] });
+    // FIX: return the real episode id so stream addons can resolve it
+    const realId = imdbId
+      ? imdbId + ':' + target.season + ':' + target.episode
+      : 'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode;
     res.json({ videos: [{
-      id:        'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode,
+      id:        realId,
       title:     target.name, season: target.season, episode: target.episode,
       thumbnail: target.still, overview: target.overview,
     }]});
@@ -728,51 +725,92 @@ function configurePage() {
       --text: #c8d4e0; --text-dim: #5a6878; --text-mute: #3a4555;
       --accent: #3d9be9; --accent2: #56cfb0; --gold: #f0b429;
       --purple: #8b5cf6; --danger: #e05252; --radius: 12px;
+      --beta: #f59e0b;
     }
     body { background: var(--bg); color: var(--text); font-family: "DM Sans", sans-serif; min-height: 100vh; }
     .app { display: flex; flex-direction: column; min-height: 100vh; }
-    .topbar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 2rem; height: 60px; display: flex; align-items: center; gap: 1rem; position: sticky; top: 0; z-index: 100; }
-    .topbar-logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1rem; color: #fff; }
-    .topbar-steps { display: flex; align-items: center; gap: 0; margin-left: auto; }
-    .step-item { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; color: var(--text-dim); padding: 6px 14px; }
+
+    /* ── Topbar: responsive ── */
+    .topbar {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 0 1.5rem; height: 56px; display: flex; align-items: center; gap: 1rem;
+      position: sticky; top: 0; z-index: 100; overflow: hidden;
+    }
+    .topbar-logo { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 0.95rem; color: #fff; white-space: nowrap; flex-shrink: 0; }
+    .topbar-steps { display: flex; align-items: center; gap: 0; margin-left: auto; overflow: hidden; }
+    .step-item {
+      display: flex; align-items: center; gap: 6px; font-size: 0.75rem;
+      color: var(--text-dim); padding: 5px 10px; white-space: nowrap; flex-shrink: 0;
+    }
     .step-item.active { color: var(--accent); }
-    .step-item.done { color: var(--accent2); }
-    .step-num { width: 22px; height: 22px; border-radius: 50%; background: var(--surface2); border: 1.5px solid var(--border2); display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700; }
+    .step-item.done   { color: var(--accent2); }
+    .step-label { display: inline; }
+    .step-num {
+      width: 20px; height: 20px; border-radius: 50%; background: var(--surface2);
+      border: 1.5px solid var(--border2); display: flex; align-items: center;
+      justify-content: center; font-size: 0.68rem; font-weight: 700; flex-shrink: 0;
+    }
     .step-item.active .step-num { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .step-item.done .step-num { background: var(--accent2); border-color: var(--accent2); color: #000; }
-    .step-divider { color: var(--text-mute); font-size: 0.7rem; }
-    .main { flex: 1; padding: 2.5rem 2rem; max-width: 820px; margin: 0 auto; width: 100%; }
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 2rem 2rem 2.2rem; margin-bottom: 1.4rem; }
+    .step-item.done   .step-num { background: var(--accent2); border-color: var(--accent2); color: #000; }
+    .step-divider { color: var(--text-mute); font-size: 0.68rem; flex-shrink: 0; }
+    @media (max-width: 540px) {
+      .topbar { padding: 0 1rem; height: 52px; }
+      .step-label { display: none; }
+      .step-item { padding: 5px 6px; gap: 0; }
+      .step-divider { padding: 0 2px; }
+    }
+
+    .main { flex: 1; padding: 2rem 1.5rem; max-width: 820px; margin: 0 auto; width: 100%; }
+    @media (max-width: 540px) { .main { padding: 1.25rem 0.9rem; } }
+
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 1.75rem 1.75rem 2rem; margin-bottom: 1.25rem; }
     .card-title { font-size: 1rem; font-weight: 700; color: #fff; margin-bottom: 0.25rem; }
     .card-sub { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 1.5rem; }
     .field { margin-bottom: 1.2rem; }
-    label { display: block; font-size: 0.78rem; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
-    input[type=text], input[type=number], input[type=password] { width: 100%; background: var(--bg); border: 1.5px solid var(--border2); border-radius: var(--radius); padding: 11px 14px; color: var(--text); font-size: 0.93rem; font-family: inherit; outline: none; transition: border-color 0.15s; }
-    select { width: 100%; background: var(--bg); border: 1.5px solid var(--border2); border-radius: var(--radius); padding: 11px 14px; color: var(--text); font-size: 0.93rem; font-family: inherit; outline: none; transition: border-color 0.15s; cursor: pointer; }
-    input:focus, select:focus { border-color: var(--accent); }
-    input.error { border-color: var(--danger) !important; animation: shake 0.3s; }
+    label { display: block; font-size: 0.75rem; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
+    input[type=text], input[type=number], input[type=password], textarea {
+      width: 100%; background: var(--bg); border: 1.5px solid var(--border2);
+      border-radius: var(--radius); padding: 11px 14px; color: var(--text);
+      font-size: 0.93rem; font-family: inherit; outline: none; transition: border-color 0.15s;
+    }
+    textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
+    select {
+      width: 100%; background: var(--bg); border: 1.5px solid var(--border2);
+      border-radius: var(--radius); padding: 11px 14px; color: var(--text);
+      font-size: 0.93rem; font-family: inherit; outline: none; transition: border-color 0.15s; cursor: pointer;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    input.error, textarea.error { border-color: var(--danger) !important; animation: shake 0.3s; }
     @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-4px)} 75%{transform:translateX(4px)} }
     .hint { font-size: 0.72rem; color: var(--text-mute); margin-top: 5px; }
     .hint a { color: var(--accent); text-decoration: none; }
+
     .btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 10px 20px; border-radius: var(--radius); font-size: 0.88rem; font-weight: 600; font-family: inherit; cursor: pointer; border: none; transition: all 0.15s; }
-    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary   { background: var(--accent); color: #fff; }
     .btn-primary:hover { opacity: 0.85; }
     .btn-secondary { background: var(--surface2); border: 1.5px solid var(--border2); color: var(--text); }
     .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
-    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger    { background: var(--danger); color: #fff; }
     .btn-danger:hover { opacity: 0.85; }
-    .btn-gold { background: var(--gold); color: #000; }
+    .btn-gold      { background: var(--gold); color: #000; }
     .btn-gold:hover { opacity: 0.85; }
-    .btn-install { background: var(--purple); color: #fff; width: 100%; font-size: 1rem; padding: 14px; border-radius: var(--radius); }
+    .btn-install   { background: var(--purple); color: #fff; width: 100%; font-size: 1rem; padding: 14px; border-radius: var(--radius); }
     .btn-install:hover { opacity: 0.85; }
     .btn-lg { padding: 13px 28px; font-size: 0.95rem; }
     .btn-sm { padding: 6px 12px; font-size: 0.75rem; }
+
     .page { display: none; }
     .page.active { display: block; }
+
     .features-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 1.8rem; }
     .feature-chip { background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 0.8rem; color: var(--text-dim); display: flex; align-items: center; gap: 8px; }
+    @media (max-width: 540px) { .features-grid { grid-template-columns: 1fr; } }
+
+    .beta-badge { display: inline-flex; align-items: center; gap: 4px; background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.35); color: var(--beta); font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 2px 7px; border-radius: 20px; vertical-align: middle; margin-left: 6px; }
+
     .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.2rem; }
-    .section-title { font-size: 0.82rem; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+    .section-title  { font-size: 0.82rem; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+
     .search-wrap { position: relative; }
     .search-wrap input { padding-left: 42px; }
     .search-icon { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--text-mute); pointer-events: none; }
@@ -781,69 +819,106 @@ function configurePage() {
     .search-result-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; cursor: pointer; transition: background 0.12s; border: 1px solid transparent; }
     .search-result-item:hover { background: var(--surface2); border-color: var(--border); }
     .search-poster { width: 36px; height: 54px; border-radius: 6px; object-fit: cover; background: var(--surface2); flex-shrink: 0; }
-    .search-name { font-size: 0.88rem; font-weight: 600; color: var(--text); }
-    .search-meta { font-size: 0.72rem; color: var(--text-dim); margin-top: 2px; }
+    .search-name   { font-size: 0.88rem; font-weight: 600; color: var(--text); }
+    .search-meta   { font-size: 0.72rem; color: var(--text-dim); margin-top: 2px; }
+
     .custom-seasons-empty { text-align: center; padding: 2.5rem 1rem; color: var(--text-mute); font-size: 0.83rem; }
+
     .list-card { border: 1px solid var(--border); border-radius: 14px; overflow: hidden; margin-bottom: 12px; background: var(--surface2); }
     .list-card-header { display: flex; align-items: center; gap: 14px; padding: 14px 16px; cursor: pointer; transition: background 0.12s; }
     .list-card-header:hover { background: var(--bg); }
     .list-poster { width: 32px; height: 48px; border-radius: 5px; object-fit: cover; background: var(--surface); flex-shrink: 0; }
     .list-card-meta { flex: 1; min-width: 0; }
     .list-card-name { font-size: 0.9rem; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .list-card-sub { font-size: 0.72rem; color: var(--text-dim); margin-top: 2px; }
+    .list-card-sub  { font-size: 0.72rem; color: var(--text-dim); margin-top: 2px; }
     .list-card-count { font-size: 0.72rem; color: var(--text-dim); flex-shrink: 0; }
     .list-card-chevron { color: var(--text-mute); transition: transform 0.2s; font-size: 0.8rem; }
     .list-card.open .list-card-chevron { transform: rotate(90deg); }
     .list-card-body { display: none; border-top: 1px solid var(--border); padding: 14px 16px; }
     .list-card.open .list-card-body { display: block; }
-    .list-meta-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: flex-end; }
-    .list-meta-row .field { margin-bottom: 0; flex: 1; }
-    .prefix-field { max-width: 90px; }
-    .ep-list { list-style: none; min-height: 40px; }
-    .ep-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 9px; margin-bottom: 5px; background: var(--surface); border: 1px solid var(--border); cursor: grab; user-select: none; }
-    .ep-item.dragging { opacity: 0.45; background: var(--bg); }
+
+    .list-meta-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: flex-end; flex-wrap: wrap; }
+    .list-meta-row .field { margin-bottom: 0; flex: 1; min-width: 120px; }
+    .prefix-field { max-width: 90px; flex: 0 0 90px !important; min-width: 0 !important; }
+
+    .ep-list  { list-style: none; min-height: 40px; }
+    .ep-item  { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 9px; margin-bottom: 5px; background: var(--surface); border: 1px solid var(--border); cursor: grab; user-select: none; }
+    .ep-item.dragging  { opacity: 0.45; background: var(--bg); }
     .ep-item.drag-over { border-color: var(--accent); }
-    .ep-rank { width: 22px; text-align: center; flex-shrink: 0; font-size: 0.72rem; color: var(--text-mute); font-family: "DM Mono", monospace; }
-    .ep-drag { color: var(--text-mute); flex-shrink: 0; }
+    .ep-rank  { width: 22px; text-align: center; flex-shrink: 0; font-size: 0.72rem; color: var(--text-mute); font-family: "DM Mono", monospace; }
+    .ep-drag  { color: var(--text-mute); flex-shrink: 0; }
     .ep-thumb { width: 56px; height: 32px; border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--bg); }
-    .ep-info { flex: 1; min-width: 0; }
+    .ep-info  { flex: 1; min-width: 0; }
     .ep-label { font-size: 0.8rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .ep-sublabel { font-size: 0.68rem; color: var(--text-dim); margin-top: 2px; }
     .ep-rating { font-size: 0.72rem; color: var(--gold); font-family: "DM Mono", monospace; flex-shrink: 0; }
-    .ep-del { flex-shrink: 0; color: var(--text-mute); cursor: pointer; font-size: 1rem; padding: 4px; border-radius: 5px; transition: color 0.12s; }
+    .ep-del   { flex-shrink: 0; color: var(--text-mute); cursor: pointer; font-size: 1rem; padding: 4px; border-radius: 5px; transition: color 0.12s; }
     .ep-del:hover { color: var(--danger); }
+
     .ep-list-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-    .imdb-import-row { display: flex; gap: 8px; margin-top: 10px; }
+
+    /* ── Episode add tabs ── */
+    .ep-add-section { margin-bottom: 14px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    .ep-add-tabs { display: flex; border-bottom: 1px solid var(--border); }
+    .ep-add-tab { flex: 1; padding: 9px 8px; font-size: 0.75rem; font-weight: 600; text-align: center; cursor: pointer; color: var(--text-dim); background: var(--surface2); border: none; font-family: inherit; transition: all 0.12s; border-right: 1px solid var(--border); }
+    .ep-add-tab:last-child { border-right: none; }
+    .ep-add-tab.active { background: var(--surface); color: var(--accent); }
+    .ep-add-tab:hover:not(.active) { color: var(--text); }
+    .ep-add-panel { display: none; padding: 12px 14px; background: var(--surface); }
+    .ep-add-panel.active { display: block; }
+
+    /* Paste panel */
+    .paste-hint { font-size: 0.72rem; color: var(--text-mute); margin-bottom: 8px; }
+    .paste-actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+    .paste-status { font-size: 0.75rem; margin-left: auto; }
+    .paste-status.ok  { color: var(--accent2); }
+    .paste-status.err { color: var(--danger); }
+
+    /* IMDB panel */
+    .imdb-import-row { display: flex; gap: 8px; }
     .imdb-import-row input { flex: 1; font-size: 0.82rem; }
     .imdb-import-status { font-size: 0.75rem; margin-top: 6px; color: var(--text-dim); min-height: 18px; }
     .imdb-import-status.ok  { color: var(--accent2); }
     .imdb-import-status.err { color: var(--danger); }
+
     .catalog-row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 10px; background: var(--surface2); border: 1px solid var(--border); margin-bottom: 8px; }
     .catalog-row-info { flex: 1; }
     .catalog-row-name { font-size: 0.86rem; font-weight: 600; color: var(--text); }
     .catalog-row-type { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; }
+
     .toggle { position: relative; width: 38px; height: 22px; flex-shrink: 0; }
     .toggle input { opacity: 0; width: 0; height: 0; }
     .toggle-slider { position: absolute; inset: 0; background: var(--border2); border-radius: 22px; transition: background 0.2s; cursor: pointer; }
     .toggle-slider::before { content: ''; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: transform 0.2s; }
     .toggle input:checked + .toggle-slider { background: var(--accent); }
     .toggle input:checked + .toggle-slider::before { transform: translateX(16px); }
+
     .catalog-section-label { font-size: 0.72rem; font-weight: 700; color: var(--text-mute); text-transform: uppercase; letter-spacing: 0.08em; margin: 16px 0 8px; }
+
     .custom-catalog-form { background: var(--surface2); border: 1px solid var(--border2); border-radius: 14px; padding: 16px; margin-top: 14px; display: none; }
     .custom-catalog-form.open { display: block; }
     .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 480px) { .form-row { grid-template-columns: 1fr; } }
     .custom-catalog-item { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 10px; background: var(--surface2); border: 1px solid var(--border); margin-bottom: 8px; }
     .custom-catalog-item-info { flex: 1; }
     .custom-catalog-item-name { font-size: 0.86rem; font-weight: 600; color: var(--text); }
-    .custom-catalog-item-sub { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; font-family: "DM Mono", monospace; }
+    .custom-catalog-item-sub  { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; font-family: "DM Mono", monospace; }
+
+    /* ── Auto Best Of config card ── */
+    .bestof-auto-card { background: rgba(240,180,41,0.05); border: 1px solid rgba(240,180,41,0.2); border-radius: 14px; padding: 16px 18px; margin-bottom: 1.25rem; }
+    .bestof-auto-title { font-size: 0.9rem; font-weight: 700; color: var(--gold); margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+    .bestof-auto-desc  { font-size: 0.78rem; color: var(--text-dim); margin-bottom: 14px; line-height: 1.5; }
+    .bestof-auto-row   { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+    .bestof-auto-row .field { margin-bottom: 0; flex: 1; min-width: 140px; }
+
     .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 500; align-items: center; justify-content: center; padding: 1.5rem; }
     .modal-backdrop.open { display: flex; }
     .modal { background: var(--surface); border: 1px solid var(--border2); border-radius: 20px; max-width: 580px; width: 100%; max-height: 88vh; display: flex; flex-direction: column; overflow: hidden; }
     .modal-header { padding: 1.4rem 1.6rem 1rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 14px; }
     .modal-poster { width: 36px; height: 54px; border-radius: 6px; object-fit: cover; background: var(--surface2); flex-shrink: 0; }
-    .modal-title { font-size: 1rem; font-weight: 700; color: #fff; }
-    .modal-sub { font-size: 0.75rem; color: var(--text-dim); margin-top: 2px; }
-    .modal-close { margin-left: auto; color: var(--text-mute); cursor: pointer; font-size: 1.3rem; }
+    .modal-title  { font-size: 1rem; font-weight: 700; color: #fff; }
+    .modal-sub    { font-size: 0.75rem; color: var(--text-dim); margin-top: 2px; }
+    .modal-close  { margin-left: auto; color: var(--text-mute); cursor: pointer; font-size: 1.3rem; }
     .modal-close:hover { color: var(--text); }
     .modal-filter { padding: 12px 1.6rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .season-filter-btn { padding: 5px 13px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; background: var(--surface2); border: 1.5px solid var(--border); color: var(--text-dim); cursor: pointer; transition: all 0.12s; }
@@ -853,43 +928,43 @@ function configurePage() {
     .modal-ep-item:hover { background: var(--surface2); }
     .modal-ep-item.selected { border-color: var(--accent); }
     .modal-ep-thumb { width: 64px; height: 36px; border-radius: 5px; object-fit: cover; background: var(--surface2); flex-shrink: 0; }
-    .modal-ep-info { flex: 1; min-width: 0; }
-    .modal-ep-name { font-size: 0.82rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .modal-ep-meta { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; }
+    .modal-ep-info  { flex: 1; min-width: 0; }
+    .modal-ep-name  { font-size: 0.82rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .modal-ep-meta  { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; }
     .modal-ep-check { width: 20px; height: 20px; border-radius: 6px; border: 2px solid var(--border2); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; transition: all 0.12s; }
     .modal-ep-item.selected .modal-ep-check { background: var(--accent); border-color: var(--accent); color: #fff; }
     .modal-footer { padding: 1rem 1.6rem; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
     .modal-selected-count { font-size: 0.8rem; color: var(--text-dim); }
+
     .generate-hero { text-align: center; padding: 1.2rem 0 2rem; }
     .generate-hero h2 { font-size: 1.3rem; font-weight: 700; color: #fff; margin-bottom: 6px; }
-    .generate-hero p { font-size: 0.83rem; color: var(--text-dim); }
+    .generate-hero p  { font-size: 0.83rem; color: var(--text-dim); }
     .summary-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-radius: 10px; background: var(--surface2); border: 1px solid var(--border); margin-bottom: 8px; font-size: 0.82rem; }
     .summary-label { color: var(--text-dim); }
     .summary-value { color: #fff; font-weight: 600; font-family: "DM Mono", monospace; font-size: 0.78rem; }
     .summary-value.accent { color: var(--accent); }
-    .summary-value.gold { color: var(--gold); }
+    .summary-value.gold   { color: var(--gold); }
     .or-line { text-align: center; font-size: 0.72rem; color: var(--text-mute); margin: 14px 0 12px; }
     .copy-row { display: flex; gap: 8px; }
     .copy-row input { flex: 1; font-size: 0.73rem; color: var(--text-dim); padding: 9px 12px; font-family: "DM Mono", monospace; }
     .btn-copy { flex-shrink: 0; padding: 9px 16px; background: var(--surface2); border: 1.5px solid var(--border2); border-radius: var(--radius); color: var(--text-dim); font-size: 0.78rem; font-weight: 600; cursor: pointer; transition: all 0.15s; font-family: inherit; }
-    .btn-copy:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-copy:hover  { border-color: var(--accent); color: var(--accent); }
     .btn-copy.copied { border-color: var(--accent2); color: var(--accent2); }
+
     .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2); border-top-color: rgba(255,255,255,0.8); border-radius: 50%; animation: spin 0.7s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .loading-overlay { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 2rem; font-size: 0.83rem; color: var(--text-dim); }
     .nav-row { display: flex; justify-content: space-between; align-items: center; margin-top: 1.4rem; }
-    @media (max-width: 540px) { .features-grid { grid-template-columns: 1fr; } .main { padding: 1.5rem 1rem; } .form-row { grid-template-columns: 1fr; } .list-meta-row { flex-wrap: wrap; } }
   `;
 
   // ── Client JS ──────────────────────────────────────────────────────────────
-  // state.customSeasons is now an ARRAY of list objects matching the server model:
-  // [{ listId, tmdbId, tmdbName, tmdbPoster, label, prefix, episodes:[{season,episode,name,still,...}] }]
   const clientJS = [
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
-    // customSeasons is now an array of list objects
     "var state = { apiKey: '', topN: 20, showAutoSeason: true, customSeasons: [], catalogEnabled: {}, customCatalogs: [] };",
     "var modalData = { listId: null, tmdbId: null, tmdbName: null, tmdbPoster: null, allEpisodes: [], filteredSeason: 'all', selected: new Set() };",
     "var genreCache = { movie: null, tv: null };",
+    // Total pages is now 5: 1=API Key, 2=Best Of Config, 3=Catalogs, 4=Best Of Lists, 5=Install
+    "var TOTAL_PAGES = 5;",
     "",
     "function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }",
     "",
@@ -900,7 +975,7 @@ function configurePage() {
     "    if (num === n) el.classList.add('active');",
     "    else if (num < n) el.classList.add('done');",
     "  });",
-    "  if (n === 4) buildInstallPage();",
+    "  if (n === TOTAL_PAGES) buildInstallPage();",
     "  window.scrollTo({ top: 0, behavior: 'smooth' });",
     "}",
     "",
@@ -916,6 +991,7 @@ function configurePage() {
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    state.apiKey = key;",
+    // Read Auto Best Of settings from page 1 inputs
     "    state.topN = parseInt(document.getElementById('topN').value) || 20;",
     "    state.showAutoSeason = document.getElementById('showAutoSeason').checked;",
     "    renderDefaultCatalogs();",
@@ -926,6 +1002,69 @@ function configurePage() {
     "}",
     "",
     "function flashError(el) { el.classList.add('error'); el.focus(); setTimeout(function() { el.classList.remove('error'); }, 2000); }",
+    "",
+    // ── Tab switching for episode add panels ──────────────────────────────────
+    "function switchEpTab(listId, tab) {",
+    "  ['picker','imdb','paste'].forEach(function(t) {",
+    "    var btn = document.getElementById('ep-tab-' + t + '-' + listId);",
+    "    var panel = document.getElementById('ep-panel-' + t + '-' + listId);",
+    "    if (btn)   btn.classList.toggle('active', t === tab);",
+    "    if (panel) panel.classList.toggle('active', t === tab);",
+    "  });",
+    "}",
+    "",
+    // ── Paste episode list ─────────────────────────────────────────────────────
+    // Parses SxEx, S01E01, SE1E1 etc. formats
+    "function parsePasteEpisodes(text) {",
+    "  var results = [];",
+    // Match patterns: S1E1, S01E01, s1e1, 1x01, 1X01
+    "  var re = /[Ss](\\d{1,3})[Ee](\\d{1,3})|(?:^|\\D)(\\d{1,2})[Xx](\\d{1,3})(?:\\D|$)/gm;",
+    "  var m;",
+    "  while ((m = re.exec(text)) !== null) {",
+    "    var s = parseInt(m[1] || m[3]);",
+    "    var e = parseInt(m[2] || m[4]);",
+    "    if (!isNaN(s) && !isNaN(e) && s > 0 && e > 0) results.push({ season: s, episode: e });",
+    "  }",
+    // Deduplicate
+    "  var seen = new Set();",
+    "  return results.filter(function(ep) {",
+    "    var k = ep.season + ':' + ep.episode;",
+    "    if (seen.has(k)) return false;",
+    "    seen.add(k); return true;",
+    "  });",
+    "}",
+    "",
+    "function applyPaste(listId) {",
+    "  var textarea = document.getElementById('paste-input-' + listId);",
+    "  var status   = document.getElementById('paste-status-' + listId);",
+    "  if (!textarea || !status) return;",
+    "  var text = textarea.value.trim();",
+    "  if (!text) { status.textContent = 'Paste some episode codes first'; status.className = 'paste-status err'; return; }",
+    "  var parsed = parsePasteEpisodes(text);",
+    "  if (!parsed.length) { status.textContent = 'No episode codes found. Use S01E01 or 1x01 format.'; status.className = 'paste-status err'; return; }",
+    "  var list = getList(listId);",
+    "  if (!list) return;",
+    // Try to match against cached episodes if available; otherwise store bare refs
+    "  var allEps = (modalData.tmdbId === list.tmdbId) ? modalData.allEpisodes : [];",
+    "  var existingKeys = new Set(list.episodes.map(function(e) { return e.season + ':' + e.episode; }));",
+    "  var added = 0;",
+    "  for (var i = 0; i < parsed.length; i++) {",
+    "    var ref = parsed[i];",
+    "    var key = ref.season + ':' + ref.episode;",
+    "    if (!existingKeys.has(key)) {",
+    "      existingKeys.add(key);",
+    "      var full = allEps.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });",
+    "      list.episodes.push(full || ref);",
+    "      added++;",
+    "    }",
+    "  }",
+    "  var msg = 'Added ' + added + ' of ' + parsed.length + ' episode' + (parsed.length !== 1 ? 's' : '') + ' (dupes skipped)';",
+    "  status.textContent = msg;",
+    "  status.className = 'paste-status ok';",
+    "  textarea.value = '';",
+    "  renderCustomSeasonsList();",
+    "  setTimeout(function() { var card = document.getElementById('card-' + listId); if (card) card.classList.add('open'); }, 50);",
+    "}",
     "",
     // ── Catalog UI ──────────────────────────────────────────────────────────
     "function renderDefaultCatalogs() {",
@@ -1003,21 +1142,18 @@ function configurePage() {
     "    if (!d.results || !d.results.length) { box.innerHTML = '<p style=\"padding:1rem;font-size:0.82rem;color:var(--text-mute)\">No results found.</p>'; return; }",
     "    box.innerHTML = d.results.map(function(s) {",
     "      var ph = s.poster ? '<img class=\"search-poster\" src=\"' + s.poster + '\" alt=\"\" loading=\"lazy\"/>' : '<div class=\"search-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#128250;</div>';",
-    // Clicking a search result creates a new list for that show
     "      return '<div class=\"search-result-item\" onclick=\"createNewList(' + s.id + ',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster || '') + '\\')\">'+ph+'<div><div class=\"search-name\">' + esc(s.name) + '</div><div class=\"search-meta\">' + (s.year ? s.year + ' &middot; ' : '') + '&#11088; ' + s.vote_average + '</div></div></div>';",
     "    }).join('');",
     "  } catch(e) { box.innerHTML = '<p style=\"padding:1rem;color:var(--text-mute)\">Error searching.</p>'; }",
     "}",
     "",
     // ── Create / manage lists ────────────────────────────────────────────────
-    // createNewList: adds a new empty list for the show and opens episode picker
     "function createNewList(tmdbId, name, poster) {",
     "  var listId = uid();",
     "  state.customSeasons.push({ listId: listId, tmdbId: String(tmdbId), tmdbName: name, tmdbPoster: poster, label: 'Best Of', prefix: '\u2b50', episodes: [] });",
     "  document.getElementById('search-results').classList.remove('visible');",
     "  document.getElementById('series-search').value = '';",
     "  renderCustomSeasonsList();",
-    // Auto-open the new list card so user sees it, and open episode picker
     "  setTimeout(function() {",
     "    var card = document.getElementById('card-' + listId);",
     "    if (card) card.classList.add('open');",
@@ -1030,7 +1166,6 @@ function configurePage() {
     "function updateListMeta(listId, field, value) {",
     "  var list = getList(listId);",
     "  if (list) { list[field] = value; }",
-    // Re-render just the header name to reflect changes live
     "  var nameEl = document.getElementById('list-name-' + listId);",
     "  if (nameEl && list) nameEl.textContent = (list.prefix || '\u2b50') + ' ' + (list.label || 'Best Of') + ' \u2014 ' + list.tmdbName;",
     "}",
@@ -1051,9 +1186,9 @@ function configurePage() {
     "async function openModal(listId) {",
     "  var list = getList(listId);",
     "  if (!list) return;",
-    "  modalData.listId    = listId;",
-    "  modalData.tmdbId    = list.tmdbId;",
-    "  modalData.tmdbName  = list.tmdbName;",
+    "  modalData.listId     = listId;",
+    "  modalData.tmdbId     = list.tmdbId;",
+    "  modalData.tmdbName   = list.tmdbName;",
     "  modalData.tmdbPoster = list.tmdbPoster;",
     "  modalData.allEpisodes = []; modalData.filteredSeason = 'all';",
     "  modalData.selected = new Set(list.episodes.map(function(e) { return e.season + ':' + e.episode; }));",
@@ -1113,7 +1248,6 @@ function configurePage() {
     "    var p = k.split(':').map(Number);",
     "    return modalData.allEpisodes.find(function(ep) { return ep.season === p[0] && ep.episode === p[1]; });",
     "  }).filter(Boolean);",
-    // Preserve existing order for already-selected eps, append new ones at end
     "  var existingKeys = new Set(list.episodes.map(function(e) { return e.season + ':' + e.episode; }));",
     "  var kept = list.episodes.filter(function(e) { return keys.indexOf(e.season + ':' + e.episode) !== -1; });",
     "  var newEps = episodes.filter(function(e) { return !existingKeys.has(e.season + ':' + e.episode); });",
@@ -1140,7 +1274,6 @@ function configurePage() {
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    if (!d.episodes || !d.episodes.length) throw new Error('No matching episodes found for this show. Check the list contains TV episodes from this series.');",
-    // Merge imported episodes with existing, dedup, preserve order
     "    var existingKeys = new Set(list.episodes.map(function(e) { return e.season + ':' + e.episode; }));",
     "    var allEpsForShow = modalData.tmdbId === list.tmdbId ? modalData.allEpisodes : [];",
     "    var added = 0;",
@@ -1149,7 +1282,6 @@ function configurePage() {
     "      var key = ref.season + ':' + ref.episode;",
     "      if (!existingKeys.has(key)) {",
     "        existingKeys.add(key);",
-    // Try to find full episode data from cached modal data; otherwise use minimal ref
     "        var full = allEpsForShow.find(function(e) { return e.season === ref.season && e.episode === ref.episode; });",
     "        list.episodes.push(full || ref);",
     "        added++;",
@@ -1183,7 +1315,7 @@ function configurePage() {
     "      var th = ep.still ? '<img class=\"ep-thumb\" src=\"' + ep.still + '\" alt=\"\" loading=\"lazy\"/>' : '<div class=\"ep-thumb\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#127902;</div>';",
     "      return '<li class=\"ep-item\" draggable=\"true\" data-lid=\"' + tid + '\" data-idx=\"' + i + '\">' +",
     "        '<span class=\"ep-rank\">' + (i+1) + '</span><span class=\"ep-drag\">&#8943;</span>' + th +",
-    "        '<div class=\"ep-info\"><div class=\"ep-label\">S' + sL + 'E' + eL + ' \u2014 ' + esc(ep.name || 'Episode') + '</div><div class=\"ep-sublabel\">' + (ep.air_date || '') + '</div></div>' +",
+    "        '<div class=\"ep-info\"><div class=\"ep-label\">S' + sL + 'E' + eL + ' \u2014 ' + esc(ep.name || ('S' + sL + 'E' + eL)) + '</div><div class=\"ep-sublabel\">' + (ep.air_date || '') + '</div></div>' +",
     "        (ep.vote_average > 0 ? '<span class=\"ep-rating\">&#11088;' + ep.vote_average.toFixed(1) + '</span>' : '') +",
     "        '<span class=\"ep-del\" onclick=\"removeEp(\\'' + tid + '\\',' + i + ')\" title=\"Remove\">&#10005;</span></li>';",
     "    }).join('');",
@@ -1197,19 +1329,38 @@ function configurePage() {
     "        '<div class=\"list-meta-row\">' +",
     "          '<div class=\"field prefix-field\"><label>Prefix</label><input type=\"text\" value=\"' + esc(list.prefix || '\u2b50') + '\" placeholder=\"\u2b50\" oninput=\"updateListMeta(\\'' + tid + '\\',\\'prefix\\',this.value)\" style=\"text-align:center;font-size:1.2rem;\"/></div>' +",
     "          '<div class=\"field\"><label>List Label</label><input type=\"text\" value=\"' + esc(list.label || 'Best Of') + '\" placeholder=\"Best Of\" oninput=\"updateListMeta(\\'' + tid + '\\',\\'label\\',this.value)\"/></div>' +",
-    "          '<button class=\"btn btn-secondary btn-sm\" style=\"margin-bottom:0;align-self:flex-end\" onclick=\"openModal(\\'' + tid + '\\')\">Pick Episodes</button>' +",
     "        '</div>' +",
-    // IMDB import
-    "        '<div style=\"margin-bottom:10px\">' +",
-    "          '<label>Import from IMDB List</label>' +",
-    "          '<div class=\"imdb-import-row\">' +",
-    "            '<input type=\"text\" id=\"imdb-url-' + tid + '\" placeholder=\"https://www.imdb.com/list/ls086682535/\"/>' +",
-    "            '<button class=\"btn btn-secondary btn-sm\" id=\"imdb-btn-' + tid + '\" onclick=\"importImdbList(\\'' + tid + '\\')\" style=\"white-space:nowrap\">Import</button>' +",
+    // Episode add tabs: Pick, IMDB, Paste
+    "        '<div class=\"ep-add-section\">' +",
+    "          '<div class=\"ep-add-tabs\">' +",
+    "            '<button class=\"ep-add-tab active\" id=\"ep-tab-picker-' + tid + '\" onclick=\"switchEpTab(\\'' + tid + '\\',\\'picker\\')\">&#127912; Pick Episodes</button>' +",
+    "            '<button class=\"ep-add-tab\" id=\"ep-tab-imdb-' + tid + '\" onclick=\"switchEpTab(\\'' + tid + '\\',\\'imdb\\')\">&#127916; IMDB List</button>' +",
+    "            '<button class=\"ep-add-tab\" id=\"ep-tab-paste-' + tid + '\" onclick=\"switchEpTab(\\'' + tid + '\\',\\'paste\\')\">&#128203; Paste</button>' +",
     "          '</div>' +",
-    "          '<div class=\"imdb-import-status\" id=\"imdb-status-' + tid + '\"></div>' +",
+    // Picker panel
+    "          '<div class=\"ep-add-panel active\" id=\"ep-panel-picker-' + tid + '\">' +",
+    "            '<button class=\"btn btn-secondary btn-sm\" style=\"width:100%;margin-top:2px\" onclick=\"openModal(\\'' + tid + '\\')\">Browse &amp; select episodes\u2026</button>' +",
+    "          '</div>' +",
+    // IMDB panel
+    "          '<div class=\"ep-add-panel\" id=\"ep-panel-imdb-' + tid + '\">' +",
+    "            '<div class=\"imdb-import-row\">' +",
+    "              '<input type=\"text\" id=\"imdb-url-' + tid + '\" placeholder=\"https://www.imdb.com/list/ls086682535/\"/>' +",
+    "              '<button class=\"btn btn-secondary btn-sm\" id=\"imdb-btn-' + tid + '\" onclick=\"importImdbList(\\'' + tid + '\\')\" style=\"white-space:nowrap\">Import</button>' +",
+    "            '</div>' +",
+    "            '<div class=\"imdb-import-status\" id=\"imdb-status-' + tid + '\"></div>' +",
+    "          '</div>' +",
+    // Paste panel
+    "          '<div class=\"ep-add-panel\" id=\"ep-panel-paste-' + tid + '\">' +",
+    "            '<p class=\"paste-hint\">Paste a list of episode codes, one per line or space-separated. Accepts S01E01, s1e1, 1x01 and similar formats.</p>' +",
+    "            '<textarea id=\"paste-input-' + tid + '\" placeholder=\"S01E01&#10;S01E05&#10;S02E03&#10;3x10\"></textarea>' +",
+    "            '<div class=\"paste-actions\">' +",
+    "              '<button class=\"btn btn-primary btn-sm\" onclick=\"applyPaste(\\'' + tid + '\\')\">Add Episodes</button>' +",
+    "              '<span class=\"paste-status\" id=\"paste-status-' + tid + '\"></span>' +",
+    "            '</div>' +",
+    "          '</div>' +",
     "        '</div>' +",
     // Episode list
-    "        '<ul class=\"ep-list\" id=\"eplist-' + tid + '\" data-lid=\"' + tid + '\">' + (epItems || '<li style=\"color:var(--text-mute);font-size:0.82rem;padding:8px 0\">No episodes yet. Pick manually or import from IMDB.</li>') + '</ul>' +",
+    "        '<ul class=\"ep-list\" id=\"eplist-' + tid + '\" data-lid=\"' + tid + '\" style=\"margin-top:12px\">' + (epItems || '<li style=\"color:var(--text-mute);font-size:0.82rem;padding:8px 0\">No episodes yet. Pick, import, or paste to add.</li>') + '</ul>' +",
     "        '<div class=\"ep-list-actions\"><button class=\"btn btn-danger btn-sm\" onclick=\"removeList(\\'' + tid + '\\')\">Delete List</button></div>' +",
     "      '</div>' +",
     "    '</div>';",
@@ -1290,17 +1441,19 @@ function configurePage() {
     '<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">\n' +
     '<style>\n' + css + '\n</style>\n</head>\n<body>\n' +
     '<div class="app">\n' +
+    // ── Topbar: now 5 steps ──
     '  <div class="topbar">\n' +
     '    <div class="topbar-logo">&#127916; TMDB Best Of</div>\n' +
     '    <div class="topbar-steps">\n' +
-    '      <div class="step-item active" id="step-tab-1"><span class="step-num">1</span><span>API Key</span></div><span class="step-divider">&rsaquo;</span>\n' +
-    '      <div class="step-item" id="step-tab-2"><span class="step-num">2</span><span>Catalogs</span></div><span class="step-divider">&rsaquo;</span>\n' +
-    '      <div class="step-item" id="step-tab-3"><span class="step-num">3</span><span>Best Of Lists</span></div><span class="step-divider">&rsaquo;</span>\n' +
-    '      <div class="step-item" id="step-tab-4"><span class="step-num">4</span><span>Install</span></div>\n' +
+    '      <div class="step-item active" id="step-tab-1"><span class="step-num">1</span><span class="step-label">API Key</span></div><span class="step-divider">&rsaquo;</span>\n' +
+    '      <div class="step-item" id="step-tab-2"><span class="step-num">2</span><span class="step-label">Best Of</span></div><span class="step-divider">&rsaquo;</span>\n' +
+    '      <div class="step-item" id="step-tab-3"><span class="step-num">3</span><span class="step-label">Catalogs</span></div><span class="step-divider">&rsaquo;</span>\n' +
+    '      <div class="step-item" id="step-tab-4"><span class="step-num">4</span><span class="step-label">Lists</span></div><span class="step-divider">&rsaquo;</span>\n' +
+    '      <div class="step-item" id="step-tab-5"><span class="step-num">5</span><span class="step-label">Install</span></div>\n' +
     '    </div>\n  </div>\n' +
     '  <div class="main">\n' +
 
-    // PAGE 1
+    // ── PAGE 1: API Key ──
     '    <div class="page active" id="page-1"><div class="card">\n' +
     '      <div style="text-align:center;padding:1rem 0 1.8rem;font-size:4rem;opacity:0.6">&#128273;</div>\n' +
     '      <div class="card-title">Connect to TMDB</div>\n' +
@@ -1311,13 +1464,29 @@ function configurePage() {
     '        <div class="feature-chip">&#11088; Auto Best Of season</div><div class="feature-chip">&#128203; IMDB list import</div>\n' +
     '      </div>\n' +
     '      <div class="field"><label>TMDB API Key (v3)</label><input type="password" id="apiKey" placeholder="Paste your API key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key===\'Enter\') validateApiKey()"/><p class="hint">Free key from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a></p></div>\n' +
-    '      <div class="field"><label>Default top episodes count</label><input type="number" id="topN" placeholder="20" min="5" max="100"/><p class="hint">Top N episodes in auto Season 0. Default: 20. Streams don\'t work from Season 0.</p></div>\n' +
-    '      <div class="catalog-row" style="margin-bottom:1.2rem"><div class="catalog-row-info"><div class="catalog-row-name">Show auto Best Of (Season 0)</div><div class="catalog-row-type">Adds a Season 0 with top-rated episodes inside every show. Display only — streams won\'t work. Disable if you only use custom Best Of lists.</div></div><label class="toggle"><input type="checkbox" id="showAutoSeason" checked/><span class="toggle-slider"></span></label></div>\n' +
     '      <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>\n' +
     '    </div></div>\n' +
 
-    // PAGE 2
+    // ── PAGE 2: Best Of Settings (own screen, beta) ──
     '    <div class="page" id="page-2">\n' +
+    '      <div class="bestof-auto-card">\n' +
+    '        <div class="bestof-auto-title">&#11088; Auto Best Of <span class="beta-badge">Beta</span></div>\n' +
+    '        <div class="bestof-auto-desc">Adds a hidden <strong>Season 0</strong> inside every show you open, listing the top-rated episodes ranked by TMDB score. Useful for exploring a new series — but streams won\'t work from Season 0 because the episode IDs are virtual. Use Custom Best Of Lists (step 4) if you need working streams.</div>\n' +
+    '        <div class="bestof-auto-row">\n' +
+    '          <div class="field"><label>Top N episodes</label><input type="number" id="topN" placeholder="20" min="5" max="100" value="20"/><p class="hint">How many top-rated episodes to show in Season 0.</p></div>\n' +
+    '          <div style="padding-bottom:1.25rem">\n' +
+    '            <div class="catalog-row" style="min-width:200px">\n' +
+    '              <div class="catalog-row-info"><div class="catalog-row-name">Enable Season 0</div><div class="catalog-row-type">Show auto Best Of inside every series</div></div>\n' +
+    '              <label class="toggle"><input type="checkbox" id="showAutoSeason" checked/><span class="toggle-slider"></span></label>\n' +
+    '            </div>\n' +
+    '          </div>\n' +
+    '        </div>\n' +
+    '      </div>\n' +
+    '      <div class="nav-row"><button class="btn btn-secondary" onclick="goTo(1)">&larr; Back</button><button class="btn btn-primary btn-lg" onclick="syncAutoSettings();goTo(3)">Next &rarr;</button></div>\n' +
+    '    </div>\n' +
+
+    // ── PAGE 3: Catalogs ──
+    '    <div class="page" id="page-3">\n' +
     '      <div class="card"><div class="card-title">&#128198; TMDB Catalogs</div><div class="card-sub">Choose which TMDB catalogs appear in Stremio.</div>\n' +
     '        <div class="catalog-section-label">&#127916; Movies</div><div id="catalog-defaults-movie"></div>\n' +
     '        <div class="catalog-section-label">&#128250; Series</div><div id="catalog-defaults-series"></div>\n' +
@@ -1330,35 +1499,35 @@ function configurePage() {
     '        </div>\n' +
     '        <div id="custom-catalogs-list" style="margin-top:14px"><div class="custom-seasons-empty">No custom catalogs yet.</div></div>\n' +
     '      </div>\n' +
-    '      <div class="nav-row"><button class="btn btn-secondary" onclick="goTo(1)">&larr; Back</button><button class="btn btn-primary btn-lg" onclick="goTo(3)">Next &rarr;</button></div>\n' +
+    '      <div class="nav-row"><button class="btn btn-secondary" onclick="goTo(2)">&larr; Back</button><button class="btn btn-primary btn-lg" onclick="goTo(4)">Next &rarr;</button></div>\n' +
     '    </div>\n' +
 
-    // PAGE 3
-    '    <div class="page" id="page-3">\n' +
+    // ── PAGE 4: Best Of Lists ──
+    '    <div class="page" id="page-4">\n' +
     '      <div class="card">\n' +
     '        <div class="card-title">&#11088; Custom Best Of Lists</div>\n' +
-    '        <div class="card-sub">Search for a show to create a named list. Each list becomes its own entry in the &#11088; Best Of catalog. You can have multiple lists per show, each with a custom prefix and label. Streams work from these entries.<br><br>Import episodes from any public IMDB list, or pick them manually. You can also mix both.</div>\n' +
+    '        <div class="card-sub">Search for a show to create a named list. Each list becomes its own entry in the &#11088; Best Of catalog. Multiple lists per show are supported, each with a custom prefix and label. Streams work from these entries.<br><br>Add episodes by browsing, importing an IMDB list, or pasting episode codes (S01E01 format).</div>\n' +
     '        <div class="search-wrap field"><span class="search-icon">&#128269;</span><input type="text" id="series-search" placeholder="Search for a TV show to create a list..." oninput="debounceSearch(this.value)" autocomplete="off"/></div>\n' +
     '        <div id="search-results" class="search-results"></div>\n' +
     '      </div>\n' +
     '      <div class="card"><div class="section-header"><span class="section-title">Your Best Of Lists</span><span id="custom-count" style="font-size:0.75rem;color:var(--text-dim)"></span></div>\n' +
     '        <div id="custom-seasons-list"><div class="custom-seasons-empty">No lists yet. Search for a show above to get started.</div></div>\n' +
     '      </div>\n' +
-    '      <div class="nav-row"><button class="btn btn-secondary" onclick="goTo(2)">&larr; Back</button><button class="btn btn-gold btn-lg" onclick="goTo(4)">Generate Install Link &rarr;</button></div>\n' +
+    '      <div class="nav-row"><button class="btn btn-secondary" onclick="goTo(3)">&larr; Back</button><button class="btn btn-gold btn-lg" onclick="goTo(5)">Generate Install Link &rarr;</button></div>\n' +
     '    </div>\n' +
 
-    // PAGE 4
-    '    <div class="page" id="page-4"><div class="card">\n' +
+    // ── PAGE 5: Install ──
+    '    <div class="page" id="page-5"><div class="card">\n' +
     '      <div class="generate-hero"><div style="font-size:3.5rem;margin-bottom:12px">&#128640;</div><h2>Ready to install!</h2><p>Your addon is configured. Click below to add it directly to Stremio.</p></div>\n' +
     '      <div id="install-summary"></div>\n' +
     '      <button class="btn btn-install" onclick="openStremio()">&#9889; Install in Stremio</button>\n' +
     '      <div class="or-line">-- or add manually --</div>\n' +
     '      <div class="copy-row"><input type="text" id="manifest-url" readonly/><button class="btn-copy" id="copy-btn" onclick="copyUrl()">Copy</button></div>\n' +
-    '    </div><div class="nav-row"><button class="btn btn-secondary" onclick="goTo(3)">&larr; Back</button></div></div>\n' +
+    '    </div><div class="nav-row"><button class="btn btn-secondary" onclick="goTo(4)">&larr; Back</button></div></div>\n' +
 
     '  </div>\n</div>\n' +
 
-    // Modal
+    // ── Modal ──
     '<div class="modal-backdrop" id="modal-backdrop" onclick="closeModalOnBackdrop(event)">\n' +
     '  <div class="modal">\n' +
     '    <div class="modal-header"><img class="modal-poster" id="modal-poster" src="" alt=""/><div><div class="modal-title" id="modal-show-name">Loading...</div><div class="modal-sub" id="modal-show-sub"></div></div><div class="modal-close" onclick="closeModal()">&#10005;</div></div>\n' +
@@ -1366,7 +1535,13 @@ function configurePage() {
     '    <div class="modal-ep-list" id="modal-ep-list"><div class="loading-overlay"><div class="spinner"></div> Loading episodes...</div></div>\n' +
     '    <div class="modal-footer"><span class="modal-selected-count">Selected: <span id="modal-sel-count">0</span></span><div style="display:flex;gap:8px"><button class="btn btn-secondary btn-sm" onclick="closeModal()">Cancel</button><button class="btn btn-primary btn-sm" onclick="addSelectedEpisodes()">Save Selection</button></div></div>\n' +
     '  </div>\n</div>\n' +
-    '<script>\n' + clientJS + '\n</script>\n</body>\n</html>';
+    '<script>\n' +
+    // syncAutoSettings reads page 2 inputs into state before leaving
+    'function syncAutoSettings() {' +
+    '  state.topN = parseInt(document.getElementById("topN").value) || 20;' +
+    '  state.showAutoSeason = document.getElementById("showAutoSeason").checked;' +
+    '}' +
+    '\n' + clientJS + '\n</script>\n</body>\n</html>';
 }
 
 const PORT = process.env.PORT || 7000;
