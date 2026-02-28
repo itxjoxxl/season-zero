@@ -16,9 +16,6 @@ const TMDB_IMG_MD = 'https://image.tmdb.org/t/p/w500';
 const TMDB_IMG_LG = 'https://image.tmdb.org/t/p/w1280';
 const TMDB_BASE   = 'https://api.themoviedb.org/3';
 
-// Cinemeta (no API key required)
-const CINEMETA_BASE = 'https://v3-cinemeta.strem.io';
-
 const DEFAULT_CATALOGS = [
   { id: 'tmdb.trending_movies',   type: 'movie',  name: 'Trending Movies',   path: '/trending/movie/week', enabled: true  },
   { id: 'tmdb.popular_movies',    type: 'movie',  name: 'Popular Movies',     path: '/movie/popular',       enabled: true  },
@@ -46,13 +43,42 @@ async function tmdb(path, apiKey, params = {}) {
   return data;
 }
 
-async function cinemeta(path) {
-  const url = new URL(CINEMETA_BASE + path);
-  const { data } = await axios.get(url.toString(), { timeout: 20000 });
-  return data;
+const CINEMETA_BASE = 'https://v3-cinemeta.strem.io';
+
+async function cinemetaSearch(type, query) {
+  const url = `${CINEMETA_BASE}/catalog/${type}/top/search=${encodeURIComponent(query)}.json`;
+  const { data } = await axios.get(url, { timeout: 10000 });
+  return data.metas || [];
 }
 
-function extractId(id) { return id.replace(/^tmdb:/, ''); }
+async function cinemetaMeta(type, id) {
+  const url = `${CINEMETA_BASE}/meta/${type}/${id}.json`;
+  const { data } = await axios.get(url, { timeout: 10000 });
+  return data.meta || null;
+}
+
+async function cinemetaCatalog(catalogId, type, skip) {
+  // Map our catalog IDs to cinemeta catalog IDs
+  const catalogMap = {
+    'tmdb.trending_movies':   'top',
+    'tmdb.popular_movies':    'top',
+    'tmdb.top_rated_movies':  'top',
+    'tmdb.upcoming_movies':   'top',
+    'tmdb.nowplaying_movies': 'top',
+    'tmdb.trending_series':   'top',
+    'tmdb.popular_series':    'top',
+    'tmdb.top_rated_series':  'top',
+    'tmdb.airing_today':      'top',
+    'tmdb.on_the_air':        'top',
+  };
+  const cineType = type === 'series' ? 'series' : 'movie';
+  const skip_ = parseInt(skip) || 0;
+  const url = `${CINEMETA_BASE}/catalog/${cineType}/top/skip=${skip_}.json`;
+  const { data } = await axios.get(url, { timeout: 10000 });
+  return data.metas || [];
+}
+
+
 
 async function getMovie(tmdbId, apiKey) {
   return tmdb('/movie/' + tmdbId, apiKey, { append_to_response: 'external_ids,release_dates,credits,videos' });
@@ -154,9 +180,6 @@ function buildBestOfVideos(bestOfEps, imdbId, tmdbId) {
 function buildManifest(config) {
   const cfg = config ? parseConfig(config) : {};
 
-  const provider = String(cfg.provider || 'tmdb').toLowerCase();
-  const usesTmdb = provider !== 'cinemeta';
-
   const enabledDefaults = DEFAULT_CATALOGS.filter(d => {
     const override = cfg.catalogEnabled && cfg.catalogEnabled[d.id];
     if (override === false) return false;
@@ -172,16 +195,15 @@ function buildManifest(config) {
       const displayName = cfg.catalogNames && cfg.catalogNames[d.id] ? cfg.catalogNames[d.id] : d.name;
       return {
         id: d.id, type: d.type, name: displayName,
-        // IMPORTANT: do NOT expose `search` extra on non-search catalogs or Stremio will merge them into global search.
-        extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }],
+        extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }, { name: 'search', isRequired: false }],
       };
     }),
     ...customCatalogs.map(c => ({
       id: c.id, type: c.type, name: c.name,
-      extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }],
+      extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }, { name: 'search', isRequired: false }],
     })),
-    { id: 'gt.search_movies',  type: 'movie',  name: 'Search Movies',  extra: [{ name: 'search', isRequired: true }] },
-    { id: 'gt.search_series',  type: 'series', name: 'Search Series',  extra: [{ name: 'search', isRequired: true }] },
+    { id: 'tmdb.search_movies',  type: 'movie',  name: 'Search Movies',  extra: [{ name: 'search', isRequired: true }] },
+    { id: 'tmdb.search_series',  type: 'series', name: 'Search Series',  extra: [{ name: 'search', isRequired: true }] },
   ];
 
   if (customSeasons.length > 0) {
@@ -194,16 +216,13 @@ function buildManifest(config) {
     name:        'GoodTaste',
     description: 'Curated episode lists, full metadata, catalogs, and search.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
-    catalogs:    (usesTmdb ? !!cfg.tmdbApiKey : true) ? allCatalogs : [],
-    // NOTE: `episodeVideos` is not a valid Stremio manifest resource (it breaks manifest validation).
-    // We avoid it by using real episode IDs for streaming.
-    resources:   ['catalog', 'meta'],
+    catalogs:    (cfg.tmdbApiKey || cfg.metaProvider === 'cinemeta') ? allCatalogs : [],
+    resources:   ['catalog', 'meta', 'episodeVideos'],
     types:       ['movie', 'series'],
     idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
-    behaviorHints: { configurable: true, configurationRequired: (usesTmdb ? !cfg.tmdbApiKey : false) },
+    behaviorHints: { configurable: true, configurationRequired: (!cfg.tmdbApiKey && cfg.metaProvider !== 'cinemeta') },
     config: [
-      { key: 'provider',   type: 'select', title: 'Metadata Provider', required: false, options: ['tmdb', 'cinemeta'] },
-      { key: 'tmdbApiKey', type: 'text',   title: 'TMDB API Key (recommended)',                  required: false },
+      { key: 'tmdbApiKey', type: 'text',   title: 'TMDB API Key (optional if using Cinemeta)', required: false },
       { key: 'topN',       type: 'number', title: 'Top episodes in Best Of season (default: 20)', required: false },
     ],
   };
@@ -217,46 +236,21 @@ app.get('/configure', (req, res) => res.send(configurePage()));
 // ─── BEST OF CATALOG ─────────────────────────────────────────────────────────
 app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
-  const provider = String(cfg.provider || 'tmdb').toLowerCase();
-  const usesTmdb = provider !== 'cinemeta';
   const apiKey = cfg.tmdbApiKey;
-  if (usesTmdb && !apiKey) return res.json({ metas: [] });
+  if (!apiKey) return res.json({ metas: [] }); // bestof requires TMDB API
   const customSeasons = cfg.customSeasons || [];
   if (!customSeasons.length) return res.json({ metas: [] });
   try {
     const seriesCache = {};
     const metas = (await Promise.all(customSeasons.map(async function(list) {
       try {
-        const prefix  = list.prefix || '\u2728';
-        const label   = list.label  || 'Curated';
-        const epCount = (list.episodes || []).length;
-
-        if (!usesTmdb) {
-          const imdbId = list.tmdbId; // stored as imdb id in cinemeta mode
-          if (!/^tt\d+/.test(imdbId)) return null;
-          if (!seriesCache[imdbId]) {
-            const d = await cinemeta('/meta/series/' + imdbId + '.json');
-            seriesCache[imdbId] = d && d.meta ? d.meta : null;
-          }
-          const series = seriesCache[imdbId];
-          if (!series) return null;
-          return {
-            id:          'bestof:' + list.listId,
-            type:        'series',
-            name:        prefix + ' ' + label + ' — ' + (series.name || 'Unknown'),
-            poster:      series.poster || null,
-            background:  series.background || null,
-            description: label + ': ' + epCount + ' episode' + (epCount !== 1 ? 's' : '') + ' from ' + (series.name || 'Unknown') + '.\n\n' + (series.description || ''),
-            releaseInfo: series.releaseInfo || '',
-            imdbRating:  series.imdbRating || null,
-            genres:      series.genres || [],
-          };
-        }
-
         if (!seriesCache[list.tmdbId]) {
           seriesCache[list.tmdbId] = await getSeries(list.tmdbId, apiKey);
         }
         const series  = seriesCache[list.tmdbId];
+        const prefix  = list.prefix || '\u2728';
+        const label   = list.label  || 'Curated';
+        const epCount = (list.episodes || []).length;
         return {
           id:          'bestof:' + list.listId,
           type:        'series',
@@ -282,10 +276,9 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
   const type   = req.params.type;
   const id     = req.params.id;
-  const provider = String(cfg.provider || 'tmdb').toLowerCase();
-  const apiKey   = cfg.tmdbApiKey;
-  const usesTmdb = provider !== 'cinemeta';
-  if (usesTmdb && !apiKey) return res.status(400).json({ metas: [] });
+  const apiKey = cfg.tmdbApiKey;
+  const isCinemeta = cfg.metaProvider === 'cinemeta';
+  if (!apiKey && !isCinemeta) return res.status(400).json({ metas: [] });
 
   const extrasRaw = req.params.extras || '';
   const extrasMap = {};
@@ -302,22 +295,28 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
   const search = extrasMap.search ? extrasMap.search.trim() : null;
 
   try {
-    if (id === 'gt.search_movies' || id === 'gt.search_series') {
+    if (id === 'tmdb.search_movies' || id === 'tmdb.search_series') {
       if (!search) return res.json({ metas: [] });
-      if (!usesTmdb) {
-        // Cinemeta search
-        const cType = id === 'gt.search_movies' ? 'movie' : 'series';
-        const data = await cinemeta('/catalog/' + cType + '/top/search=' + encodeURIComponent(search) + '.json');
-        const metas = (data.metas || []).filter(m => m && m.poster);
-        return res.json({ metas });
-      } else {
-        const tmdbType = id === 'gt.search_movies' ? 'movie' : 'tv';
-        const data = await tmdb('/search/' + tmdbType, apiKey, { query: search, page });
-        const metas = (data.results || []).map(item =>
-          tmdbType === 'movie' ? movieToMeta(item) : seriesToMeta(item)
-        ).filter(m => m.poster);
+      if (isCinemeta) {
+        const cineType = id === 'tmdb.search_movies' ? 'movie' : 'series';
+        const metas = await cinemetaSearch(cineType, search);
         return res.json({ metas });
       }
+      const tmdbType = id === 'tmdb.search_movies' ? 'movie' : 'tv';
+      const data = await tmdb('/search/' + tmdbType, apiKey, { query: search, page });
+      const metas = (data.results || []).map(item =>
+        tmdbType === 'movie' ? movieToMeta(item) : seriesToMeta(item)
+      ).filter(m => m.poster);
+      return res.json({ metas });
+    }
+
+    // Non-search catalogs should not respond to search queries
+    if (search) return res.json({ metas: [] });
+
+    // Cinemeta fallback for default catalogs
+    if (isCinemeta) {
+      const metas = await cinemetaCatalog(id, type, skip);
+      return res.json({ metas });
     }
 
     const defaultDef = DEFAULT_CATALOGS.find(d => d.id === id);
@@ -325,101 +324,20 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
     const catDef     = defaultDef || customDef;
     if (!catDef) return res.json({ metas: [] });
 
-    // Handle IMDb list-sourced catalogs
-    if (catDef.path === '_imdb_' && catDef.imdbUrl) {
-      const listUrl = String(catDef.imdbUrl).trim();
-      const listIdMatch = listUrl.match(/ls\d+/);
-      if (!listIdMatch) return res.json({ metas: [] });
-      const listId = listIdMatch[0];
-      const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
-      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-
-      function parseCsv(text) {
-        const rows = [];
-        let row = [];
-        let cur = '';
-        let inQuotes = false;
-        for (let i = 0; i < text.length; i++) {
-          const ch = text[i];
-          const next = text[i + 1];
-          if (inQuotes) {
-            if (ch === '"' && next === '"') { cur += '"'; i++; continue; }
-            if (ch === '"') { inQuotes = false; continue; }
-            cur += ch; continue;
-          }
-          if (ch === '"') { inQuotes = true; continue; }
-          if (ch === ',') { row.push(cur); cur = ''; continue; }
-          if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; continue; }
-          if (ch === '\r') continue;
-          cur += ch;
-        }
-        if (cur.length || row.length) { row.push(cur); rows.push(row); }
-        return rows;
-      }
-
-      const resp = await axios.get(csvUrl, {
-        headers: { 'Accept': 'text/csv,text/plain,*/*', 'Accept-Language': 'en-US,en;q=0.9', 'User-Agent': UA },
-        timeout: 20000,
-        validateStatus: (s) => s >= 200 && s < 400,
-      });
-      const rows = parseCsv(String(resp.data || ''));
-      if (!rows.length) return res.json({ metas: [] });
-      const header = rows[0].map(h => String(h || '').trim().toLowerCase());
-      const constIdx = header.findIndex(h => h === 'const');
-      const typeIdx  = header.findIndex(h => h === 'title type');
-      if (constIdx === -1) return res.json({ metas: [] });
-
-      const raw = [];
-      for (let i = 1; i < rows.length; i++) {
-        const cols = rows[i] || [];
-        const ttId = String(cols[constIdx] || '').trim();
-        if (!ttId || !ttId.startsWith('tt')) continue;
-        const ttype = typeIdx !== -1 ? String(cols[typeIdx] || '').trim() : '';
-        const norm = ttype.toLowerCase().replace(/\s+/g, '');
-        const isMovie = norm === 'movie' || norm === 'tvmovie' || norm === 'short' || norm === 'video';
-        const isSeries = norm === 'tvseries' || norm === 'tvmini' || norm === 'tvminiseries';
-        if (!isMovie && !isSeries) continue;
-        raw.push({ ttId, type: isMovie ? 'movie' : 'series' });
-      }
-      const pageItems = raw.slice(skip, skip + 20);
-      const metas = [];
-      for (const item of pageItems) {
-        try {
-          if (!usesTmdb) {
-            const d = await cinemeta('/meta/' + item.type + '/' + item.ttId + '.json');
-            if (d && d.meta && d.meta.poster) metas.push(d.meta);
-          } else {
-            const found = await tmdb('/find/' + item.ttId, apiKey, { external_source: 'imdb_id' });
-            const mv = (found.movie_results || [])[0];
-            const tv = (found.tv_results || [])[0];
-            if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
-            else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
-          }
-        } catch (e) {}
-      }
-      return res.json({ metas });
-    }
-
     // Handle MDBList-sourced catalogs
     if (catDef.path === '_mdblist_' && catDef.mdblistUrl) {
       const listUrl = String(catDef.mdblistUrl).trim();
-      // Public MDBList JSON endpoint is typically the GUI URL + /json/
-      // Example: https://mdblist.com/lists/user/listname/json/
-      // Some older links might already end in .json.
-      let fetchUrl = listUrl;
-      if (/mdblist\.com\/lists\//i.test(fetchUrl)) {
-        fetchUrl = fetchUrl.replace(/\/$/, '');
-        if (!/\/json$/i.test(fetchUrl) && !/\/json\//i.test(fetchUrl) && !/\.json$/i.test(fetchUrl)) {
-          fetchUrl = fetchUrl + '/json/';
-        }
-      }
-      if (!/\.json($|\?)/i.test(fetchUrl) && !/\/json\/?($|\?)/i.test(fetchUrl)) {
-        fetchUrl = fetchUrl.replace(/\/$/, '') + '.json';
-      }
+      // Strip any existing .json suffix and query params, then rebuild cleanly
+      let fetchUrl = listUrl.split('?')[0].replace(/\.json$/, '').replace(/\/$/, '') + '.json';
       const resp = await axios.get(fetchUrl, {
         headers: { 'Accept': 'application/json', 'User-Agent': 'GoodTaste/1.0' },
         timeout: 15000,
+        validateStatus: s => s < 500,
       });
+      if (resp.status === 404) {
+        console.error('[mdblist] 404 for', fetchUrl);
+        return res.json({ metas: [] });
+      }
       const raw = Array.isArray(resp.data) ? resp.data : (resp.data && resp.data.items ? resp.data.items : []);
       const pageItems = raw.slice(skip, skip + 20);
       const metas = [];
@@ -429,29 +347,73 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
         const mediatype  = (item.mediatype || item.type || '').toLowerCase();
         const isMovie    = mediatype === 'movie' || mediatype === 'movies';
         try {
-          if (!usesTmdb) {
-            // Cinemeta: prefer imdb ids
-            if (imdbId && /^tt\d+/.test(imdbId)) {
-              const cType = isMovie ? 'movie' : 'series';
-              const d = await cinemeta('/meta/' + cType + '/' + imdbId + '.json');
-              if (d && d.meta && d.meta.poster) metas.push(d.meta);
-            }
-          } else {
-            if (itemTmdbId) {
-              const d = await tmdb((isMovie ? '/movie/' : '/tv/') + itemTmdbId, apiKey);
-              const meta = isMovie ? movieToMeta(d) : seriesToMeta(d);
-              if (meta.poster) metas.push(meta);
-            } else if (imdbId) {
-              const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
-              const mv = (found.movie_results || [])[0];
-              const tv = (found.tv_results || [])[0];
-              if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
-              else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
-            }
+          if (itemTmdbId) {
+            const d = await tmdb((isMovie ? '/movie/' : '/tv/') + itemTmdbId, apiKey);
+            const meta = isMovie ? movieToMeta(d) : seriesToMeta(d);
+            if (meta.poster) metas.push(meta);
+          } else if (imdbId) {
+            const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
+            const mv = (found.movie_results || [])[0];
+            const tv = (found.tv_results || [])[0];
+            if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
+            else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
           }
         } catch (e) { /* skip */ }
       }
       return res.json({ metas });
+    }
+
+    // Handle IMDb list-sourced catalogs
+    if (catDef.path === '_imdblist_' && catDef.imdblistUrl) {
+      const listIdMatch = String(catDef.imdblistUrl).match(/ls\d+/);
+      if (!listIdMatch) return res.json({ metas: [] });
+      const imdbListId = listIdMatch[0];
+      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36';
+      try {
+        let ttIds = [];
+        try {
+          const csvResp = await axios.get('https://www.imdb.com/list/' + imdbListId + '/export', { headers: { 'Accept': 'text/csv,*/*', 'User-Agent': UA }, timeout: 20000, validateStatus: s => s < 400 });
+          const text = String(csvResp.data || '');
+          if (!text.includes('<html')) {
+            const lines = text.split('\n');
+            const header = (lines[0] || '').split(',').map(h => h.replace(/^"|"$/g,'').trim().toLowerCase());
+            const constIdx = header.findIndex(h => h === 'const');
+            for (let i = 1; i < lines.length; i++) {
+              const cols = (lines[i].match(/("(?:[^"]|"")*"|[^,]*)/g) || []).map(c => c.replace(/^"|"$/g,'').trim());
+              const imdbId = constIdx >= 0 ? cols[constIdx] : null;
+              if (imdbId && imdbId.startsWith('tt')) ttIds.push(imdbId);
+            }
+          }
+        } catch(e) {}
+        if (!ttIds.length) {
+          const pageResp = await axios.get('https://www.imdb.com/list/' + imdbListId + '/', { headers: { 'User-Agent': UA }, timeout: 20000, validateStatus: s => s < 400 });
+          const matches = [...String(pageResp.data || '').matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
+          ttIds = [...new Set(matches)];
+        }
+        const pageIds = ttIds.slice(skip, skip + 20);
+        const metas = [];
+        for (const ttId of pageIds) {
+          try {
+            if (apiKey) {
+              const found = await tmdb('/find/' + ttId, apiKey, { external_source: 'imdb_id' });
+              const mv = (found.movie_results || [])[0];
+              const tv = (found.tv_results || [])[0];
+              if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
+              else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
+            } else {
+              // Cinemeta fallback
+              try {
+                const cr = await axios.get(CINEMETA_BASE + '/meta/movie/' + ttId + '.json', { timeout: 5000 });
+                if (cr.data && cr.data.meta && cr.data.meta.poster) metas.push({ id: ttId, type: 'movie', name: cr.data.meta.name, poster: cr.data.meta.poster });
+              } catch(e2) {
+                const cr = await axios.get(CINEMETA_BASE + '/meta/series/' + ttId + '.json', { timeout: 5000 });
+                if (cr.data && cr.data.meta && cr.data.meta.poster) metas.push({ id: ttId, type: 'series', name: cr.data.meta.name, poster: cr.data.meta.poster });
+              }
+            }
+          } catch(e) { /* skip */ }
+        }
+        return res.json({ metas });
+      } catch(e) { return res.json({ metas: [] }); }
     }
 
     let path   = catDef.path;
@@ -463,15 +425,6 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
       else if (id.includes('popular') || id.includes('trending')) params.sort_by = 'popularity.desc';
     }
     if (customDef && customDef.params) Object.assign(params, customDef.params);
-
-    if (!usesTmdb) {
-      // Cinemeta default catalogs (top / popular)
-      const catId = (id.includes('popular') ? 'popular' : 'top');
-      const cType = type === 'movie' ? 'movie' : 'series';
-      const data = await cinemeta('/catalog/' + cType + '/' + catId + '.json');
-      const metas = (data.metas || []).slice(skip, skip + 20).filter(m => m && m.poster);
-      return res.json({ metas });
-    }
 
     const data  = await tmdb(path, apiKey, params);
     const metas = (data.results || []).map(item =>
@@ -486,25 +439,9 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
 
 // ─── API HELPER ROUTES ────────────────────────────────────────────────────────
 app.get('/api/search', async function(req, res) {
-  const { q, apiKey, type = 'tv', provider = 'tmdb' } = req.query;
-  if (!q) return res.json({ results: [] });
+  const { q, apiKey, type = 'tv' } = req.query;
+  if (!q || !apiKey) return res.json({ results: [] });
   try {
-    const prov = String(provider).toLowerCase();
-    if (prov === 'cinemeta') {
-      const cType = type === 'movie' ? 'movie' : 'series';
-      const data = await cinemeta('/catalog/' + cType + '/top/search=' + encodeURIComponent(q) + '.json');
-      const results = (data.metas || []).slice(0, 8).map(m => ({
-        id: m.id,
-        name: m.name,
-        poster: m.poster || null,
-        year: (m.releaseInfo || '').toString().substring(0, 4),
-        vote_average: (m.imdbRating || '?').toString(),
-        type: cType,
-      }));
-      return res.json({ results });
-    }
-
-    if (!apiKey) return res.json({ results: [] });
     const data = await tmdb('/search/' + type, apiKey, { query: q });
     const results = (data.results || []).slice(0, 8).map(s => {
       const isMovie = type === 'movie' || s.media_type === 'movie';
@@ -522,36 +459,9 @@ app.get('/api/search', async function(req, res) {
 });
 
 app.get('/api/episodes', async function(req, res) {
-  const { tmdbId, apiKey, provider = 'tmdb' } = req.query;
-  if (!tmdbId) return res.json({ episodes: [] });
+  const { tmdbId, apiKey } = req.query;
+  if (!tmdbId || !apiKey) return res.json({ episodes: [] });
   try {
-    const prov = String(provider).toLowerCase();
-    if (prov === 'cinemeta') {
-      const imdbId = String(tmdbId).trim(); // in cinemeta mode, we pass imdb id into tmdbId param
-      const d = await cinemeta('/meta/series/' + imdbId + '.json');
-      const meta = d && d.meta ? d.meta : null;
-      const vids = (meta && meta.videos) ? meta.videos : [];
-      const episodes = vids
-        .filter(v => v && typeof v.season === 'number' && typeof v.episode === 'number')
-        .map(v => ({
-          season: v.season,
-          episode: v.episode,
-          name: v.title || '',
-          overview: v.overview || '',
-          still: v.thumbnail || null,
-          vote_average: 0,
-          vote_count: 0,
-          air_date: v.released ? new Date(v.released).toISOString().slice(0, 10) : null,
-          id: v.id,
-        }));
-      const seasons = Math.max(0, ...episodes.map(e => e.season));
-      return res.json({
-        show: { name: meta ? meta.name : 'Unknown', poster: meta ? meta.poster : null, seasons },
-        episodes,
-      });
-    }
-
-    if (!apiKey) return res.json({ episodes: [] });
     const series   = await getSeries(tmdbId, apiKey);
     const episodes = await getAllEpisodes(tmdbId, apiKey, series.number_of_seasons || 1);
     res.json({
@@ -568,20 +478,6 @@ app.get('/api/genres', async function(req, res) {
     const data = await tmdb('/genre/' + type + '/list', apiKey);
     res.json({ genres: data.genres || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Cinemeta posters for the landing page header background
-app.get('/api/cinemeta-popular', async function(req, res) {
-  try {
-    const mv = await cinemeta('/catalog/movie/top.json');
-    const tv = await cinemeta('/catalog/series/top.json');
-    const posters = [];
-    (mv.metas || []).slice(0, 10).forEach(m => { if (m && m.poster) posters.push(m.poster); });
-    (tv.metas || []).slice(0, 10).forEach(m => { if (m && m.poster) posters.push(m.poster); });
-    res.json({ posters });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
 
 // ─── IMDB LIST IMPORT ─────────────────────────────────────────────────────────
@@ -726,131 +622,25 @@ app.get('/api/imdb-list', async function(req, res) {
   }
 });
 
-// ─── IMDB LIST -> CATALOG PREVIEW (movies + series) ─────────────────────────
-app.get('/api/imdb-catalog', async function(req, res) {
-  let { url: listUrl, apiKey, provider = 'tmdb' } = req.query;
-  if (!listUrl) return res.status(400).json({ error: 'url required' });
-
-  const prov = String(provider).toLowerCase();
-  const usesTmdb = prov !== 'cinemeta';
-  if (usesTmdb && !apiKey) return res.status(400).json({ error: 'apiKey required for TMDB mode' });
-
-  const listIdMatch = String(listUrl).match(/ls\d+/);
-  if (!listIdMatch) return res.status(400).json({ error: 'Could not parse IMDB list ID from URL' });
-  const listId = listIdMatch[0];
-  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-
-  function parseCsv(text) {
-    const rows = [];
-    let row = [];
-    let cur = '';
-    let inQuotes = false;
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      const next = text[i + 1];
-      if (inQuotes) {
-        if (ch === '"' && next === '"') { cur += '"'; i++; continue; }
-        if (ch === '"') { inQuotes = false; continue; }
-        cur += ch; continue;
-      }
-      if (ch === '"') { inQuotes = true; continue; }
-      if (ch === ',') { row.push(cur); cur = ''; continue; }
-      if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; continue; }
-      if (ch === '\r') continue;
-      cur += ch;
-    }
-    if (cur.length || row.length) { row.push(cur); rows.push(row); }
-    return rows;
-  }
-
-  async function fetchImdbCsvExport() {
-    const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
-    const resp = await axios.get(csvUrl, {
-      headers: { 'Accept': 'text/csv,text/plain,*/*', 'Accept-Language': 'en-US,en;q=0.9', 'User-Agent': UA },
-      timeout: 20000,
-      validateStatus: (s) => s >= 200 && s < 400,
-    });
-    const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
-    if (ct.includes('text/html')) throw new Error('IMDB export returned HTML (blocked)');
-    return resp.data;
-  }
-
-  try {
-    const csvText = await fetchImdbCsvExport();
-    const rows = parseCsv(String(csvText));
-    if (!rows.length) return res.json({ metas: [], count: 0, name: '' });
-
-    const header = rows[0].map(h => String(h || '').trim().toLowerCase());
-    const constIdx = header.findIndex(h => h === 'const');
-    const typeIdx  = header.findIndex(h => h === 'title type');
-    if (constIdx === -1) return res.status(400).json({ error: 'Unexpected CSV format — missing Const column' });
-
-    const items = [];
-    for (let i = 1; i < rows.length; i++) {
-      const cols = rows[i] || [];
-      const ttId = String(cols[constIdx] || '').trim();
-      const ttype = typeIdx !== -1 ? String(cols[typeIdx] || '').trim() : '';
-      if (!ttId || !ttId.startsWith('tt')) continue;
-      // IMDb title types are inconsistent; we handle common ones.
-      const norm = ttype.toLowerCase().replace(/\s+/g, '');
-      const isMovie = norm === 'movie' || norm === 'tvmovie' || norm === 'short' || norm === 'video';
-      const isSeries = norm === 'tvseries' || norm === 'tvmini' || norm === 'tvminiseries';
-      if (!isMovie && !isSeries) continue;
-      items.push({ ttId, type: isMovie ? 'movie' : 'series' });
-    }
-
-    const metas = [];
-    for (const it of items.slice(0, 50)) {
-      try {
-        if (prov === 'cinemeta') {
-          const d = await cinemeta('/meta/' + it.type + '/' + it.ttId + '.json');
-          if (d && d.meta && d.meta.poster) metas.push(d.meta);
-        } else {
-          const found = await tmdb('/find/' + it.ttId, apiKey, { external_source: 'imdb_id' });
-          const mv = (found.movie_results || [])[0];
-          const tv = (found.tv_results || [])[0];
-          if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
-          else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
-        }
-      } catch (e) { /* skip */ }
-    }
-
-    res.json({ metas, count: items.length, name: '' });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // ─── MDBLIST IMPORT ──────────────────────────────────────────────────────────
 // ─── MDBLIST CATALOG PREVIEW ─────────────────────────────────────────────────
 // Fetches items from a public MDBList URL and resolves them via TMDB.
 // Returns an array of meta objects suitable for catalog preview in the UI.
 app.get('/api/mdblist-catalog', async function(req, res) {
-  let { url: listUrl, apiKey, provider = 'tmdb' } = req.query;
-  if (!listUrl) return res.status(400).json({ error: 'url required' });
+  let { url: listUrl, apiKey } = req.query;
+  if (!listUrl || !apiKey) return res.status(400).json({ error: 'url and apiKey required' });
 
   const urlStr = String(listUrl).trim();
 
   try {
-    const prov = String(provider).toLowerCase();
-    const usesTmdb = prov !== 'cinemeta';
-    if (usesTmdb && !apiKey) return res.status(400).json({ error: 'apiKey required for TMDB mode' });
-
-    let fetchUrl = urlStr;
-    if (/mdblist\.com\/lists\//i.test(fetchUrl)) {
-      fetchUrl = fetchUrl.replace(/\/$/, '');
-      if (!/\/json$/i.test(fetchUrl) && !/\/json\//i.test(fetchUrl) && !/\.json$/i.test(fetchUrl)) {
-        fetchUrl = fetchUrl + '/json/';
-      }
-    }
-    if (!/\.json($|\?)/i.test(fetchUrl) && !/\/json\/?($|\?)/i.test(fetchUrl)) {
-      fetchUrl = fetchUrl.replace(/\/$/, '') + '.json';
-    }
+    let fetchUrl = urlStr.split('?')[0].replace(/\.json$/, '').replace(/\/$/, '') + '.json';
 
     const resp = await axios.get(fetchUrl, {
       headers: { 'Accept': 'application/json', 'User-Agent': 'GoodTaste/1.0' },
       timeout: 15000,
+      validateStatus: s => s < 500,
     });
+    if (resp.status === 404) return res.status(404).json({ error: 'MDBList returned 404 — check that the list URL is public and correct.' });
 
     const raw = Array.isArray(resp.data) ? resp.data : (resp.data && resp.data.items ? resp.data.items : []);
     if (!raw.length) return res.json({ metas: [], count: 0, name: '' });
@@ -868,25 +658,16 @@ app.get('/api/mdblist-catalog', async function(req, res) {
       const isTv       = mediatype === 'show' || mediatype === 'tv' || mediatype === 'series';
 
       try {
-        if (prov === 'cinemeta') {
-          if (imdbId && /^tt\d+/.test(imdbId)) {
-            const cType = isMovie ? 'movie' : (isTv ? 'series' : null);
-            if (!cType) continue;
-            const d = await cinemeta('/meta/' + cType + '/' + imdbId + '.json');
-            if (d && d.meta) metas.push(d.meta);
-          }
-        } else {
-          if (itemTmdbId && (isMovie || isTv)) {
-            const path = isMovie ? '/movie/' + itemTmdbId : '/tv/' + itemTmdbId;
-            const d = await tmdb(path, apiKey);
-            metas.push(isMovie ? movieToMeta(d) : seriesToMeta(d));
-          } else if (imdbId) {
-            const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
-            const mv = (found.movie_results || [])[0];
-            const tv = (found.tv_results || [])[0];
-            if (mv) metas.push(movieToMeta(mv));
-            else if (tv) metas.push(seriesToMeta(tv));
-          }
+        if (itemTmdbId && (isMovie || isTv)) {
+          const path = isMovie ? '/movie/' + itemTmdbId : '/tv/' + itemTmdbId;
+          const d = await tmdb(path, apiKey);
+          metas.push(isMovie ? movieToMeta(d) : seriesToMeta(d));
+        } else if (imdbId) {
+          const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
+          const mv = (found.movie_results || [])[0];
+          const tv = (found.tv_results || [])[0];
+          if (mv) metas.push(movieToMeta(mv));
+          else if (tv) metas.push(seriesToMeta(tv));
         }
       } catch (e) { /* skip unresolvable */ }
     }
@@ -899,23 +680,112 @@ app.get('/api/mdblist-catalog', async function(req, res) {
 });
 
 
-// ─── META ENDPOINTS ───────────────────────────────────────────────────────────
+// ─── IMDB LIST AS CATALOG ────────────────────────────────────────────────────
+// Fetches items from a public IMDB list URL and resolves them via TMDB.
+// Returns catalog-style metas.
+app.get('/api/imdb-catalog', async function(req, res) {
+  let { url: listUrl, apiKey } = req.query;
+  if (!listUrl) return res.status(400).json({ error: 'url required' });
+  if (!apiKey) return res.status(400).json({ error: 'apiKey required (TMDB)' });
+
+  const listIdMatch = String(listUrl).match(/ls\d+/);
+  if (!listIdMatch) return res.status(400).json({ error: 'Could not parse IMDB list ID from URL' });
+  const listId = listIdMatch[0];
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+  try {
+    // Try CSV export first
+    let ttIds = [];
+    let listName = '';
+    try {
+      const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
+      const resp = await axios.get(csvUrl, {
+        headers: { 'Accept': 'text/csv,*/*', 'User-Agent': UA },
+        timeout: 20000, validateStatus: s => s < 400,
+      });
+      const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
+      if (!ct.includes('text/html')) {
+        const lines = String(resp.data).split('\n');
+        const header = (lines[0] || '').toLowerCase().split(',').map(h => h.replace(/"/g,'').trim());
+        const constIdx = header.findIndex(h => h === 'const');
+        if (constIdx !== -1) {
+          for (let i = 1; i < lines.length; i++) {
+            const cols = lines[i].split(',').map(c => c.replace(/"/g,'').trim());
+            const tt = cols[constIdx];
+            if (tt && tt.startsWith('tt')) ttIds.push(tt);
+          }
+        }
+      }
+    } catch(e) { /* fallback to scraping */ }
+
+    if (!ttIds.length) {
+      const pageResp = await axios.get('https://www.imdb.com/list/' + listId + '/', {
+        headers: { 'User-Agent': UA }, timeout: 20000, validateStatus: s => s < 400,
+      });
+      const html = String(pageResp.data || '');
+      // Try to get list name
+      const titleMatch = html.match(/<h1[^>]*class="[^"]*ipl-list-card__title[^"]*"[^>]*>([^<]+)/);
+      if (titleMatch) listName = titleMatch[1].trim();
+      const hm = [...html.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
+      ttIds = [...new Set(hm)];
+    }
+
+    if (!ttIds.length) return res.json({ metas: [], count: 0, name: listName });
+
+    const metas = [];
+    for (const ttId of ttIds.slice(0, 50)) {
+      try {
+        const found = await tmdb('/find/' + ttId, apiKey, { external_source: 'imdb_id' });
+        const mv = (found.movie_results || [])[0];
+        const tv = (found.tv_results || [])[0];
+        if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
+        else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
+      } catch(e) { /* skip */ }
+    }
+
+    res.json({ metas, count: ttIds.length, name: listName });
+  } catch(e) {
+    console.error('[imdb-catalog]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Also serve imdb-catalog as catalog endpoint for saved imdb catalogs
+
+// ─── CINEMETA HERO BACKGROUND ────────────────────────────────────────────────
+app.get('/api/cinemeta-hero', async function(req, res) {
+  try {
+    const [moviesResp, seriesResp] = await Promise.all([
+      axios.get(`${CINEMETA_BASE}/catalog/movie/top.json`, { timeout: 8000 }),
+      axios.get(`${CINEMETA_BASE}/catalog/series/top.json`, { timeout: 8000 }),
+    ]);
+    const movies = (moviesResp.data.metas || []).slice(0, 10);
+    const series = (seriesResp.data.metas || []).slice(0, 10);
+    const images = [...movies, ...series]
+      .map(m => m.background || m.poster)
+      .filter(Boolean);
+    res.json({ images });
+  } catch(e) {
+    res.json({ images: [] });
+  }
+});
+
 app.get('/:config/meta/movie/:id.json', async function(req, res) {
   const cfg = parseConfig(req.params.config);
   const id  = req.params.id;
-  const provider = String(cfg.provider || 'tmdb').toLowerCase();
-  const usesTmdb = provider !== 'cinemeta';
-  if (!usesTmdb) {
-    if (!/^tt\d+/.test(id)) return res.json({ meta: null });
+  const isCinemeta = cfg.metaProvider === 'cinemeta';
+  if (!cfg.tmdbApiKey && !isCinemeta) return res.status(400).json({ err: 'No API key' });
+
+  // Use cinemeta for tt IDs or when cinemeta mode
+  if (isCinemeta || (id.startsWith('tt') && !cfg.tmdbApiKey)) {
     try {
-      const d = await cinemeta('/meta/movie/' + id + '.json');
-      return res.json({ meta: d && d.meta ? d.meta : null });
+      const meta = await cinemetaMeta('movie', id);
+      return res.json({ meta });
     } catch (e) {
       return res.status(500).json({ err: e.message });
     }
   }
 
-  if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
   if (!id.startsWith('tmdb:')) return res.json({ meta: null });
   try {
     const movie      = await getMovie(extractId(id), cfg.tmdbApiKey);
@@ -946,61 +816,18 @@ app.get('/:config/meta/movie/:id.json', async function(req, res) {
 app.get('/:config/meta/series/:id.json', async function(req, res) {
   const cfg = parseConfig(req.params.config);
   const id  = req.params.id;
-  const provider = String(cfg.provider || 'tmdb').toLowerCase();
-  const usesTmdb = provider !== 'cinemeta';
-  if (!usesTmdb) {
-    // Curated lists (bestof:) still supported in cinemeta mode (they store episode IDs directly).
-    if (id.startsWith('bestof:')) {
-      const listId = id.slice('bestof:'.length);
-      const customSeasons = cfg.customSeasons || [];
-      const list = customSeasons.find(l => l.listId === listId);
-      if (!list) return res.json({ meta: null });
+  const isCinemeta = cfg.metaProvider === 'cinemeta';
+  if (!cfg.tmdbApiKey && !isCinemeta) return res.status(400).json({ err: 'No API key' });
 
-      // list.tmdbId stores imdb id in cinemeta mode
-      const imdbId = list.tmdbId;
-      try {
-        const d = await cinemeta('/meta/series/' + imdbId + '.json');
-        const base = d && d.meta ? d.meta : null;
-        if (!base) return res.json({ meta: null });
-        const prefix = list.prefix || '\u2728';
-        const label  = list.label  || 'Curated';
-        // list.episodes store { id, season, episode, name, still, air_date }
-        const vids = (list.episodes || []).map(function(ep, i) {
-          const rank = i + 1;
-          const sLabel = String(ep.season).padStart(2, '0');
-          const eLabel = String(ep.episode).padStart(2, '0');
-          return {
-            id: ep.id || (imdbId + ':' + ep.season + ':' + ep.episode),
-            title: '#' + rank + ' — S' + sLabel + 'E' + eLabel + ' — ' + (ep.name || ''),
-            season: 1,
-            episode: rank,
-            overview: ep.overview || '',
-            thumbnail: ep.still || null,
-            released: ep.air_date ? new Date(ep.air_date) : null,
-          };
-        });
-        return res.json({ meta: Object.assign({}, base, {
-          id: 'bestof:' + listId,
-          name: prefix + ' ' + label + ' — ' + (base.name || 'Unknown'),
-          description: (vids.length || 0) + ' episodes — ' + label + '\n\n' + (base.description || ''),
-          videos: vids,
-          behaviorHints: { defaultVideoId: null },
-        })});
-      } catch (e) {
-        return res.status(500).json({ err: e.message });
-      }
-    }
-
-    if (!/^tt\d+/.test(id)) return res.json({ meta: null });
+  // Cinemeta meta for tt IDs when in cinemeta mode (non-bestof)
+  if (isCinemeta && !id.startsWith('bestof:') && id.startsWith('tt')) {
     try {
-      const d = await cinemeta('/meta/series/' + id + '.json');
-      return res.json({ meta: d && d.meta ? d.meta : null });
+      const meta = await cinemetaMeta('series', id);
+      return res.json({ meta });
     } catch (e) {
       return res.status(500).json({ err: e.message });
     }
   }
-
-  if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
 
   if (id.startsWith('bestof:')) {
     const listId        = id.slice('bestof:'.length);
@@ -1074,7 +901,6 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       } catch (e) { /* skip */ }
     }
 
-    // Season Zero is TMDB-only.
     if (cfg.showAutoSeason !== false) {
       const bestOfEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
       bestOfEps.forEach((ep, i) => {
@@ -1083,12 +909,8 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
         const eLabel = String(ep.episode).padStart(2, '0');
         const ratingLine = ep.vote_average > 0
           ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
-        // Use REAL episode IDs so streaming works without needing the (invalid) `episodeVideos` resource.
-        const realVideoId = imdbId
-          ? imdbId + ':' + ep.season + ':' + ep.episode
-          : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
         videos.push({
-          id: realVideoId,
+          id: 'tmdb:' + tmdbId + ':0:' + rank,
           title: '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
           season: 0, episode: rank,
           overview: ratingLine + (ep.overview || ''),
@@ -1187,6 +1009,46 @@ function configurePage() {
       -webkit-font-smoothing: antialiased;
     }
 
+    /* ── Hero Background Scroll ── */
+    .hero-bg-wrap {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      overflow: hidden;
+      opacity: 0.12;
+      pointer-events: none;
+    }
+    .hero-bg-track {
+      display: flex;
+      height: 100%;
+      gap: 8px;
+      animation: heroBgScroll 60s linear infinite;
+      will-change: transform;
+    }
+    .hero-bg-img {
+      height: 100%;
+      width: auto;
+      min-width: 180px;
+      object-fit: cover;
+      border-radius: 8px;
+      flex-shrink: 0;
+      filter: saturate(0.5);
+      transform: skewX(-6deg);
+    }
+    .hero-bg-fade {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(to right, var(--bg) 0%, transparent 20%, transparent 80%, var(--bg) 100%),
+                  linear-gradient(to bottom, var(--bg) 0%, transparent 30%, transparent 70%, var(--bg) 100%);
+    }
+    @keyframes heroBgScroll {
+      from { transform: translateX(0); }
+      to   { transform: translateX(-50%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .hero-bg-track { animation: none; }
+    }
+
     /* ── Topbar ── */
     .topbar {
       background: rgba(8,8,8,0.92);
@@ -1236,12 +1098,12 @@ function configurePage() {
       transition: background var(--transition);
       flex-shrink: 0;
     }
-    .step-pill.active .step-dot { background: var(--gold); }
-    .step-pill.done .step-dot   { background: var(--text-dim); }
-
-    /* subtle pulse on the active step dot */
-    @keyframes dotPulse { 0%,100%{ box-shadow: 0 0 0 0 rgba(240,192,64,0.0); } 50%{ box-shadow: 0 0 0 6px rgba(240,192,64,0.12); } }
-    .step-pill.active .step-dot { animation: dotPulse 1.8s ease-in-out infinite; }
+    .step-pill.active .step-dot { background: var(--gold); animation: dotPulse 2s ease-in-out infinite; }
+    .step-pill.done .step-dot   { background: var(--text-dim); animation: none; }
+    @keyframes dotPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(240,192,64,0.5); }
+      50% { box-shadow: 0 0 0 4px rgba(240,192,64,0); }
+    }
     .step-divider { color: var(--text-mute); font-size: 0.6rem; opacity: 0.4; }
 
     @media (max-width: 600px) {
@@ -1298,32 +1160,7 @@ function configurePage() {
     .hero {
       text-align: center;
       padding: 3rem 0 2.5rem;
-      position: relative;
-      overflow: hidden;
     }
-    .hero-bg {
-      position: absolute;
-      inset: -40px -80px;
-      opacity: 0.18;
-      transform: skewY(-8deg);
-      pointer-events: none;
-    }
-    .hero-bg-track {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      will-change: transform;
-      animation: heroScroll 22s linear infinite;
-    }
-    .hero-bg img {
-      width: 90px;
-      height: 135px;
-      border-radius: 10px;
-      object-fit: cover;
-      filter: blur(0px);
-      opacity: 0.9;
-    }
-    @keyframes heroScroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
     .hero-logo {
       font-family: 'Playfair Display', serif;
       font-size: 3.5rem;
@@ -1617,7 +1454,7 @@ function configurePage() {
     .ep-item.dragging  { opacity: 0.4; }
     .ep-item.drag-over { border-color: var(--gold); }
     .ep-rank { width: 22px; text-align: center; flex-shrink: 0; font-size: 0.68rem; color: var(--text-mute); font-family: 'DM Mono', monospace; }
-    .ep-drag { color: var(--text-mute); flex-shrink: 0; font-size: 0.85rem; }
+    .ep-drag { color: var(--text-mute); flex-shrink: 0; font-size: 0.85rem; cursor: grab; padding: 4px 6px; touch-action: none; }
     .ep-thumb { width: 56px; height: 32px; border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--surface2); }
     .ep-info  { flex: 1; min-width: 0; }
     .ep-label { font-size: 0.79rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1625,23 +1462,6 @@ function configurePage() {
     .ep-rating { font-size: 0.7rem; color: var(--gold); font-family: 'DM Mono', monospace; flex-shrink: 0; }
     .ep-del { flex-shrink: 0; color: var(--text-mute); cursor: pointer; font-size: 0.9rem; padding: 4px 5px; border-radius: 5px; transition: color var(--transition); }
     .ep-del:hover { color: #e05252; }
-
-    /* Mobile-friendly reorder controls (touch drag isn't reliable across WebViews) */
-    .ep-move { display: none; gap: 6px; align-items: center; margin-left: 2px; }
-    .ep-move button {
-      background: transparent;
-      border: 1px solid var(--border);
-      color: var(--text-mute);
-      border-radius: 8px;
-      padding: 4px 7px;
-      font-size: 0.75rem;
-      cursor: pointer;
-    }
-    .ep-move button:active { transform: translateY(1px); }
-    @media (pointer: coarse) {
-      .ep-item { cursor: default; }
-      .ep-move { display: inline-flex; }
-    }
     .ep-list-empty { font-size: 0.8rem; color: var(--text-mute); padding: 10px 0; }
     .ep-list-actions { display: flex; gap: 8px; margin-top: 12px; }
 
@@ -1698,6 +1518,21 @@ function configurePage() {
     }
     .szero-header { display: flex; align-items: flex-start; gap: 14px; justify-content: space-between; }
     .szero-title { font-size: 0.87rem; font-weight: 600; color: var(--text); margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+    .feat-badge {
+      display: inline-flex;
+      align-items: center;
+      background: rgba(240,192,64,0.1);
+      border: 1px solid rgba(240,192,64,0.3);
+      color: var(--gold);
+      font-size: 0.52rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 4px;
+      vertical-align: middle;
+      margin-left: 4px;
+    }
     .beta-badge {
       display: inline-flex;
       align-items: center;
@@ -1714,8 +1549,15 @@ function configurePage() {
     .szero-desc { font-size: 0.78rem; color: var(--text-mute); line-height: 1.6; }
     .szero-body { margin-top: 14px; display: none; }
     .szero-card.expanded .szero-body { display: block; }
-    .szero-expand { font-size: 0.73rem; color: var(--text-mute); cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+    .szero-expand { font-size: 0.73rem; color: var(--text-mute); cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 4px; flex-shrink: 0; pointer-events: none; }
     .szero-expand:hover { color: var(--text-dim); }
+    .szero-collapsed-desc {
+      font-size: 0.72rem;
+      color: var(--text-mute);
+      font-weight: 400;
+      margin-left: 4px;
+    }
+    .szero-card.expanded .szero-collapsed-desc { display: none; }
 
     /* ── Modal ── */
     .modal-backdrop {
@@ -1916,13 +1758,38 @@ function configurePage() {
     .flex-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .mt-1 { margin-top: 8px; }
     .mt-2 { margin-top: 14px; }
+
+    /* ── Provider selector ── */
+    .provider-select {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 1.5rem;
+    }
+    .provider-btn {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1.5px solid var(--border2);
+      background: var(--bg);
+      cursor: pointer;
+      transition: all var(--transition);
+      text-align: left;
+      font-family: 'DM Sans', sans-serif;
+    }
+    .provider-btn:hover { border-color: var(--text-dim); }
+    .provider-btn.active { border-color: var(--gold); background: var(--gold-dim); }
+    .provider-btn-name { font-size: 0.87rem; font-weight: 600; color: var(--text); }
+    .provider-btn-desc { font-size: 0.72rem; color: var(--text-mute); line-height: 1.4; }
+    .provider-recommended { font-size: 0.58rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gold); }
   `;
 
   const clientJS = [
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
     "var state = {",
-    "  provider: 'tmdb',",
-    "  apiKey: '', topN: 20, showAutoSeason: false,",
+    "  apiKey: '', metaProvider: 'tmdb', topN: 20, showAutoSeason: false,",
     "  customSeasons: [], catalogEnabled: {}, catalogNames: {}, customCatalogs: []",
     "};",
     "var modalData = { listId: null, tmdbId: null, allEpisodes: [], filteredSeason: 'all', selected: new Set() };",
@@ -1931,6 +1798,16 @@ function configurePage() {
     "",
 
     "function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }",
+    "",
+
+    "function selectProvider(provider) {",
+    "  state.metaProvider = provider;",
+    "  document.querySelectorAll('.provider-btn').forEach(function(b){ b.classList.toggle('active', b.dataset.provider === provider); });",
+    "  var tmdbCard = document.getElementById('tmdb-key-card');",
+    "  if (tmdbCard) tmdbCard.style.display = provider === 'tmdb' ? '' : 'none';",
+    "  var btn = document.getElementById('btn-validate');",
+    "  if (btn) btn.textContent = provider === 'cinemeta' ? 'Continue \u2192' : 'Continue \u2192';",
+    "}",
     "",
 
     "function goTo(n) {",
@@ -1946,39 +1823,23 @@ function configurePage() {
     "}",
     "",
 
-    // ── Provider + API key validation ──
-    "function onProviderChange() {",
-    "  var prov = (document.getElementById('provider').value || 'tmdb').toLowerCase();",
-    "  state.provider = prov;",
-    "  var apiWrap = document.getElementById('apiKey');",
-    "  if (apiWrap && apiWrap.parentElement) {",
-    "    if (prov === 'cinemeta') {",
-    "      apiWrap.value = '';",
-    "      apiWrap.parentElement.style.display = 'none';",
-    "    } else {",
-    "      apiWrap.parentElement.style.display = '';",
-    "    }",
-    "  }",
-    "  var sz=document.getElementById('szero-card');",
-    "  if (sz) sz.style.display = (prov === 'cinemeta') ? 'none' : '';",
-    "}",
+    // ── API key validation ──
     "async function validateApiKey() {",
-    "  state.provider = (document.getElementById('provider').value || 'tmdb').toLowerCase();",
     "  var btn = document.getElementById('btn-validate');",
-    "  if (state.provider === 'cinemeta') {",
+    "  // Cinemeta: no key required",
+    "  if (state.metaProvider === 'cinemeta') {",
     "    state.apiKey = '';",
-    "    state.showAutoSeason = false;",
     "    renderDefaultCatalogs();",
     "    goTo(2);",
     "    return;",
     "  }",
     "  var input = document.getElementById('apiKey');",
-    "  var key = input.value.trim();",
+    "  var key = input ? input.value.trim() : '';",
     "  if (!key) { flashError(input); return; }",
     "  btn.innerHTML = '<span class=\"spinner\"></span> Checking...';",
     "  btn.disabled = true;",
     "  try {",
-    "    var r = await fetch('/api/search?q=test&apiKey='+encodeURIComponent(key)+'&type=tv&provider=tmdb');",
+    "    var r = await fetch('/api/search?q=test&apiKey='+encodeURIComponent(key));",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    state.apiKey = key;",
@@ -1987,7 +1848,7 @@ function configurePage() {
     "  } catch(e) {",
     "    flashError(input);",
     "    input.placeholder = 'Invalid key — try again';",
-    "  } finally { btn.innerHTML = 'Continue &rarr;'; btn.disabled = false; }",
+    "  } finally { btn.innerHTML = 'Continue \u2192'; btn.disabled = false; }",
     "}",
     "",
 
@@ -2108,9 +1969,11 @@ function configurePage() {
     "  if (!state.customCatalogs.length) { el.innerHTML='<div class=\"empty-state\">No custom catalogs yet.</div>'; return; }",
     "  var sortLabels={'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'};",
     "  el.innerHTML=state.customCatalogs.map(function(c){",
-    "    var sl=(c.params&&sortLabels[c.params.sort_by])||'';",
-    "    var gp=c.params&&c.params.with_genres?' \u00b7 Genre '+c.params.with_genres:'';",
-    "    return '<div class=\"custom-catalog-item\"><div class=\"custom-catalog-item-info\"><div class=\"custom-catalog-item-name\">'+esc(c.name)+'</div><div class=\"custom-catalog-item-sub\">'+c.type+' \u00b7 '+sl+gp+'</div></div><button class=\"btn btn-danger btn-sm\" onclick=\"removeCustomCatalog(\\'' + c.id + '\\')\">\u00d7 Remove</button></div>';",
+    "    var sl='';",
+    "    if (c.path==='_mdblist_') sl='MDBList';",
+    "    else if (c.path==='_imdblist_') sl='IMDb List';",
+    "    else sl=(c.params&&sortLabels[c.params.sort_by])||'Custom';",
+    "    return '<div class=\"custom-catalog-item\"><div class=\"custom-catalog-item-info\"><div class=\"custom-catalog-item-name\">'+esc(c.name)+'</div><div class=\"custom-catalog-item-sub\">'+c.type+' \u00b7 '+sl+'</div></div><button class=\"btn btn-danger btn-sm\" onclick=\"removeCustomCatalog(\\'' + c.id + '\\')\">\u00d7 Remove</button></div>';",
     "  }).join('');",
     "}",
     "",
@@ -2127,15 +1990,12 @@ function configurePage() {
     "  box.classList.add('visible');",
     "  box.innerHTML='<div class=\"loading-state\"><div class=\"spinner-light\"></div> Searching...</div>';",
     "  try {",
-    "    var t = (state.provider==='cinemeta') ? 'series' : 'tv';",
-    "    var url='/api/search?q='+encodeURIComponent(q)+'&type='+t+'&provider='+encodeURIComponent(state.provider);",
-    "    if (state.apiKey) url += '&apiKey='+encodeURIComponent(state.apiKey);",
-    "    var r=await fetch(url);",
+    "    var r=await fetch('/api/search?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type=tv');",
     "    var d=await r.json();",
     "    if (!d.results||!d.results.length) { box.innerHTML='<p style=\"padding:1rem;font-size:0.82rem;color:var(--text-mute)\">No results.</p>'; return; }",
     "    box.innerHTML=d.results.map(function(s){",
     "      var ph=s.poster?'<img class=\"search-poster\" src=\"'+s.poster+'\" alt=\"\" loading=\"lazy\"/>' : '<div class=\"search-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#128250;</div>';",
-    "      return '<div class=\"search-result-item\" onclick=\"addShowToList(\\''+esc4attr(s.id)+'\\',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\')\">'+ph+'<div><div class=\"search-name\">'+esc(s.name)+'</div><div class=\"search-meta\">'+(s.year?s.year+' &middot; ':'')+'\u2605 '+s.vote_average+'</div></div></div>';",
+    "      return '<div class=\"search-result-item\" onclick=\"addShowToList('+s.id+',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\')\">'+ph+'<div><div class=\"search-name\">'+esc(s.name)+'</div><div class=\"search-meta\">'+(s.year?s.year+' &middot; ':'')+'\u2605 '+s.vote_average+'</div></div></div>';",
     "    }).join('');",
     "  } catch(e) { box.innerHTML='<p style=\"padding:1rem;color:var(--text-mute)\">Error searching.</p>'; }",
     "}",
@@ -2180,17 +2040,6 @@ function configurePage() {
     "}",
     "",
 
-    "function moveEp(listId, idx, delta) {",
-    "  var list=getList(listId); if(!list) return;",
-    "  var to = idx + delta;",
-    "  if (to < 0 || to >= list.episodes.length) return;",
-    "  var moved = list.episodes.splice(idx, 1)[0];",
-    "  list.episodes.splice(to, 0, moved);",
-    "  renderListEpisodes(listId);",
-    "  updateEpCount(listId);",
-    "}",
-    "",
-
     "function toggleShowCard(listId) {",
     "  var card=document.getElementById('show-'+listId);",
     "  if (card) card.classList.toggle('expanded');",
@@ -2221,10 +2070,6 @@ function configurePage() {
     "      '<span class=\"ep-rank\">'+(i+1)+'</span><span class=\"ep-drag\">&#8801;</span>'+th+",
     "      '<div class=\"ep-info\"><div class=\"ep-label\">S'+sL+'E'+eL+' \u2014 '+esc(ep.name||(\"S\"+sL+\"E\"+eL))+'</div><div class=\"ep-sublabel\">'+(ep.air_date||'')+'</div></div>'+",
     "      (ep.vote_average>0?'<span class=\"ep-rating\">\u2605'+ep.vote_average.toFixed(1)+'</span>':'')+",
-    "      '<span class=\"ep-move\">'+",
-    "        '<button onclick=\"event.stopPropagation();moveEp(\\''+listId+'\\','+i+',-1)\" title=\"Move up\">\u2191</button>'+",
-    "        '<button onclick=\"event.stopPropagation();moveEp(\\''+listId+'\\','+i+',1)\" title=\"Move down\">\u2193</button>'+",
-    "      '</span>'+",
     "      '<span class=\"ep-del\" onclick=\"removeEp(\\'' + listId + '\\','+i+')\" title=\"Remove\">\u00d7</span></li>';",
     "  }).join('');",
     "  initDragSort(listId);",
@@ -2247,10 +2092,6 @@ function configurePage() {
     "          '<span class=\"ep-rank\">'+(i+1)+'</span><span class=\"ep-drag\">&#8801;</span>'+th+",
     "          '<div class=\"ep-info\"><div class=\"ep-label\">S'+sL+'E'+eL+' \u2014 '+esc(ep.name||(\"S\"+sL+\"E\"+eL))+'</div><div class=\"ep-sublabel\">'+(ep.air_date||'')+'</div></div>'+",
     "          (ep.vote_average>0?'<span class=\"ep-rating\">\u2605'+ep.vote_average.toFixed(1)+'</span>':'')+",
-    "          '<span class=\"ep-move\">'+",
-    "            '<button onclick=\"event.stopPropagation();moveEp(\\''+tid+'\\','+i+',-1)\" title=\"Move up\">\u2191</button>'+",
-    "            '<button onclick=\"event.stopPropagation();moveEp(\\''+tid+'\\','+i+',1)\" title=\"Move down\">\u2193</button>'+",
-    "          '</span>'+",
     "          '<span class=\"ep-del\" onclick=\"removeEp(\\'' + tid + '\\','+i+')\" title=\"Remove\">\u00d7</span></li>';",
     "      }).join(''):",
     "      '<li class=\"ep-list-empty\">No episodes yet. Use the tabs above to add some.</li>';",
@@ -2313,13 +2154,14 @@ function configurePage() {
     "}",
     "",
 
-    // ── Drag sort ──
+    // ── Drag sort (desktop + mobile touch) ──
     "function initDragSort(listId) {",
     "  var listEl=document.getElementById('eplist-'+listId); if (!listEl) return;",
     "  var dragIdx=null;",
+    "  // Desktop drag-and-drop",
     "  listEl.querySelectorAll('.ep-item').forEach(function(item,idx){",
     "    item.addEventListener('dragstart',function(e){ dragIdx=idx; item.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; });",
-    "    item.addEventListener('dragend',function(){ item.classList.remove('dragging'); });",
+    "    item.addEventListener('dragend',function(){ item.classList.remove('dragging'); dragIdx=null; });",
     "    item.addEventListener('dragover',function(e){ e.preventDefault(); listEl.querySelectorAll('.ep-item').forEach(function(i){ i.classList.remove('drag-over'); }); item.classList.add('drag-over'); });",
     "    item.addEventListener('dragleave',function(){ item.classList.remove('drag-over'); });",
     "    item.addEventListener('drop',function(e){",
@@ -2331,6 +2173,50 @@ function configurePage() {
     "      list.episodes.splice(dropIdx,0,moved);",
     "      renderListEpisodes(listId);",
     "      updateEpCount(listId);",
+    "    });",
+    "  });",
+    "  // Mobile touch drag (long-press on handle to initiate)",
+    "  var touchDragIdx=null, touchGhost=null, touchList=null;",
+    "  listEl.querySelectorAll('.ep-drag').forEach(function(handle, idx) {",
+    "    handle.addEventListener('touchstart', function(e) {",
+    "      touchDragIdx=idx; touchList=getList(listId);",
+    "      var item=handle.closest('.ep-item');",
+    "      item.classList.add('dragging');",
+    "      touchGhost=item.cloneNode(true);",
+    "      touchGhost.style.cssText='position:fixed;opacity:0.85;pointer-events:none;z-index:9999;width:'+item.offsetWidth+'px;box-shadow:0 8px 32px rgba(0,0,0,0.5);border-radius:9px;';",
+    "      document.body.appendChild(touchGhost);",
+    "      e.preventDefault();",
+    "    },{passive:false});",
+    "    handle.addEventListener('touchmove', function(e) {",
+    "      if (touchDragIdx===null||!touchGhost) return;",
+    "      e.preventDefault();",
+    "      var t=e.touches[0];",
+    "      touchGhost.style.left=(t.clientX-touchGhost.offsetWidth/2)+'px';",
+    "      touchGhost.style.top=(t.clientY-touchGhost.offsetHeight/2)+'px';",
+    "      // Highlight target",
+    "      var els=listEl.querySelectorAll('.ep-item');",
+    "      els.forEach(function(el){ el.classList.remove('drag-over'); });",
+    "      var target=document.elementFromPoint(t.clientX,t.clientY);",
+    "      var targetItem=target&&target.closest('.ep-item');",
+    "      if (targetItem&&targetItem.parentNode===listEl) targetItem.classList.add('drag-over');",
+    "    },{passive:false});",
+    "    handle.addEventListener('touchend', function(e) {",
+    "      if (touchDragIdx===null) return;",
+    "      if (touchGhost) { document.body.removeChild(touchGhost); touchGhost=null; }",
+    "      listEl.querySelectorAll('.ep-item').forEach(function(el){ el.classList.remove('dragging','drag-over'); });",
+    "      var t=e.changedTouches[0];",
+    "      var target=document.elementFromPoint(t.clientX,t.clientY);",
+    "      var targetItem=target&&target.closest('.ep-item');",
+    "      if (targetItem&&targetItem.parentNode===listEl&&touchList) {",
+    "        var dropIdx=parseInt(targetItem.dataset.idx);",
+    "        if (!isNaN(dropIdx)&&dropIdx!==touchDragIdx) {",
+    "          var moved=touchList.episodes.splice(touchDragIdx,1)[0];",
+    "          touchList.episodes.splice(dropIdx,0,moved);",
+    "          renderListEpisodes(listId);",
+    "          updateEpCount(listId);",
+    "        }",
+    "      }",
+    "      touchDragIdx=null; touchList=null;",
     "    });",
     "  });",
     "}",
@@ -2351,9 +2237,7 @@ function configurePage() {
     "  document.getElementById('modal-backdrop').classList.add('open');",
     "  document.body.style.overflow='hidden';",
     "  try {",
-    "    var url='/api/episodes?tmdbId='+encodeURIComponent(list.tmdbId)+'&provider='+encodeURIComponent(state.provider);",
-    "    if (state.apiKey) url += '&apiKey='+encodeURIComponent(state.apiKey);",
-    "    var r=await fetch(url);",
+    "    var r=await fetch('/api/episodes?tmdbId='+list.tmdbId+'&apiKey='+encodeURIComponent(state.apiKey));",
     "    var d=await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    modalData.allEpisodes=d.episodes;",
@@ -2451,8 +2335,49 @@ function configurePage() {
     // ── Season Zero toggle ──
     
     // ── MDBList catalog import ──
-    "var mdbCatalogPreviewData = null;",
     "var imdbCatalogPreviewData = null;",
+    "async function previewImdbCatalog() {",
+    "  var input = document.getElementById('imdb-cat-url');",
+    "  var status = document.getElementById('imdb-cat-status');",
+    "  var btn = document.getElementById('imdb-cat-btn');",
+    "  var preview = document.getElementById('imdb-cat-preview');",
+    "  var url = (input ? input.value : '').trim();",
+    "  if (!url) { status.textContent = 'Please enter an IMDb list URL'; status.style.color = 'var(--danger)'; return; }",
+    "  btn.disabled = true; btn.innerHTML = '<span class=\"spinner-light\"></span>';",
+    "  status.textContent = 'Fetching list\u2026'; status.style.color = 'var(--text-mute)';",
+    "  preview.style.display = 'none'; imdbCatalogPreviewData = null;",
+    "  try {",
+    "    var r = await fetch('/api/imdb-catalog?url=' + encodeURIComponent(url) + '&apiKey=' + encodeURIComponent(state.apiKey));",
+    "    var d = await r.json();",
+    "    if (d.error) throw new Error(d.error);",
+    "    if (!d.metas || !d.metas.length) throw new Error('No items found in this list.');",
+    "    imdbCatalogPreviewData = { url: url, metas: d.metas, count: d.count };",
+    "    var movieCount = d.metas.filter(function(m){ return m.type==='movie'; }).length;",
+    "    document.getElementById('imdb-cat-type').value = movieCount >= d.metas.length / 2 ? 'movie' : 'series';",
+    "    var thumbs = d.metas.slice(0,8).map(function(m){ return m.poster ? '<img src=\"'+m.poster+'\" style=\"width:36px;height:54px;border-radius:5px;object-fit:cover\" loading=\"lazy\"/>' : ''; }).join('');",
+    "    document.getElementById('imdb-cat-thumbs').innerHTML = thumbs;",
+    "    status.textContent = d.count + ' items found';",
+    "    status.style.color = 'var(--gold)';",
+    "    preview.style.display = 'block';",
+    "  } catch(e) {",
+    "    status.textContent = 'Error: ' + e.message; status.style.color = '#e05252';",
+    "  } finally { btn.disabled = false; btn.textContent = 'Preview'; }",
+    "}",
+    "function addImdbCatalog() {",
+    "  if (!imdbCatalogPreviewData) return;",
+    "  var name = document.getElementById('imdb-cat-name').value.trim() || 'IMDb List';",
+    "  var type = document.getElementById('imdb-cat-type').value;",
+    "  var url  = imdbCatalogPreviewData.url;",
+    "  state.customCatalogs.push({ id: 'imdblist.' + Date.now(), name: name, type: type, path: '_imdblist_', imdblistUrl: url, enabled: true });",
+    "  document.getElementById('imdb-cat-url').value = '';",
+    "  document.getElementById('imdb-cat-preview').style.display = 'none';",
+    "  document.getElementById('imdb-cat-status').textContent = '\u2713 Added \"' + name + '\" to custom catalogs';",
+    "  document.getElementById('imdb-cat-status').style.color = 'var(--gold)';",
+    "  imdbCatalogPreviewData = null;",
+    "  renderCustomCatalogsList();",
+    "}",
+    "",
+    "var mdbCatalogPreviewData = null;",
     "async function previewMdbCatalog() {",
     "  var input = document.getElementById('mdb-cat-url');",
     "  var status = document.getElementById('mdb-cat-status');",
@@ -2464,9 +2389,7 @@ function configurePage() {
     "  status.textContent = 'Fetching list\u2026'; status.style.color = 'var(--text-mute)';",
     "  preview.style.display = 'none'; mdbCatalogPreviewData = null;",
     "  try {",
-    "    var u = '/api/mdblist-catalog?url=' + encodeURIComponent(url) + '&provider=' + encodeURIComponent(state.provider);",
-    "    if (state.apiKey) u += '&apiKey=' + encodeURIComponent(state.apiKey);",
-    "    var r = await fetch(u);",
+    "    var r = await fetch('/api/mdblist-catalog?url=' + encodeURIComponent(url) + '&apiKey=' + encodeURIComponent(state.apiKey));",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    if (!d.metas || !d.metas.length) throw new Error('No movies or shows found in this list.');",
@@ -2504,31 +2427,33 @@ function configurePage() {
     "}",
     "",
 
+    "var imdbCatalogPreviewData = null;",
     "async function previewImdbCatalog() {",
     "  var input = document.getElementById('imdb-cat-url');",
     "  var status = document.getElementById('imdb-cat-status');",
     "  var btn = document.getElementById('imdb-cat-btn');",
     "  var preview = document.getElementById('imdb-cat-preview');",
     "  var url = (input ? input.value : '').trim();",
-    "  if (!url) { status.textContent = 'Please enter an IMDb list URL'; status.style.color = 'var(--danger)'; return; }",
+    "  if (!url) { status.textContent = 'Please enter an IMDB list URL'; status.style.color = 'var(--danger)'; return; }",
+    "  if (!state.apiKey) { status.textContent = 'TMDB API key required to resolve IMDB lists'; status.style.color = 'var(--danger)'; return; }",
     "  btn.disabled = true; btn.innerHTML = '<span class=\"spinner-light\"></span>';",
-    "  status.textContent = 'Fetching list…'; status.style.color = 'var(--text-mute)';",
+    "  status.textContent = 'Fetching list\u2026'; status.style.color = 'var(--text-mute)';",
     "  preview.style.display = 'none'; imdbCatalogPreviewData = null;",
     "  try {",
-    "    var u = '/api/imdb-catalog?url=' + encodeURIComponent(url) + '&provider=' + encodeURIComponent(state.provider);",
-    "    if (state.apiKey) u += '&apiKey=' + encodeURIComponent(state.apiKey);",
-    "    var r = await fetch(u);",
+    "    var r = await fetch('/api/imdb-catalog?url=' + encodeURIComponent(url) + '&apiKey=' + encodeURIComponent(state.apiKey));",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
-    "    if (!d.metas || !d.metas.length) throw new Error('No movies or series found in this list.');",
+    "    if (!d.metas || !d.metas.length) throw new Error('No movies or shows found in this list.');",
     "    imdbCatalogPreviewData = { url: url, metas: d.metas, name: d.name, count: d.count };",
+    "    if (d.name) document.getElementById('imdb-cat-name').value = d.name;",
     "    var movieCount = d.metas.filter(function(m){ return m.type === 'movie'; }).length;",
     "    document.getElementById('imdb-cat-type').value = movieCount >= d.metas.length / 2 ? 'movie' : 'series';",
     "    var thumbs = d.metas.slice(0, 8).map(function(m) {",
     "      if (!m.poster) return ''; var img=document.createElement('img'); img.src=m.poster; img.style.cssText='width:36px;height:54px;border-radius:5px;object-fit:cover;'; img.loading='lazy'; return img.outerHTML;",
     "    }).join('');",
     "    document.getElementById('imdb-cat-thumbs').innerHTML = thumbs;",
-    "    status.textContent = d.count + ' item' + (d.count !== 1 ? 's' : '') + ' found';",
+    "    var nameStr = d.name ? ' \u2014 ' + d.name : '';",
+    "    status.textContent = d.count + ' item' + (d.count !== 1 ? 's' : '') + ' found' + nameStr;",
     "    status.style.color = 'var(--gold)';",
     "    preview.style.display = 'block';",
     "  } catch(e) {",
@@ -2537,13 +2462,13 @@ function configurePage() {
     "}",
     "function addImdbCatalog() {",
     "  if (!imdbCatalogPreviewData) return;",
-    "  var name = document.getElementById('imdb-cat-name').value.trim() || 'IMDb List';",
+    "  var name = document.getElementById('imdb-cat-name').value.trim() || 'IMDB List';",
     "  var type = document.getElementById('imdb-cat-type').value;",
     "  var url  = imdbCatalogPreviewData.url;",
-    "  state.customCatalogs.push({ id: 'imdb.' + Date.now(), name: name, type: type, path: '_imdb_', imdbUrl: url, enabled: true });",
+    "  state.customCatalogs.push({ id: 'imdblist.' + Date.now(), name: name, type: type, path: '_imdblist_', imdblistUrl: url, enabled: true });",
     "  document.getElementById('imdb-cat-url').value = '';",
     "  document.getElementById('imdb-cat-preview').style.display = 'none';",
-    "  document.getElementById('imdb-cat-status').textContent = '✓ Added ' + name + ' to custom catalogs';",
+    "  document.getElementById('imdb-cat-status').textContent = '\u2713 Added \"' + name + '\" to custom catalogs';",
     "  document.getElementById('imdb-cat-status').style.color = 'var(--gold)';",
     "  imdbCatalogPreviewData = null;",
     "  renderCustomCatalogsList();",
@@ -2551,24 +2476,24 @@ function configurePage() {
     "",
 
 "function toggleSzeroExpand() {",
-    "  document.getElementById('szero-card').classList.toggle('expanded');",
+    "  var card=document.getElementById('szero-card');",
+    "  card.classList.toggle('expanded');",
+    "  var expanded=card.classList.contains('expanded');",
     "  var btn=document.getElementById('szero-expand-btn');",
-    "  btn.textContent=document.getElementById('szero-card').classList.contains('expanded')?'Collapse \u25b2':'Details \u25be';",
+    "  var desc=document.getElementById('szero-collapsed-desc');",
+    "  btn.textContent=expanded?'Collapse \u25b2':'Configure \u25be';",
+    "  if(desc) desc.style.display=expanded?'none':'';",
     "}",
     "",
 
     // ── Install page ──
     "function buildInstallPage() {",
     "  var flat=state.customSeasons.map(function(list){",
-    "    return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'\u2728', episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode,id:e.id||null,name:e.name||null,still:e.still||null,overview:e.overview||null,air_date:e.air_date||null}; }) };",
+    "    return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'\u2728', episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
     "  });",
-    "  if (state.provider !== 'cinemeta') {",
-    "    state.topN=parseInt(document.getElementById('topN').value)||20;",
-    "    state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
-    "  } else {",
-    "    state.topN=20; state.showAutoSeason=false;",
-    "  }",
-    "  var cfg={provider:state.provider, tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs};",
+    "  state.topN=parseInt(document.getElementById('topN').value)||20;",
+    "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
+    "  var cfg={tmdbApiKey:state.apiKey, metaProvider:state.metaProvider||'tmdb', topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs};",
     "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
     "  var manifestUrl=window.location.origin+'/'+encoded+'/manifest.json';",
     "  document.getElementById('manifest-url').value=manifestUrl;",
@@ -2606,23 +2531,28 @@ function configurePage() {
     "  setTimeout(function(){btn.textContent='Copy';btn.classList.remove('copied');},2000);",
     "}",
     "",
-    "async function initHeroBg(){",
-    "  var host=document.getElementById('hero-bg');",
-    "  if(!host) return;",
-    "  try{",
-    "    var r=await fetch('/api/cinemeta-popular');",
-    "    var d=await r.json();",
-    "    var posters=(d.posters||[]).filter(Boolean);",
-    "    if(!posters.length) return;",
-    "    var all=posters.concat(posters);",
-    "    host.innerHTML='<div class=\"hero-bg-track\">'+all.map(function(p){return '<img src=\"'+p+'\" alt=\"\" loading=\"lazy\"/>';}).join('')+'</div>';",
-    "  }catch(e){}",
-    "}",
-    "",
-    "setTimeout(function(){ onProviderChange(); initHeroBg(); },0);",
-    "",
     "function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;'); }",
     "function esc4attr(s){ return String(s||'').replace(/'/g,'&#39;'); }",
+    "",
+    "// Hero background images",
+    "async function loadHeroBackground() {",
+    "  try {",
+    "    var r = await fetch('/api/cinemeta-hero');",
+    "    var d = await r.json();",
+    "    var imgs = (d.images || []).filter(Boolean);",
+    "    if (!imgs.length) return;",
+    "    // Duplicate for seamless loop",
+    "    var all = imgs.concat(imgs);",
+    "    var track = document.getElementById('hero-bg-track');",
+    "    if (!track) return;",
+    "    track.innerHTML = all.map(function(src){",
+    "      return '<img class=\"hero-bg-img\" src=\"'+src+'\" alt=\"\" loading=\"lazy\"/>';",
+    "    }).join('');",
+    "  } catch(e) {}",
+    "}",
+    "loadHeroBackground();",
+    "// Init provider selection",
+    "selectProvider('tmdb');",
   ].join('\n');
 
   // ── HTML ──────────────────────────────────────────────────────────────────
@@ -2635,6 +2565,10 @@ function configurePage() {
 <style>${css}</style>
 </head>
 <body>
+<div class="hero-bg-wrap">
+  <div class="hero-bg-track" id="hero-bg-track"></div>
+  <div class="hero-bg-fade"></div>
+</div>
 <div class="topbar">
   <div class="topbar-brand">Good<span>Taste</span></div>
   <div class="topbar-steps">
@@ -2653,33 +2587,36 @@ function configurePage() {
   <!-- PAGE 1: Connect -->
   <div class="page active" id="page-1">
     <div class="hero">
-      <div class="hero-bg" id="hero-bg"></div>
       <div class="hero-logo">Good<span>Taste</span></div>
-      <div class="hero-tagline">the ultimate metadata curation addon</div>
+      <div class="hero-subtitle">The ultimate metadata curation addon</div>
       <div class="hero-features">
-        <div class="hero-feat"><strong>Full metadata &amp; search</strong>Cinemeta or TMDB (TMDB recommended)</div>
-        <div class="hero-feat"><strong>Custom curated episode lists</strong>Curate episodes for your favorite series and stream them straight from the list</div>
-        <div class="hero-feat"><strong>Catalog manager</strong>Create, add, and manage catalogs</div>
-        <div class="hero-feat"><strong>Season zero <span class=\"beta-badge\">Beta</span></strong>Auto-adds top-rated episodes as Season 0 for every series</div>
-        <div class="hero-feat"><strong>Import lists</strong>Bring in IMDb or MDBList lists in seconds</div>
-        <div class="hero-feat"><strong>Reorder episodes</strong>Drag on desktop, tap-to-move on mobile</div>
+        <div class="hero-feat"><strong>Full Metadata &amp; Search</strong>Cinemeta or TMDB — posters, ratings, cast, and full search</div>
+        <div class="hero-feat"><strong>Curated Episode Lists</strong>Build handpicked episode lists for any series and stream them directly</div>
+        <div class="hero-feat"><strong>Catalog Manager</strong>Create, import, and manage movie &amp; show catalogs</div>
+        <div class="hero-feat"><strong>Season Zero <span class="feat-badge">Beta</span></strong>Auto-adds the top-rated episodes of every series to a Season 0</div>
       </div>
     </div>
     <div class="card">
       <div class="card-eyebrow">Step 1</div>
-      <div class="card-title">Pick your metadata source</div>
-      <div class="card-sub">TMDB is recommended (best metadata + ratings). Cinemeta works without an API key. You can switch anytime.</div>
-      <div class="field">
-        <label>Metadata Provider</label>
-        <select id="provider" onchange="onProviderChange()">
-          <option value="tmdb">TMDB (recommended)</option>
-          <option value="cinemeta">Cinemeta (no key)</option>
-        </select>
+      <div class="card-title">Choose your metadata source</div>
+      <div class="card-sub">Pick where GoodTaste pulls metadata, posters, and search results from.</div>
+      <div class="provider-select">
+        <button class="provider-btn" data-provider="tmdb" onclick="selectProvider('tmdb')">
+          <span class="provider-recommended">Recommended</span>
+          <span class="provider-btn-name">TMDB</span>
+          <span class="provider-btn-desc">Full metadata, genre filters, custom catalogs, and search. Requires a free API key.</span>
+        </button>
+        <button class="provider-btn" data-provider="cinemeta" onclick="selectProvider('cinemeta')">
+          <span class="provider-btn-name">Cinemeta</span>
+          <span class="provider-btn-desc">No API key needed. Uses Stremio's built-in catalog source.</span>
+        </button>
       </div>
-      <div class="field">
-        <label>TMDB API Key</label>
-        <input type="password" id="apiKey" placeholder="Paste your key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter') validateApiKey()"/>
-        <p class="hint" id="tmdb-hint">Free key available at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> under API &rarr; API Key</p>
+      <div id="tmdb-key-card">
+        <div class="field">
+          <label>TMDB API Key</label>
+          <input type="password" id="apiKey" placeholder="Paste your key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter') validateApiKey()"/>
+          <p class="hint">Free key at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> &rarr; API Key (v3 auth)</p>
+        </div>
       </div>
       <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>
     </div>
@@ -2710,47 +2647,25 @@ function configurePage() {
 
     <!-- Season Zero -->
     <div class="szero-card" id="szero-card">
-      <div class="szero-header">
-        <div>
-          <div class="szero-title">Season Zero <span class="beta-badge">Beta</span></div>
-          <div class="szero-desc">Adds an auto “Best Of” season to every series.</div>
+      <div class="szero-header" onclick="toggleSzeroExpand()">
+        <div class="szero-title">
+          Season Zero <span class="beta-badge">Beta</span>
+          <span class="szero-collapsed-desc" id="szero-collapsed-desc">— auto-adds top rated episodes to every series</span>
         </div>
-        <span class="szero-expand" id="szero-expand-btn" onclick="toggleSzeroExpand()">Details &#9660;</span>
+        <span class="szero-expand" id="szero-expand-btn">Configure &#9660;</span>
       </div>
       <div class="szero-body">
-        <div class="szero-desc" style="margin-top:2px">Automatically adds a <strong>Season 0</strong> inside every show you open, listing the top-rated episodes by TMDB score. Useful for exploring a new series. <strong style="color:var(--text-dim)">Warning:</strong> streaming from Season Zero may not work on all platforms.</div>
-        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-top:4px;">
+        <div class="szero-desc">Automatically adds a "Season Zero" inside every show you open, listing its top-rated episodes by TMDB score — great for discovering a new series. <strong style="color:var(--text-dim)">Note: streaming from Season Zero may not work on all platforms.</strong> For reliable streams, use Curated Lists above.</div>
+        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-top:14px">
           <div class="field" style="margin-bottom:0;flex:1;min-width:160px">
             <label>Top N Episodes</label>
             <input type="number" id="topN" placeholder="20" min="5" max="100" value="20"/>
           </div>
           <div class="catalog-row" style="flex:1;min-width:200px;margin-bottom:0">
-            <div class="catalog-row-info"><div style="font-size:0.87rem;font-weight:600;color:var(--text)">Enable Season Zero</div><div class="catalog-row-type">TMDB-only</div></div>
+            <div class="catalog-row-info"><div style="font-size:0.87rem;font-weight:600;color:var(--text)">Enable Season Zero</div><div class="catalog-row-type">Off by default</div></div>
             <label class="toggle"><input type="checkbox" id="showAutoSeason"/><span class="toggle-slider"></span></label>
           </div>
         </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="section-header">
-        <div>
-          <div style="font-size:0.9rem;font-weight:600;color:#fff">Import from IMDb <span style="font-size:0.68rem;color:var(--text-mute);font-weight:400;margin-left:6px">optional</span></div>
-          <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">Add an IMDb list as a movie or series catalog in Stremio</div>
-        </div>
-      </div>
-      <div style="display:flex;gap:8px;margin-bottom:10px">
-        <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/" style="flex:1;font-size:0.85rem"/>
-        <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
-      </div>
-      <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
-      <div id="imdb-cat-preview" style="display:none">
-        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
-          <div class="field" style="margin-bottom:0;flex:1;min-width:160px"><label>Catalog Name</label><input type="text" id="imdb-cat-name" placeholder="My IMDb List"/></div>
-          <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="imdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
-          <button class="btn btn-primary btn-sm" onclick="addImdbCatalog()">Add Catalog</button>
-        </div>
-        <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7;margin-top:4px"></div>
       </div>
     </div>
 
@@ -2800,6 +2715,28 @@ function configurePage() {
     <div class="card">
       <div class="section-header">
         <div>
+          <div style="font-size:0.9rem;font-weight:600;color:#fff">Import from IMDb List <span style="font-size:0.68rem;color:var(--text-mute);font-weight:400;margin-left:6px">optional</span></div>
+          <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">Add a public IMDb list as a movie or series catalog</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/" style="flex:1;font-size:0.85rem"/>
+        <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
+      </div>
+      <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
+      <div id="imdb-cat-preview" style="display:none">
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
+          <div class="field" style="margin-bottom:0;flex:1;min-width:160px"><label>Catalog Name</label><input type="text" id="imdb-cat-name" placeholder="My IMDb List"/></div>
+          <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="imdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
+          <button class="btn btn-primary btn-sm" onclick="addImdbCatalog()">Add Catalog</button>
+        </div>
+        <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7;margin-top:4px"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-header">
+        <div>
           <div style="font-size:0.9rem;font-weight:600;color:#fff">Import from MDBList <span style="font-size:0.68rem;color:var(--text-mute);font-weight:400;margin-left:6px">optional</span></div>
           <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">Add a public MDBList as a movie or series catalog in Stremio</div>
         </div>
@@ -2816,6 +2753,28 @@ function configurePage() {
           <button class="btn btn-primary btn-sm" onclick="addMdbCatalog()">Add Catalog</button>
         </div>
         <div id="mdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7;margin-top:4px"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-header">
+        <div>
+          <div style="font-size:0.9rem;font-weight:600;color:#fff">Import from IMDB List <span style="font-size:0.68rem;color:var(--text-mute);font-weight:400;margin-left:6px">optional</span></div>
+          <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">Add a public IMDB list as a movie or series catalog in Stremio</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/" style="flex:1;font-size:0.85rem"/>
+        <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
+      </div>
+      <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
+      <div id="imdb-cat-preview" style="display:none">
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
+          <div class="field" style="margin-bottom:0;flex:1;min-width:160px"><label>Catalog Name</label><input type="text" id="imdb-cat-name" placeholder="My IMDB List"/></div>
+          <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="imdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
+          <button class="btn btn-primary btn-sm" onclick="addImdbCatalog()">Add Catalog</button>
+        </div>
+        <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7;margin-top:4px"></div>
       </div>
     </div>
 
