@@ -193,55 +193,6 @@ function buildManifest(config) {
   };
 }
 
-// ─── AI EPISODE LIST GENERATION ─────────────────────────────────────────────
-// Uses Pollinations.AI (free, no key) to generate episode lists
-app.get('/api/ai-episodes', async function(req, res) {
-  const { show, n, focus } = req.query;
-  if (!show) return res.status(400).json({ error: 'show is required' });
-
-  const topN = parseInt(n) || 0;
-  const countPhrase = topN > 0 ? 'exactly ' + topN : 'a curated selection of';
-  const focusPhrase = focus && focus.trim() ? focus.trim() : 'the most acclaimed, essential, and memorable episodes';
-
-  const prompt =
-    'You are a TV expert. List ' + countPhrase + ' episodes of "' + show + '". ' +
-    'The list should focus on: ' + focusPhrase + '. ' +
-    'Reply ONLY with episode codes, one per line, in S##E## format (e.g. S01E03). ' +
-    'Do not include titles, explanations, numbering, bullet points, or any other text. ' +
-    'Only output episode codes, one per line, nothing else.';
-
-  try {
-    const encoded = encodeURIComponent(prompt);
-    const url = 'https://text.pollinations.ai/' + encoded + '?model=openai&seed=' + Date.now();
-    const resp = await axios.get(url, {
-      headers: { 'User-Agent': 'GoodTaste/1.0' },
-      timeout: 30000,
-    });
-
-    const text = String(resp.data || '').trim();
-    // Parse S##E## codes
-    const re = /[Ss](\d{1,3})[Ee](\d{1,3})/g;
-    let m;
-    const episodes = [];
-    const seen = new Set();
-    while ((m = re.exec(text)) !== null) {
-      const s = parseInt(m[1]);
-      const e = parseInt(m[2]);
-      const k = s + ':' + e;
-      if (!seen.has(k) && s > 0 && e > 0) { seen.add(k); episodes.push({ season: s, episode: e }); }
-    }
-
-    if (!episodes.length) {
-      return res.status(502).json({ error: 'AI returned no episode codes. Try rephrasing your request.', raw: text.slice(0, 200) });
-    }
-
-    res.json({ episodes, count: episodes.length, raw: text });
-  } catch (e) {
-    console.error('[ai-episodes]', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.get('/manifest.json',         (req, res) => res.json(buildManifest()));
 app.get('/:config/manifest.json', (req, res) => res.json(buildManifest(req.params.config)));
 app.get('/',          (req, res) => res.redirect('/configure'));
@@ -326,10 +277,7 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
     // Handle MDBList-sourced catalogs
     if (catDef.path === '_mdblist_' && catDef.mdblistUrl) {
       const listUrl = String(catDef.mdblistUrl).trim();
-      let fetchUrl = listUrl;
-      if (!fetchUrl.endsWith('/json/') && !fetchUrl.endsWith('/json')) {
-        fetchUrl = fetchUrl.replace(/\/json\.?$/, '').replace(/\/$/, '') + '/json/';
-      }
+      let fetchUrl = listUrl.endsWith('.json') ? listUrl : listUrl.replace(/\/$/, '') + '.json';
       const resp = await axios.get(fetchUrl, {
         headers: { 'Accept': 'application/json', 'User-Agent': 'GoodTaste/1.0' },
         timeout: 15000,
@@ -577,9 +525,8 @@ app.get('/api/mdblist-catalog', async function(req, res) {
 
   try {
     let fetchUrl = urlStr;
-    // MDBList JSON endpoint: must end with /json/ (not .json)
-    if (!fetchUrl.endsWith('/json/') && !fetchUrl.endsWith('/json')) {
-      fetchUrl = fetchUrl.replace(/\/json\.?$/, '').replace(/\/$/, '') + '/json/';
+    if (!fetchUrl.endsWith('.json')) {
+      fetchUrl = fetchUrl.replace(/\/$/, '') + '.json';
     }
 
     const resp = await axios.get(fetchUrl, {
@@ -1530,7 +1477,7 @@ function configurePage() {
   const clientJS = [
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
     "var state = {",
-    "  apiKey: '', metaSource: 'tmdb', topN: 20, showAutoSeason: false,",
+    "  apiKey: '', topN: 20, showAutoSeason: false,",
     "  customSeasons: [], catalogEnabled: {}, catalogNames: {}, customCatalogs: []",
     "};",
     "var modalData = { listId: null, tmdbId: null, allEpisodes: [], filteredSeason: 'all', selected: new Set() };",
@@ -1554,30 +1501,15 @@ function configurePage() {
     "}",
     "",
 
-    // ── Source selector ──
-    "function selectSource(src) {",
-    "  state.metaSource = src;",
-    "  document.getElementById('src-tmdb').classList.toggle('selected', src==='tmdb');",
-    "  document.getElementById('src-cinemeta').classList.toggle('selected', src==='cinemeta');",
-    "  document.getElementById('tmdb-key-field').style.display = src==='tmdb' ? '' : 'none';",
-    "  document.getElementById('btn-validate').textContent = src==='cinemeta' ? 'Continue →' : 'Continue →';",
-    "}",
-    "",
-
     // ── API key validation ──
     "async function validateApiKey() {",
+    "  var input = document.getElementById('apiKey');",
+    "  var key = input.value.trim();",
     "  var btn = document.getElementById('btn-validate');",
-    "  btn.innerHTML = '<span class=\"spinner\"></span> Checking...'; btn.disabled = true;",
+    "  if (!key) { flashError(input); return; }",
+    "  btn.innerHTML = '<span class=\"spinner\"></span> Checking...';",
+    "  btn.disabled = true;",
     "  try {",
-    "    if (state.metaSource === 'cinemeta') {",
-    "      state.apiKey = '';",
-    "      renderDefaultCatalogs();",
-    "      goTo(2);",
-    "      return;",
-    "    }",
-    "    var input = document.getElementById('apiKey');",
-    "    var key = input.value.trim();",
-    "    if (!key) { flashError(input); btn.innerHTML = 'Continue →'; btn.disabled = false; return; }",
     "    var r = await fetch('/api/search?q=test&apiKey='+encodeURIComponent(key));",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
@@ -1585,52 +1517,18 @@ function configurePage() {
     "    renderDefaultCatalogs();",
     "    goTo(2);",
     "  } catch(e) {",
-    "    var input2 = document.getElementById('apiKey');",
-    "    if (input2) { flashError(input2); input2.placeholder = 'Invalid key — try again'; }",
-    "  } finally { btn.innerHTML = 'Continue →'; btn.disabled = false; }",
+    "    flashError(input);",
+    "    input.placeholder = 'Invalid key — try again';",
+    "  } finally { btn.innerHTML = 'Continue &rarr;'; btn.disabled = false; }",
     "}",
     "",
 
-    
-    // ── AI episode list generation ──
-    "async function generateAiList(listId) {",
-    "  var list = getList(listId); if (!list) return;",
-    "  var focusEl = document.getElementById('ai-focus-'+listId);",
-    "  var countEl = document.getElementById('ai-count-'+listId);",
-    "  var btn = document.getElementById('ai-btn-'+listId);",
-    "  var status = document.getElementById('ai-status-'+listId);",
-    "  var focus = focusEl ? focusEl.value.trim() : '';",
-    "  var n = countEl ? (parseInt(countEl.value)||0) : 0;",
-    "  var showName = list.title || list.tmdbId;",
-    "  if (btn) { btn.disabled=true; btn.innerHTML='<span class=\"spinner\"></span>'; }",
-    "  if (status) { status.textContent='Generating…'; status.className='ai-status'; }",
-    "  try {",
-    "    var params = 'show='+encodeURIComponent(showName);",
-    "    if (n>0) params += '&n='+n;",
-    "    if (focus) params += '&focus='+encodeURIComponent(focus);",
-    "    var r = await fetch('/api/ai-episodes?'+params);",
-    "    var d = await r.json();",
-    "    if (d.error) throw new Error(d.error);",
-    "    var existing = new Set(list.episodes.map(function(e){ return e.season+':'+e.episode; }));",
-    "    var added = 0;",
-    "    for (var i=0;i<d.episodes.length;i++) {",
-    "      var ep=d.episodes[i]; var k=ep.season+':'+ep.episode;",
-    "      if (!existing.has(k)) { existing.add(k); list.episodes.push(ep); added++; }",
-    "    }",
-    "    if (status) { status.textContent='✓ Added '+added+' episode'+(added!==1?'s':'')+' ('+d.count+' generated)'; status.className='ai-status ok'; }",
-    "    renderListEpisodes(listId); updateEpCount(listId);",
-    "  } catch(e) {",
-    "    if (status) { status.textContent='Error: '+e.message; status.className='ai-status err'; }",
-    "  } finally { if(btn){btn.disabled=false;btn.innerHTML='✨ Generate';} }",
-    "}",
-    "",
-
-"function flashError(el) { el.classList.add('error'); el.focus(); setTimeout(function(){ el.classList.remove('error'); },2000); }",
+    "function flashError(el) { el.classList.add('error'); el.focus(); setTimeout(function(){ el.classList.remove('error'); },2000); }",
     "",
 
     // ── Tab switching for add panels ──
     "function switchAddTab(listId, tab) {",
-    "  ['picker','imdb','paste','ai'].forEach(function(t) {",
+    "  ['picker','imdb','paste'].forEach(function(t) {",
     "    var btn = document.getElementById('add-tab-'+t+'-'+listId);",
     "    var panel = document.getElementById('add-panel-'+t+'-'+listId);",
     "    if (btn) btn.classList.toggle('active', t===tab);",
@@ -1889,7 +1787,6 @@ function configurePage() {
     "          '<button class=\"add-tab active\" id=\"add-tab-picker-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'picker\\')\">Browse</button>'+",
     "          '<button class=\"add-tab\" id=\"add-tab-imdb-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'imdb\\')\">IMDB List</button>'+",
     "          '<button class=\"add-tab\" id=\"add-tab-paste-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'paste\\')\">Paste</button>'+",
-    "          '<button class=\"add-tab\" id=\"add-tab-ai-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'ai\\')\">✨ AI</button>'+",
     "        '</div>'+",
     // Picker panel
     "        '<div class=\"add-panel active\" id=\"add-panel-picker-'+tid+'\">'+",
@@ -1902,7 +1799,10 @@ function configurePage() {
     "            '<button class=\"btn btn-ghost btn-sm\" id=\"imdb-btn-'+tid+'\" onclick=\"importImdbList(\\'' + tid + '\\')\">Import</button>'+",
     "          '</div>'+",
     "        '</div>'+",
-
+    // MDBList panel
+    "          '<div class=\"import-row\">'+",
+    "          '</div>'+",
+    "        '</div>'+",
     // Paste panel
     "        '<div class=\"add-panel\" id=\"add-panel-paste-'+tid+'\">'+",
     "          '<p class=\"paste-hint\">Accepts S01E01, s1e1, 1x01 and similar formats. One per line or space-separated.</p>'+",
@@ -1910,24 +1810,6 @@ function configurePage() {
     "          '<div class=\"paste-actions\">'+",
     "            '<button class=\"btn btn-primary btn-sm\" onclick=\"applyPaste(\\'' + tid + '\\')\">\u2713 Add Episodes</button>'+",
     "            '<span class=\"paste-status\" id=\"paste-status-'+tid+'\"></span>'+",
-    "          '</div>'+",
-    "        '</div>'+",
-    // AI panel
-    "        '<div class=\"add-panel\" id=\"add-panel-ai-'+tid+'\">'+",
-    "          '<div class=\"ai-panel\">'+",
-    "            '<div class=\"ai-panel-title\">✨ Generate episode list with AI</div>'+",
-    "            '<div class=\"field\" style=\"margin-bottom:8px\">'+",
-    "              '<label style=\"margin-bottom:4px\">Focus (optional)</label>'+",
-    "              '<input type=\"text\" id=\"ai-focus-'+tid+'\" placeholder=\"e.g. highest rated, best standalone, season 3 arc, funniest...\"/>'+",
-    "            '</div>'+",
-    "            '<div style=\"display:flex;gap:8px;align-items:flex-end\">'+",
-    "              '<div class=\"field\" style=\"margin-bottom:0;max-width:80px\">'+",
-    "                '<label style=\"margin-bottom:4px\">Count</label>'+",
-    "                '<input type=\"number\" id=\"ai-count-'+tid+'\" placeholder=\"auto\" min=\"1\" max=\"50\" style=\"text-align:center\"/>'+",
-    "              '</div>'+",
-    "              '<button class=\"btn btn-primary btn-sm\" id=\"ai-btn-'+tid+'\" onclick=\"generateAiList(\\'' + tid + '\\')\">✨ Generate</button>'+",
-    "            '</div>'+",
-    "            '<div class=\"ai-status\" id=\"ai-status-'+tid+'\"></div>'+",
     "          '</div>'+",
     "        '</div>'+",
     // Episode list
@@ -2140,7 +2022,7 @@ function configurePage() {
     "  });",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
-    "  var cfg={tmdbApiKey:state.apiKey, metaSource:state.metaSource, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs};",
+    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs};",
     "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
     "  var manifestUrl=window.location.origin+'/'+encoded+'/manifest.json';",
     "  document.getElementById('manifest-url').value=manifestUrl;",
@@ -2223,33 +2105,13 @@ function configurePage() {
     </div>
     <div class="card">
       <div class="card-eyebrow">Step 1</div>
-      <div class="card-title">Connect a Metadata Source</div>
-      <div class="card-sub">GoodTaste needs a metadata source to fetch show info, posters, and episode data. TMDB is recommended for the best experience.</div>
-
-      <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:1.4rem">
-        <label style="margin-bottom:0;font-size:0.7rem;font-weight:600;color:var(--text-dim);letter-spacing:0.08em;text-transform:uppercase">Choose source</label>
-        <div id="src-tmdb" class="source-option selected" onclick="selectSource('tmdb')">
-          <div class="source-radio"></div>
-          <div class="source-info">
-            <div class="source-name">TMDB <span class="source-badge">Recommended</span></div>
-            <div class="source-desc">Free API key required &mdash; rich metadata, full episode data, trailers, cast</div>
-          </div>
-        </div>
-        <div id="src-cinemeta" class="source-option" onclick="selectSource('cinemeta')">
-          <div class="source-radio"></div>
-          <div class="source-info">
-            <div class="source-name">Cinemeta</div>
-            <div class="source-desc">No API key needed &mdash; basic metadata via Stremio&rsquo;s public addon. Episode search and best-of features unavailable.</div>
-          </div>
-        </div>
-      </div>
-
-      <div id="tmdb-key-field" class="field">
+      <div class="card-title">Connect to TMDB</div>
+      <div class="card-sub">Enter your free TMDB API key to get started. GoodTaste uses TMDB to fetch metadata, search shows, and resolve episodes.</div>
+      <div class="field">
         <label>TMDB API Key</label>
         <input type="password" id="apiKey" placeholder="Paste your key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter') validateApiKey()"/>
-        <p class="hint">Free key at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> under API &rarr; API Key</p>
+        <p class="hint">Free key available at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> under API &rarr; API Key</p>
       </div>
-
       <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>
     </div>
   </div>
