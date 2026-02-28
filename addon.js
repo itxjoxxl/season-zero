@@ -16,6 +16,9 @@ const TMDB_IMG_MD = 'https://image.tmdb.org/t/p/w500';
 const TMDB_IMG_LG = 'https://image.tmdb.org/t/p/w1280';
 const TMDB_BASE   = 'https://api.themoviedb.org/3';
 
+// Cinemeta (no API key required)
+const CINEMETA_BASE = 'https://v3-cinemeta.strem.io';
+
 const DEFAULT_CATALOGS = [
   { id: 'tmdb.trending_movies',   type: 'movie',  name: 'Trending Movies',   path: '/trending/movie/week', enabled: true  },
   { id: 'tmdb.popular_movies',    type: 'movie',  name: 'Popular Movies',     path: '/movie/popular',       enabled: true  },
@@ -40,6 +43,12 @@ async function tmdb(path, apiKey, params = {}) {
   url.searchParams.set('language', 'en-US');
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const { data } = await axios.get(url.toString());
+  return data;
+}
+
+async function cinemeta(path) {
+  const url = new URL(CINEMETA_BASE + path);
+  const { data } = await axios.get(url.toString(), { timeout: 20000 });
   return data;
 }
 
@@ -145,6 +154,9 @@ function buildBestOfVideos(bestOfEps, imdbId, tmdbId) {
 function buildManifest(config) {
   const cfg = config ? parseConfig(config) : {};
 
+  const provider = String(cfg.provider || 'tmdb').toLowerCase();
+  const usesTmdb = provider !== 'cinemeta';
+
   const enabledDefaults = DEFAULT_CATALOGS.filter(d => {
     const override = cfg.catalogEnabled && cfg.catalogEnabled[d.id];
     if (override === false) return false;
@@ -160,15 +172,16 @@ function buildManifest(config) {
       const displayName = cfg.catalogNames && cfg.catalogNames[d.id] ? cfg.catalogNames[d.id] : d.name;
       return {
         id: d.id, type: d.type, name: displayName,
-        extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }, { name: 'search', isRequired: false }],
+        // IMPORTANT: do NOT expose `search` extra on non-search catalogs or Stremio will merge them into global search.
+        extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }],
       };
     }),
     ...customCatalogs.map(c => ({
       id: c.id, type: c.type, name: c.name,
-      extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }, { name: 'search', isRequired: false }],
+      extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }],
     })),
-    { id: 'tmdb.search_movies',  type: 'movie',  name: 'Search Movies',  extra: [{ name: 'search', isRequired: true }] },
-    { id: 'tmdb.search_series',  type: 'series', name: 'Search Series',  extra: [{ name: 'search', isRequired: true }] },
+    { id: 'gt.search_movies',  type: 'movie',  name: 'Search Movies',  extra: [{ name: 'search', isRequired: true }] },
+    { id: 'gt.search_series',  type: 'series', name: 'Search Series',  extra: [{ name: 'search', isRequired: true }] },
   ];
 
   if (customSeasons.length > 0) {
@@ -179,15 +192,18 @@ function buildManifest(config) {
     id:          'community.goodtaste-tmdb',
     version:     '5.0.0',
     name:        'GoodTaste',
-    description: 'Curated episode lists, full TMDB metadata, catalogs, and search.',
+    description: 'Curated episode lists, full metadata, catalogs, and search.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
-    catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
-    resources:   ['catalog', 'meta', 'episodeVideos'],
+    catalogs:    (usesTmdb ? !!cfg.tmdbApiKey : true) ? allCatalogs : [],
+    // NOTE: `episodeVideos` is not a valid Stremio manifest resource (it breaks manifest validation).
+    // We avoid it by using real episode IDs for streaming.
+    resources:   ['catalog', 'meta'],
     types:       ['movie', 'series'],
     idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
-    behaviorHints: { configurable: true, configurationRequired: !cfg.tmdbApiKey },
+    behaviorHints: { configurable: true, configurationRequired: (usesTmdb ? !cfg.tmdbApiKey : false) },
     config: [
-      { key: 'tmdbApiKey', type: 'text',   title: 'TMDB API Key',                                required: true  },
+      { key: 'provider',   type: 'select', title: 'Metadata Provider', required: false, options: ['tmdb', 'cinemeta'] },
+      { key: 'tmdbApiKey', type: 'text',   title: 'TMDB API Key (recommended)',                  required: false },
       { key: 'topN',       type: 'number', title: 'Top episodes in Best Of season (default: 20)', required: false },
     ],
   };
@@ -201,21 +217,46 @@ app.get('/configure', (req, res) => res.send(configurePage()));
 // ─── BEST OF CATALOG ─────────────────────────────────────────────────────────
 app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
+  const provider = String(cfg.provider || 'tmdb').toLowerCase();
+  const usesTmdb = provider !== 'cinemeta';
   const apiKey = cfg.tmdbApiKey;
-  if (!apiKey) return res.json({ metas: [] });
+  if (usesTmdb && !apiKey) return res.json({ metas: [] });
   const customSeasons = cfg.customSeasons || [];
   if (!customSeasons.length) return res.json({ metas: [] });
   try {
     const seriesCache = {};
     const metas = (await Promise.all(customSeasons.map(async function(list) {
       try {
+        const prefix  = list.prefix || '\u2728';
+        const label   = list.label  || 'Curated';
+        const epCount = (list.episodes || []).length;
+
+        if (!usesTmdb) {
+          const imdbId = list.tmdbId; // stored as imdb id in cinemeta mode
+          if (!/^tt\d+/.test(imdbId)) return null;
+          if (!seriesCache[imdbId]) {
+            const d = await cinemeta('/meta/series/' + imdbId + '.json');
+            seriesCache[imdbId] = d && d.meta ? d.meta : null;
+          }
+          const series = seriesCache[imdbId];
+          if (!series) return null;
+          return {
+            id:          'bestof:' + list.listId,
+            type:        'series',
+            name:        prefix + ' ' + label + ' — ' + (series.name || 'Unknown'),
+            poster:      series.poster || null,
+            background:  series.background || null,
+            description: label + ': ' + epCount + ' episode' + (epCount !== 1 ? 's' : '') + ' from ' + (series.name || 'Unknown') + '.\n\n' + (series.description || ''),
+            releaseInfo: series.releaseInfo || '',
+            imdbRating:  series.imdbRating || null,
+            genres:      series.genres || [],
+          };
+        }
+
         if (!seriesCache[list.tmdbId]) {
           seriesCache[list.tmdbId] = await getSeries(list.tmdbId, apiKey);
         }
         const series  = seriesCache[list.tmdbId];
-        const prefix  = list.prefix || '\u2728';
-        const label   = list.label  || 'Curated';
-        const epCount = (list.episodes || []).length;
         return {
           id:          'bestof:' + list.listId,
           type:        'series',
@@ -241,8 +282,10 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
   const cfg    = parseConfig(req.params.config);
   const type   = req.params.type;
   const id     = req.params.id;
-  const apiKey = cfg.tmdbApiKey;
-  if (!apiKey) return res.status(400).json({ metas: [] });
+  const provider = String(cfg.provider || 'tmdb').toLowerCase();
+  const apiKey   = cfg.tmdbApiKey;
+  const usesTmdb = provider !== 'cinemeta';
+  if (usesTmdb && !apiKey) return res.status(400).json({ metas: [] });
 
   const extrasRaw = req.params.extras || '';
   const extrasMap = {};
@@ -259,14 +302,22 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
   const search = extrasMap.search ? extrasMap.search.trim() : null;
 
   try {
-    if (id === 'tmdb.search_movies' || id === 'tmdb.search_series') {
+    if (id === 'gt.search_movies' || id === 'gt.search_series') {
       if (!search) return res.json({ metas: [] });
-      const tmdbType = id === 'tmdb.search_movies' ? 'movie' : 'tv';
-      const data = await tmdb('/search/' + tmdbType, apiKey, { query: search, page });
-      const metas = (data.results || []).map(item =>
-        tmdbType === 'movie' ? movieToMeta(item) : seriesToMeta(item)
-      ).filter(m => m.poster);
-      return res.json({ metas });
+      if (!usesTmdb) {
+        // Cinemeta search
+        const cType = id === 'gt.search_movies' ? 'movie' : 'series';
+        const data = await cinemeta('/catalog/' + cType + '/top/search=' + encodeURIComponent(search) + '.json');
+        const metas = (data.metas || []).filter(m => m && m.poster);
+        return res.json({ metas });
+      } else {
+        const tmdbType = id === 'gt.search_movies' ? 'movie' : 'tv';
+        const data = await tmdb('/search/' + tmdbType, apiKey, { query: search, page });
+        const metas = (data.results || []).map(item =>
+          tmdbType === 'movie' ? movieToMeta(item) : seriesToMeta(item)
+        ).filter(m => m.poster);
+        return res.json({ metas });
+      }
     }
 
     const defaultDef = DEFAULT_CATALOGS.find(d => d.id === id);
@@ -274,10 +325,97 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
     const catDef     = defaultDef || customDef;
     if (!catDef) return res.json({ metas: [] });
 
+    // Handle IMDb list-sourced catalogs
+    if (catDef.path === '_imdb_' && catDef.imdbUrl) {
+      const listUrl = String(catDef.imdbUrl).trim();
+      const listIdMatch = listUrl.match(/ls\d+/);
+      if (!listIdMatch) return res.json({ metas: [] });
+      const listId = listIdMatch[0];
+      const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
+      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+      function parseCsv(text) {
+        const rows = [];
+        let row = [];
+        let cur = '';
+        let inQuotes = false;
+        for (let i = 0; i < text.length; i++) {
+          const ch = text[i];
+          const next = text[i + 1];
+          if (inQuotes) {
+            if (ch === '"' && next === '"') { cur += '"'; i++; continue; }
+            if (ch === '"') { inQuotes = false; continue; }
+            cur += ch; continue;
+          }
+          if (ch === '"') { inQuotes = true; continue; }
+          if (ch === ',') { row.push(cur); cur = ''; continue; }
+          if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; continue; }
+          if (ch === '\r') continue;
+          cur += ch;
+        }
+        if (cur.length || row.length) { row.push(cur); rows.push(row); }
+        return rows;
+      }
+
+      const resp = await axios.get(csvUrl, {
+        headers: { 'Accept': 'text/csv,text/plain,*/*', 'Accept-Language': 'en-US,en;q=0.9', 'User-Agent': UA },
+        timeout: 20000,
+        validateStatus: (s) => s >= 200 && s < 400,
+      });
+      const rows = parseCsv(String(resp.data || ''));
+      if (!rows.length) return res.json({ metas: [] });
+      const header = rows[0].map(h => String(h || '').trim().toLowerCase());
+      const constIdx = header.findIndex(h => h === 'const');
+      const typeIdx  = header.findIndex(h => h === 'title type');
+      if (constIdx === -1) return res.json({ metas: [] });
+
+      const raw = [];
+      for (let i = 1; i < rows.length; i++) {
+        const cols = rows[i] || [];
+        const ttId = String(cols[constIdx] || '').trim();
+        if (!ttId || !ttId.startsWith('tt')) continue;
+        const ttype = typeIdx !== -1 ? String(cols[typeIdx] || '').trim() : '';
+        const norm = ttype.toLowerCase().replace(/\s+/g, '');
+        const isMovie = norm === 'movie' || norm === 'tvmovie' || norm === 'short' || norm === 'video';
+        const isSeries = norm === 'tvseries' || norm === 'tvmini' || norm === 'tvminiseries';
+        if (!isMovie && !isSeries) continue;
+        raw.push({ ttId, type: isMovie ? 'movie' : 'series' });
+      }
+      const pageItems = raw.slice(skip, skip + 20);
+      const metas = [];
+      for (const item of pageItems) {
+        try {
+          if (!usesTmdb) {
+            const d = await cinemeta('/meta/' + item.type + '/' + item.ttId + '.json');
+            if (d && d.meta && d.meta.poster) metas.push(d.meta);
+          } else {
+            const found = await tmdb('/find/' + item.ttId, apiKey, { external_source: 'imdb_id' });
+            const mv = (found.movie_results || [])[0];
+            const tv = (found.tv_results || [])[0];
+            if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
+            else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
+          }
+        } catch (e) {}
+      }
+      return res.json({ metas });
+    }
+
     // Handle MDBList-sourced catalogs
     if (catDef.path === '_mdblist_' && catDef.mdblistUrl) {
       const listUrl = String(catDef.mdblistUrl).trim();
-      let fetchUrl = listUrl.endsWith('.json') ? listUrl : listUrl.replace(/\/$/, '') + '.json';
+      // Public MDBList JSON endpoint is typically the GUI URL + /json/
+      // Example: https://mdblist.com/lists/user/listname/json/
+      // Some older links might already end in .json.
+      let fetchUrl = listUrl;
+      if (/mdblist\.com\/lists\//i.test(fetchUrl)) {
+        fetchUrl = fetchUrl.replace(/\/$/, '');
+        if (!/\/json$/i.test(fetchUrl) && !/\/json\//i.test(fetchUrl) && !/\.json$/i.test(fetchUrl)) {
+          fetchUrl = fetchUrl + '/json/';
+        }
+      }
+      if (!/\.json($|\?)/i.test(fetchUrl) && !/\/json\/?($|\?)/i.test(fetchUrl)) {
+        fetchUrl = fetchUrl.replace(/\/$/, '') + '.json';
+      }
       const resp = await axios.get(fetchUrl, {
         headers: { 'Accept': 'application/json', 'User-Agent': 'GoodTaste/1.0' },
         timeout: 15000,
@@ -291,16 +429,25 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
         const mediatype  = (item.mediatype || item.type || '').toLowerCase();
         const isMovie    = mediatype === 'movie' || mediatype === 'movies';
         try {
-          if (itemTmdbId) {
-            const d = await tmdb((isMovie ? '/movie/' : '/tv/') + itemTmdbId, apiKey);
-            const meta = isMovie ? movieToMeta(d) : seriesToMeta(d);
-            if (meta.poster) metas.push(meta);
-          } else if (imdbId) {
-            const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
-            const mv = (found.movie_results || [])[0];
-            const tv = (found.tv_results || [])[0];
-            if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
-            else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
+          if (!usesTmdb) {
+            // Cinemeta: prefer imdb ids
+            if (imdbId && /^tt\d+/.test(imdbId)) {
+              const cType = isMovie ? 'movie' : 'series';
+              const d = await cinemeta('/meta/' + cType + '/' + imdbId + '.json');
+              if (d && d.meta && d.meta.poster) metas.push(d.meta);
+            }
+          } else {
+            if (itemTmdbId) {
+              const d = await tmdb((isMovie ? '/movie/' : '/tv/') + itemTmdbId, apiKey);
+              const meta = isMovie ? movieToMeta(d) : seriesToMeta(d);
+              if (meta.poster) metas.push(meta);
+            } else if (imdbId) {
+              const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
+              const mv = (found.movie_results || [])[0];
+              const tv = (found.tv_results || [])[0];
+              if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
+              else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
+            }
           }
         } catch (e) { /* skip */ }
       }
@@ -317,6 +464,15 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
     }
     if (customDef && customDef.params) Object.assign(params, customDef.params);
 
+    if (!usesTmdb) {
+      // Cinemeta default catalogs (top / popular)
+      const catId = (id.includes('popular') ? 'popular' : 'top');
+      const cType = type === 'movie' ? 'movie' : 'series';
+      const data = await cinemeta('/catalog/' + cType + '/' + catId + '.json');
+      const metas = (data.metas || []).slice(skip, skip + 20).filter(m => m && m.poster);
+      return res.json({ metas });
+    }
+
     const data  = await tmdb(path, apiKey, params);
     const metas = (data.results || []).map(item =>
       type === 'movie' ? movieToMeta(item) : seriesToMeta(item)
@@ -330,9 +486,25 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
 
 // ─── API HELPER ROUTES ────────────────────────────────────────────────────────
 app.get('/api/search', async function(req, res) {
-  const { q, apiKey, type = 'tv' } = req.query;
-  if (!q || !apiKey) return res.json({ results: [] });
+  const { q, apiKey, type = 'tv', provider = 'tmdb' } = req.query;
+  if (!q) return res.json({ results: [] });
   try {
+    const prov = String(provider).toLowerCase();
+    if (prov === 'cinemeta') {
+      const cType = type === 'movie' ? 'movie' : 'series';
+      const data = await cinemeta('/catalog/' + cType + '/top/search=' + encodeURIComponent(q) + '.json');
+      const results = (data.metas || []).slice(0, 8).map(m => ({
+        id: m.id,
+        name: m.name,
+        poster: m.poster || null,
+        year: (m.releaseInfo || '').toString().substring(0, 4),
+        vote_average: (m.imdbRating || '?').toString(),
+        type: cType,
+      }));
+      return res.json({ results });
+    }
+
+    if (!apiKey) return res.json({ results: [] });
     const data = await tmdb('/search/' + type, apiKey, { query: q });
     const results = (data.results || []).slice(0, 8).map(s => {
       const isMovie = type === 'movie' || s.media_type === 'movie';
@@ -350,9 +522,36 @@ app.get('/api/search', async function(req, res) {
 });
 
 app.get('/api/episodes', async function(req, res) {
-  const { tmdbId, apiKey } = req.query;
-  if (!tmdbId || !apiKey) return res.json({ episodes: [] });
+  const { tmdbId, apiKey, provider = 'tmdb' } = req.query;
+  if (!tmdbId) return res.json({ episodes: [] });
   try {
+    const prov = String(provider).toLowerCase();
+    if (prov === 'cinemeta') {
+      const imdbId = String(tmdbId).trim(); // in cinemeta mode, we pass imdb id into tmdbId param
+      const d = await cinemeta('/meta/series/' + imdbId + '.json');
+      const meta = d && d.meta ? d.meta : null;
+      const vids = (meta && meta.videos) ? meta.videos : [];
+      const episodes = vids
+        .filter(v => v && typeof v.season === 'number' && typeof v.episode === 'number')
+        .map(v => ({
+          season: v.season,
+          episode: v.episode,
+          name: v.title || '',
+          overview: v.overview || '',
+          still: v.thumbnail || null,
+          vote_average: 0,
+          vote_count: 0,
+          air_date: v.released ? new Date(v.released).toISOString().slice(0, 10) : null,
+          id: v.id,
+        }));
+      const seasons = Math.max(0, ...episodes.map(e => e.season));
+      return res.json({
+        show: { name: meta ? meta.name : 'Unknown', poster: meta ? meta.poster : null, seasons },
+        episodes,
+      });
+    }
+
+    if (!apiKey) return res.json({ episodes: [] });
     const series   = await getSeries(tmdbId, apiKey);
     const episodes = await getAllEpisodes(tmdbId, apiKey, series.number_of_seasons || 1);
     res.json({
@@ -369,6 +568,20 @@ app.get('/api/genres', async function(req, res) {
     const data = await tmdb('/genre/' + type + '/list', apiKey);
     res.json({ genres: data.genres || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cinemeta posters for the landing page header background
+app.get('/api/cinemeta-popular', async function(req, res) {
+  try {
+    const mv = await cinemeta('/catalog/movie/top.json');
+    const tv = await cinemeta('/catalog/series/top.json');
+    const posters = [];
+    (mv.metas || []).slice(0, 10).forEach(m => { if (m && m.poster) posters.push(m.poster); });
+    (tv.metas || []).slice(0, 10).forEach(m => { if (m && m.poster) posters.push(m.poster); });
+    res.json({ posters });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── IMDB LIST IMPORT ─────────────────────────────────────────────────────────
@@ -513,19 +726,124 @@ app.get('/api/imdb-list', async function(req, res) {
   }
 });
 
+// ─── IMDB LIST -> CATALOG PREVIEW (movies + series) ─────────────────────────
+app.get('/api/imdb-catalog', async function(req, res) {
+  let { url: listUrl, apiKey, provider = 'tmdb' } = req.query;
+  if (!listUrl) return res.status(400).json({ error: 'url required' });
+
+  const prov = String(provider).toLowerCase();
+  const usesTmdb = prov !== 'cinemeta';
+  if (usesTmdb && !apiKey) return res.status(400).json({ error: 'apiKey required for TMDB mode' });
+
+  const listIdMatch = String(listUrl).match(/ls\d+/);
+  if (!listIdMatch) return res.status(400).json({ error: 'Could not parse IMDB list ID from URL' });
+  const listId = listIdMatch[0];
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+  function parseCsv(text) {
+    const rows = [];
+    let row = [];
+    let cur = '';
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      const next = text[i + 1];
+      if (inQuotes) {
+        if (ch === '"' && next === '"') { cur += '"'; i++; continue; }
+        if (ch === '"') { inQuotes = false; continue; }
+        cur += ch; continue;
+      }
+      if (ch === '"') { inQuotes = true; continue; }
+      if (ch === ',') { row.push(cur); cur = ''; continue; }
+      if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; continue; }
+      if (ch === '\r') continue;
+      cur += ch;
+    }
+    if (cur.length || row.length) { row.push(cur); rows.push(row); }
+    return rows;
+  }
+
+  async function fetchImdbCsvExport() {
+    const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
+    const resp = await axios.get(csvUrl, {
+      headers: { 'Accept': 'text/csv,text/plain,*/*', 'Accept-Language': 'en-US,en;q=0.9', 'User-Agent': UA },
+      timeout: 20000,
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+    const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
+    if (ct.includes('text/html')) throw new Error('IMDB export returned HTML (blocked)');
+    return resp.data;
+  }
+
+  try {
+    const csvText = await fetchImdbCsvExport();
+    const rows = parseCsv(String(csvText));
+    if (!rows.length) return res.json({ metas: [], count: 0, name: '' });
+
+    const header = rows[0].map(h => String(h || '').trim().toLowerCase());
+    const constIdx = header.findIndex(h => h === 'const');
+    const typeIdx  = header.findIndex(h => h === 'title type');
+    if (constIdx === -1) return res.status(400).json({ error: 'Unexpected CSV format — missing Const column' });
+
+    const items = [];
+    for (let i = 1; i < rows.length; i++) {
+      const cols = rows[i] || [];
+      const ttId = String(cols[constIdx] || '').trim();
+      const ttype = typeIdx !== -1 ? String(cols[typeIdx] || '').trim() : '';
+      if (!ttId || !ttId.startsWith('tt')) continue;
+      // IMDb title types are inconsistent; we handle common ones.
+      const norm = ttype.toLowerCase().replace(/\s+/g, '');
+      const isMovie = norm === 'movie' || norm === 'tvmovie' || norm === 'short' || norm === 'video';
+      const isSeries = norm === 'tvseries' || norm === 'tvmini' || norm === 'tvminiseries';
+      if (!isMovie && !isSeries) continue;
+      items.push({ ttId, type: isMovie ? 'movie' : 'series' });
+    }
+
+    const metas = [];
+    for (const it of items.slice(0, 50)) {
+      try {
+        if (prov === 'cinemeta') {
+          const d = await cinemeta('/meta/' + it.type + '/' + it.ttId + '.json');
+          if (d && d.meta && d.meta.poster) metas.push(d.meta);
+        } else {
+          const found = await tmdb('/find/' + it.ttId, apiKey, { external_source: 'imdb_id' });
+          const mv = (found.movie_results || [])[0];
+          const tv = (found.tv_results || [])[0];
+          if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
+          else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
+        }
+      } catch (e) { /* skip */ }
+    }
+
+    res.json({ metas, count: items.length, name: '' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── MDBLIST IMPORT ──────────────────────────────────────────────────────────
 // ─── MDBLIST CATALOG PREVIEW ─────────────────────────────────────────────────
 // Fetches items from a public MDBList URL and resolves them via TMDB.
 // Returns an array of meta objects suitable for catalog preview in the UI.
 app.get('/api/mdblist-catalog', async function(req, res) {
-  let { url: listUrl, apiKey } = req.query;
-  if (!listUrl || !apiKey) return res.status(400).json({ error: 'url and apiKey required' });
+  let { url: listUrl, apiKey, provider = 'tmdb' } = req.query;
+  if (!listUrl) return res.status(400).json({ error: 'url required' });
 
   const urlStr = String(listUrl).trim();
 
   try {
+    const prov = String(provider).toLowerCase();
+    const usesTmdb = prov !== 'cinemeta';
+    if (usesTmdb && !apiKey) return res.status(400).json({ error: 'apiKey required for TMDB mode' });
+
     let fetchUrl = urlStr;
-    if (!fetchUrl.endsWith('.json')) {
+    if (/mdblist\.com\/lists\//i.test(fetchUrl)) {
+      fetchUrl = fetchUrl.replace(/\/$/, '');
+      if (!/\/json$/i.test(fetchUrl) && !/\/json\//i.test(fetchUrl) && !/\.json$/i.test(fetchUrl)) {
+        fetchUrl = fetchUrl + '/json/';
+      }
+    }
+    if (!/\.json($|\?)/i.test(fetchUrl) && !/\/json\/?($|\?)/i.test(fetchUrl)) {
       fetchUrl = fetchUrl.replace(/\/$/, '') + '.json';
     }
 
@@ -550,16 +868,25 @@ app.get('/api/mdblist-catalog', async function(req, res) {
       const isTv       = mediatype === 'show' || mediatype === 'tv' || mediatype === 'series';
 
       try {
-        if (itemTmdbId && (isMovie || isTv)) {
-          const path = isMovie ? '/movie/' + itemTmdbId : '/tv/' + itemTmdbId;
-          const d = await tmdb(path, apiKey);
-          metas.push(isMovie ? movieToMeta(d) : seriesToMeta(d));
-        } else if (imdbId) {
-          const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
-          const mv = (found.movie_results || [])[0];
-          const tv = (found.tv_results || [])[0];
-          if (mv) metas.push(movieToMeta(mv));
-          else if (tv) metas.push(seriesToMeta(tv));
+        if (prov === 'cinemeta') {
+          if (imdbId && /^tt\d+/.test(imdbId)) {
+            const cType = isMovie ? 'movie' : (isTv ? 'series' : null);
+            if (!cType) continue;
+            const d = await cinemeta('/meta/' + cType + '/' + imdbId + '.json');
+            if (d && d.meta) metas.push(d.meta);
+          }
+        } else {
+          if (itemTmdbId && (isMovie || isTv)) {
+            const path = isMovie ? '/movie/' + itemTmdbId : '/tv/' + itemTmdbId;
+            const d = await tmdb(path, apiKey);
+            metas.push(isMovie ? movieToMeta(d) : seriesToMeta(d));
+          } else if (imdbId) {
+            const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
+            const mv = (found.movie_results || [])[0];
+            const tv = (found.tv_results || [])[0];
+            if (mv) metas.push(movieToMeta(mv));
+            else if (tv) metas.push(seriesToMeta(tv));
+          }
         }
       } catch (e) { /* skip unresolvable */ }
     }
@@ -576,6 +903,18 @@ app.get('/api/mdblist-catalog', async function(req, res) {
 app.get('/:config/meta/movie/:id.json', async function(req, res) {
   const cfg = parseConfig(req.params.config);
   const id  = req.params.id;
+  const provider = String(cfg.provider || 'tmdb').toLowerCase();
+  const usesTmdb = provider !== 'cinemeta';
+  if (!usesTmdb) {
+    if (!/^tt\d+/.test(id)) return res.json({ meta: null });
+    try {
+      const d = await cinemeta('/meta/movie/' + id + '.json');
+      return res.json({ meta: d && d.meta ? d.meta : null });
+    } catch (e) {
+      return res.status(500).json({ err: e.message });
+    }
+  }
+
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
   if (!id.startsWith('tmdb:')) return res.json({ meta: null });
   try {
@@ -607,6 +946,60 @@ app.get('/:config/meta/movie/:id.json', async function(req, res) {
 app.get('/:config/meta/series/:id.json', async function(req, res) {
   const cfg = parseConfig(req.params.config);
   const id  = req.params.id;
+  const provider = String(cfg.provider || 'tmdb').toLowerCase();
+  const usesTmdb = provider !== 'cinemeta';
+  if (!usesTmdb) {
+    // Curated lists (bestof:) still supported in cinemeta mode (they store episode IDs directly).
+    if (id.startsWith('bestof:')) {
+      const listId = id.slice('bestof:'.length);
+      const customSeasons = cfg.customSeasons || [];
+      const list = customSeasons.find(l => l.listId === listId);
+      if (!list) return res.json({ meta: null });
+
+      // list.tmdbId stores imdb id in cinemeta mode
+      const imdbId = list.tmdbId;
+      try {
+        const d = await cinemeta('/meta/series/' + imdbId + '.json');
+        const base = d && d.meta ? d.meta : null;
+        if (!base) return res.json({ meta: null });
+        const prefix = list.prefix || '\u2728';
+        const label  = list.label  || 'Curated';
+        // list.episodes store { id, season, episode, name, still, air_date }
+        const vids = (list.episodes || []).map(function(ep, i) {
+          const rank = i + 1;
+          const sLabel = String(ep.season).padStart(2, '0');
+          const eLabel = String(ep.episode).padStart(2, '0');
+          return {
+            id: ep.id || (imdbId + ':' + ep.season + ':' + ep.episode),
+            title: '#' + rank + ' — S' + sLabel + 'E' + eLabel + ' — ' + (ep.name || ''),
+            season: 1,
+            episode: rank,
+            overview: ep.overview || '',
+            thumbnail: ep.still || null,
+            released: ep.air_date ? new Date(ep.air_date) : null,
+          };
+        });
+        return res.json({ meta: Object.assign({}, base, {
+          id: 'bestof:' + listId,
+          name: prefix + ' ' + label + ' — ' + (base.name || 'Unknown'),
+          description: (vids.length || 0) + ' episodes — ' + label + '\n\n' + (base.description || ''),
+          videos: vids,
+          behaviorHints: { defaultVideoId: null },
+        })});
+      } catch (e) {
+        return res.status(500).json({ err: e.message });
+      }
+    }
+
+    if (!/^tt\d+/.test(id)) return res.json({ meta: null });
+    try {
+      const d = await cinemeta('/meta/series/' + id + '.json');
+      return res.json({ meta: d && d.meta ? d.meta : null });
+    } catch (e) {
+      return res.status(500).json({ err: e.message });
+    }
+  }
+
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
 
   if (id.startsWith('bestof:')) {
@@ -681,6 +1074,7 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       } catch (e) { /* skip */ }
     }
 
+    // Season Zero is TMDB-only.
     if (cfg.showAutoSeason !== false) {
       const bestOfEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
       bestOfEps.forEach((ep, i) => {
@@ -689,8 +1083,12 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
         const eLabel = String(ep.episode).padStart(2, '0');
         const ratingLine = ep.vote_average > 0
           ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
+        // Use REAL episode IDs so streaming works without needing the (invalid) `episodeVideos` resource.
+        const realVideoId = imdbId
+          ? imdbId + ':' + ep.season + ':' + ep.episode
+          : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
         videos.push({
-          id: 'tmdb:' + tmdbId + ':0:' + rank,
+          id: realVideoId,
           title: '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
           season: 0, episode: rank,
           overview: ratingLine + (ep.overview || ''),
@@ -840,6 +1238,10 @@ function configurePage() {
     }
     .step-pill.active .step-dot { background: var(--gold); }
     .step-pill.done .step-dot   { background: var(--text-dim); }
+
+    /* subtle pulse on the active step dot */
+    @keyframes dotPulse { 0%,100%{ box-shadow: 0 0 0 0 rgba(240,192,64,0.0); } 50%{ box-shadow: 0 0 0 6px rgba(240,192,64,0.12); } }
+    .step-pill.active .step-dot { animation: dotPulse 1.8s ease-in-out infinite; }
     .step-divider { color: var(--text-mute); font-size: 0.6rem; opacity: 0.4; }
 
     @media (max-width: 600px) {
@@ -896,7 +1298,32 @@ function configurePage() {
     .hero {
       text-align: center;
       padding: 3rem 0 2.5rem;
+      position: relative;
+      overflow: hidden;
     }
+    .hero-bg {
+      position: absolute;
+      inset: -40px -80px;
+      opacity: 0.18;
+      transform: skewY(-8deg);
+      pointer-events: none;
+    }
+    .hero-bg-track {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      will-change: transform;
+      animation: heroScroll 22s linear infinite;
+    }
+    .hero-bg img {
+      width: 90px;
+      height: 135px;
+      border-radius: 10px;
+      object-fit: cover;
+      filter: blur(0px);
+      opacity: 0.9;
+    }
+    @keyframes heroScroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
     .hero-logo {
       font-family: 'Playfair Display', serif;
       font-size: 3.5rem;
@@ -1198,6 +1625,23 @@ function configurePage() {
     .ep-rating { font-size: 0.7rem; color: var(--gold); font-family: 'DM Mono', monospace; flex-shrink: 0; }
     .ep-del { flex-shrink: 0; color: var(--text-mute); cursor: pointer; font-size: 0.9rem; padding: 4px 5px; border-radius: 5px; transition: color var(--transition); }
     .ep-del:hover { color: #e05252; }
+
+    /* Mobile-friendly reorder controls (touch drag isn't reliable across WebViews) */
+    .ep-move { display: none; gap: 6px; align-items: center; margin-left: 2px; }
+    .ep-move button {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-mute);
+      border-radius: 8px;
+      padding: 4px 7px;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }
+    .ep-move button:active { transform: translateY(1px); }
+    @media (pointer: coarse) {
+      .ep-item { cursor: default; }
+      .ep-move { display: inline-flex; }
+    }
     .ep-list-empty { font-size: 0.8rem; color: var(--text-mute); padding: 10px 0; }
     .ep-list-actions { display: flex; gap: 8px; margin-top: 12px; }
 
@@ -1477,6 +1921,7 @@ function configurePage() {
   const clientJS = [
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
     "var state = {",
+    "  provider: 'tmdb',",
     "  apiKey: '', topN: 20, showAutoSeason: false,",
     "  customSeasons: [], catalogEnabled: {}, catalogNames: {}, customCatalogs: []",
     "};",
@@ -1501,16 +1946,39 @@ function configurePage() {
     "}",
     "",
 
-    // ── API key validation ──
+    // ── Provider + API key validation ──
+    "function onProviderChange() {",
+    "  var prov = (document.getElementById('provider').value || 'tmdb').toLowerCase();",
+    "  state.provider = prov;",
+    "  var apiWrap = document.getElementById('apiKey');",
+    "  if (apiWrap && apiWrap.parentElement) {",
+    "    if (prov === 'cinemeta') {",
+    "      apiWrap.value = '';",
+    "      apiWrap.parentElement.style.display = 'none';",
+    "    } else {",
+    "      apiWrap.parentElement.style.display = '';",
+    "    }",
+    "  }",
+    "  var sz=document.getElementById('szero-card');",
+    "  if (sz) sz.style.display = (prov === 'cinemeta') ? 'none' : '';",
+    "}",
     "async function validateApiKey() {",
+    "  state.provider = (document.getElementById('provider').value || 'tmdb').toLowerCase();",
+    "  var btn = document.getElementById('btn-validate');",
+    "  if (state.provider === 'cinemeta') {",
+    "    state.apiKey = '';",
+    "    state.showAutoSeason = false;",
+    "    renderDefaultCatalogs();",
+    "    goTo(2);",
+    "    return;",
+    "  }",
     "  var input = document.getElementById('apiKey');",
     "  var key = input.value.trim();",
-    "  var btn = document.getElementById('btn-validate');",
     "  if (!key) { flashError(input); return; }",
     "  btn.innerHTML = '<span class=\"spinner\"></span> Checking...';",
     "  btn.disabled = true;",
     "  try {",
-    "    var r = await fetch('/api/search?q=test&apiKey='+encodeURIComponent(key));",
+    "    var r = await fetch('/api/search?q=test&apiKey='+encodeURIComponent(key)+'&type=tv&provider=tmdb');",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    state.apiKey = key;",
@@ -1659,12 +2127,15 @@ function configurePage() {
     "  box.classList.add('visible');",
     "  box.innerHTML='<div class=\"loading-state\"><div class=\"spinner-light\"></div> Searching...</div>';",
     "  try {",
-    "    var r=await fetch('/api/search?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type=tv');",
+    "    var t = (state.provider==='cinemeta') ? 'series' : 'tv';",
+    "    var url='/api/search?q='+encodeURIComponent(q)+'&type='+t+'&provider='+encodeURIComponent(state.provider);",
+    "    if (state.apiKey) url += '&apiKey='+encodeURIComponent(state.apiKey);",
+    "    var r=await fetch(url);",
     "    var d=await r.json();",
     "    if (!d.results||!d.results.length) { box.innerHTML='<p style=\"padding:1rem;font-size:0.82rem;color:var(--text-mute)\">No results.</p>'; return; }",
     "    box.innerHTML=d.results.map(function(s){",
     "      var ph=s.poster?'<img class=\"search-poster\" src=\"'+s.poster+'\" alt=\"\" loading=\"lazy\"/>' : '<div class=\"search-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#128250;</div>';",
-    "      return '<div class=\"search-result-item\" onclick=\"addShowToList('+s.id+',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\')\">'+ph+'<div><div class=\"search-name\">'+esc(s.name)+'</div><div class=\"search-meta\">'+(s.year?s.year+' &middot; ':'')+'\u2605 '+s.vote_average+'</div></div></div>';",
+    "      return '<div class=\"search-result-item\" onclick=\"addShowToList(\\''+esc4attr(s.id)+'\\',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\')\">'+ph+'<div><div class=\"search-name\">'+esc(s.name)+'</div><div class=\"search-meta\">'+(s.year?s.year+' &middot; ':'')+'\u2605 '+s.vote_average+'</div></div></div>';",
     "    }).join('');",
     "  } catch(e) { box.innerHTML='<p style=\"padding:1rem;color:var(--text-mute)\">Error searching.</p>'; }",
     "}",
@@ -1709,6 +2180,17 @@ function configurePage() {
     "}",
     "",
 
+    "function moveEp(listId, idx, delta) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  var to = idx + delta;",
+    "  if (to < 0 || to >= list.episodes.length) return;",
+    "  var moved = list.episodes.splice(idx, 1)[0];",
+    "  list.episodes.splice(to, 0, moved);",
+    "  renderListEpisodes(listId);",
+    "  updateEpCount(listId);",
+    "}",
+    "",
+
     "function toggleShowCard(listId) {",
     "  var card=document.getElementById('show-'+listId);",
     "  if (card) card.classList.toggle('expanded');",
@@ -1739,6 +2221,10 @@ function configurePage() {
     "      '<span class=\"ep-rank\">'+(i+1)+'</span><span class=\"ep-drag\">&#8801;</span>'+th+",
     "      '<div class=\"ep-info\"><div class=\"ep-label\">S'+sL+'E'+eL+' \u2014 '+esc(ep.name||(\"S\"+sL+\"E\"+eL))+'</div><div class=\"ep-sublabel\">'+(ep.air_date||'')+'</div></div>'+",
     "      (ep.vote_average>0?'<span class=\"ep-rating\">\u2605'+ep.vote_average.toFixed(1)+'</span>':'')+",
+    "      '<span class=\"ep-move\">'+",
+    "        '<button onclick=\"event.stopPropagation();moveEp(\\''+listId+'\\','+i+',-1)\" title=\"Move up\">\u2191</button>'+",
+    "        '<button onclick=\"event.stopPropagation();moveEp(\\''+listId+'\\','+i+',1)\" title=\"Move down\">\u2193</button>'+",
+    "      '</span>'+",
     "      '<span class=\"ep-del\" onclick=\"removeEp(\\'' + listId + '\\','+i+')\" title=\"Remove\">\u00d7</span></li>';",
     "  }).join('');",
     "  initDragSort(listId);",
@@ -1761,6 +2247,10 @@ function configurePage() {
     "          '<span class=\"ep-rank\">'+(i+1)+'</span><span class=\"ep-drag\">&#8801;</span>'+th+",
     "          '<div class=\"ep-info\"><div class=\"ep-label\">S'+sL+'E'+eL+' \u2014 '+esc(ep.name||(\"S\"+sL+\"E\"+eL))+'</div><div class=\"ep-sublabel\">'+(ep.air_date||'')+'</div></div>'+",
     "          (ep.vote_average>0?'<span class=\"ep-rating\">\u2605'+ep.vote_average.toFixed(1)+'</span>':'')+",
+    "          '<span class=\"ep-move\">'+",
+    "            '<button onclick=\"event.stopPropagation();moveEp(\\''+tid+'\\','+i+',-1)\" title=\"Move up\">\u2191</button>'+",
+    "            '<button onclick=\"event.stopPropagation();moveEp(\\''+tid+'\\','+i+',1)\" title=\"Move down\">\u2193</button>'+",
+    "          '</span>'+",
     "          '<span class=\"ep-del\" onclick=\"removeEp(\\'' + tid + '\\','+i+')\" title=\"Remove\">\u00d7</span></li>';",
     "      }).join(''):",
     "      '<li class=\"ep-list-empty\">No episodes yet. Use the tabs above to add some.</li>';",
@@ -1861,7 +2351,9 @@ function configurePage() {
     "  document.getElementById('modal-backdrop').classList.add('open');",
     "  document.body.style.overflow='hidden';",
     "  try {",
-    "    var r=await fetch('/api/episodes?tmdbId='+list.tmdbId+'&apiKey='+encodeURIComponent(state.apiKey));",
+    "    var url='/api/episodes?tmdbId='+encodeURIComponent(list.tmdbId)+'&provider='+encodeURIComponent(state.provider);",
+    "    if (state.apiKey) url += '&apiKey='+encodeURIComponent(state.apiKey);",
+    "    var r=await fetch(url);",
     "    var d=await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    modalData.allEpisodes=d.episodes;",
@@ -1960,6 +2452,7 @@ function configurePage() {
     
     // ── MDBList catalog import ──
     "var mdbCatalogPreviewData = null;",
+    "var imdbCatalogPreviewData = null;",
     "async function previewMdbCatalog() {",
     "  var input = document.getElementById('mdb-cat-url');",
     "  var status = document.getElementById('mdb-cat-status');",
@@ -1971,7 +2464,9 @@ function configurePage() {
     "  status.textContent = 'Fetching list\u2026'; status.style.color = 'var(--text-mute)';",
     "  preview.style.display = 'none'; mdbCatalogPreviewData = null;",
     "  try {",
-    "    var r = await fetch('/api/mdblist-catalog?url=' + encodeURIComponent(url) + '&apiKey=' + encodeURIComponent(state.apiKey));",
+    "    var u = '/api/mdblist-catalog?url=' + encodeURIComponent(url) + '&provider=' + encodeURIComponent(state.provider);",
+    "    if (state.apiKey) u += '&apiKey=' + encodeURIComponent(state.apiKey);",
+    "    var r = await fetch(u);",
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    if (!d.metas || !d.metas.length) throw new Error('No movies or shows found in this list.');",
@@ -2008,21 +2503,72 @@ function configurePage() {
     "  renderCustomCatalogsList();",
     "}",
     "",
+
+    "async function previewImdbCatalog() {",
+    "  var input = document.getElementById('imdb-cat-url');",
+    "  var status = document.getElementById('imdb-cat-status');",
+    "  var btn = document.getElementById('imdb-cat-btn');",
+    "  var preview = document.getElementById('imdb-cat-preview');",
+    "  var url = (input ? input.value : '').trim();",
+    "  if (!url) { status.textContent = 'Please enter an IMDb list URL'; status.style.color = 'var(--danger)'; return; }",
+    "  btn.disabled = true; btn.innerHTML = '<span class=\"spinner-light\"></span>';",
+    "  status.textContent = 'Fetching list…'; status.style.color = 'var(--text-mute)';",
+    "  preview.style.display = 'none'; imdbCatalogPreviewData = null;",
+    "  try {",
+    "    var u = '/api/imdb-catalog?url=' + encodeURIComponent(url) + '&provider=' + encodeURIComponent(state.provider);",
+    "    if (state.apiKey) u += '&apiKey=' + encodeURIComponent(state.apiKey);",
+    "    var r = await fetch(u);",
+    "    var d = await r.json();",
+    "    if (d.error) throw new Error(d.error);",
+    "    if (!d.metas || !d.metas.length) throw new Error('No movies or series found in this list.');",
+    "    imdbCatalogPreviewData = { url: url, metas: d.metas, name: d.name, count: d.count };",
+    "    var movieCount = d.metas.filter(function(m){ return m.type === 'movie'; }).length;",
+    "    document.getElementById('imdb-cat-type').value = movieCount >= d.metas.length / 2 ? 'movie' : 'series';",
+    "    var thumbs = d.metas.slice(0, 8).map(function(m) {",
+    "      if (!m.poster) return ''; var img=document.createElement('img'); img.src=m.poster; img.style.cssText='width:36px;height:54px;border-radius:5px;object-fit:cover;'; img.loading='lazy'; return img.outerHTML;",
+    "    }).join('');",
+    "    document.getElementById('imdb-cat-thumbs').innerHTML = thumbs;",
+    "    status.textContent = d.count + ' item' + (d.count !== 1 ? 's' : '') + ' found';",
+    "    status.style.color = 'var(--gold)';",
+    "    preview.style.display = 'block';",
+    "  } catch(e) {",
+    "    status.textContent = 'Error: ' + e.message; status.style.color = '#e05252';",
+    "  } finally { btn.disabled = false; btn.textContent = 'Preview'; }",
+    "}",
+    "function addImdbCatalog() {",
+    "  if (!imdbCatalogPreviewData) return;",
+    "  var name = document.getElementById('imdb-cat-name').value.trim() || 'IMDb List';",
+    "  var type = document.getElementById('imdb-cat-type').value;",
+    "  var url  = imdbCatalogPreviewData.url;",
+    "  state.customCatalogs.push({ id: 'imdb.' + Date.now(), name: name, type: type, path: '_imdb_', imdbUrl: url, enabled: true });",
+    "  document.getElementById('imdb-cat-url').value = '';",
+    "  document.getElementById('imdb-cat-preview').style.display = 'none';",
+    "  document.getElementById('imdb-cat-status').textContent = '✓ Added ' + name + ' to custom catalogs';",
+    "  document.getElementById('imdb-cat-status').style.color = 'var(--gold)';",
+    "  imdbCatalogPreviewData = null;",
+    "  renderCustomCatalogsList();",
+    "}",
+    "",
+
 "function toggleSzeroExpand() {",
     "  document.getElementById('szero-card').classList.toggle('expanded');",
     "  var btn=document.getElementById('szero-expand-btn');",
-    "  btn.textContent=document.getElementById('szero-card').classList.contains('expanded')?'Collapse \u25b2':'Configure \u25be';",
+    "  btn.textContent=document.getElementById('szero-card').classList.contains('expanded')?'Collapse \u25b2':'Details \u25be';",
     "}",
     "",
 
     // ── Install page ──
     "function buildInstallPage() {",
     "  var flat=state.customSeasons.map(function(list){",
-    "    return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'\u2728', episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
+    "    return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'\u2728', episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode,id:e.id||null,name:e.name||null,still:e.still||null,overview:e.overview||null,air_date:e.air_date||null}; }) };",
     "  });",
-    "  state.topN=parseInt(document.getElementById('topN').value)||20;",
-    "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
-    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs};",
+    "  if (state.provider !== 'cinemeta') {",
+    "    state.topN=parseInt(document.getElementById('topN').value)||20;",
+    "    state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
+    "  } else {",
+    "    state.topN=20; state.showAutoSeason=false;",
+    "  }",
+    "  var cfg={provider:state.provider, tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs};",
     "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
     "  var manifestUrl=window.location.origin+'/'+encoded+'/manifest.json';",
     "  document.getElementById('manifest-url').value=manifestUrl;",
@@ -2060,6 +2606,21 @@ function configurePage() {
     "  setTimeout(function(){btn.textContent='Copy';btn.classList.remove('copied');},2000);",
     "}",
     "",
+    "async function initHeroBg(){",
+    "  var host=document.getElementById('hero-bg');",
+    "  if(!host) return;",
+    "  try{",
+    "    var r=await fetch('/api/cinemeta-popular');",
+    "    var d=await r.json();",
+    "    var posters=(d.posters||[]).filter(Boolean);",
+    "    if(!posters.length) return;",
+    "    var all=posters.concat(posters);",
+    "    host.innerHTML='<div class=\"hero-bg-track\">'+all.map(function(p){return '<img src=\"'+p+'\" alt=\"\" loading=\"lazy\"/>';}).join('')+'</div>';",
+    "  }catch(e){}",
+    "}",
+    "",
+    "setTimeout(function(){ onProviderChange(); initHeroBg(); },0);",
+    "",
     "function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;'); }",
     "function esc4attr(s){ return String(s||'').replace(/'/g,'&#39;'); }",
   ].join('\n');
@@ -2092,25 +2653,33 @@ function configurePage() {
   <!-- PAGE 1: Connect -->
   <div class="page active" id="page-1">
     <div class="hero">
+      <div class="hero-bg" id="hero-bg"></div>
       <div class="hero-logo">Good<span>Taste</span></div>
-      <div class="hero-tagline">Curated episode lists for Stremio, powered by TMDB</div>
+      <div class="hero-tagline">the ultimate metadata curation addon</div>
       <div class="hero-features">
-        <div class="hero-feat"><strong>Curated Episode Lists</strong>Handpick episodes from any show into a shareable list</div>
-        <div class="hero-feat"><strong>Full TMDB Metadata</strong>Posters, ratings, cast, trailers — all from TMDB</div>
-        <div class="hero-feat"><strong>Import from IMDB</strong>Pull in your IMDB or MDBList lists instantly</div>
-        <div class="hero-feat"><strong>Streaming Works</strong>Custom lists resolve correctly for stream addons</div>
-        <div class="hero-feat"><strong>Custom Catalogs</strong>Filter TMDB by genre, popularity, or rating</div>
-        <div class="hero-feat"><strong>Drag to Reorder</strong>Arrange episodes exactly how you want</div>
+        <div class="hero-feat"><strong>Full metadata &amp; search</strong>Cinemeta or TMDB (TMDB recommended)</div>
+        <div class="hero-feat"><strong>Custom curated episode lists</strong>Curate episodes for your favorite series and stream them straight from the list</div>
+        <div class="hero-feat"><strong>Catalog manager</strong>Create, add, and manage catalogs</div>
+        <div class="hero-feat"><strong>Season zero <span class=\"beta-badge\">Beta</span></strong>Auto-adds top-rated episodes as Season 0 for every series</div>
+        <div class="hero-feat"><strong>Import lists</strong>Bring in IMDb or MDBList lists in seconds</div>
+        <div class="hero-feat"><strong>Reorder episodes</strong>Drag on desktop, tap-to-move on mobile</div>
       </div>
     </div>
     <div class="card">
       <div class="card-eyebrow">Step 1</div>
-      <div class="card-title">Connect to TMDB</div>
-      <div class="card-sub">Enter your free TMDB API key to get started. GoodTaste uses TMDB to fetch metadata, search shows, and resolve episodes.</div>
+      <div class="card-title">Pick your metadata source</div>
+      <div class="card-sub">TMDB is recommended (best metadata + ratings). Cinemeta works without an API key. You can switch anytime.</div>
+      <div class="field">
+        <label>Metadata Provider</label>
+        <select id="provider" onchange="onProviderChange()">
+          <option value="tmdb">TMDB (recommended)</option>
+          <option value="cinemeta">Cinemeta (no key)</option>
+        </select>
+      </div>
       <div class="field">
         <label>TMDB API Key</label>
         <input type="password" id="apiKey" placeholder="Paste your key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter') validateApiKey()"/>
-        <p class="hint">Free key available at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> under API &rarr; API Key</p>
+        <p class="hint" id="tmdb-hint">Free key available at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> under API &rarr; API Key</p>
       </div>
       <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>
     </div>
@@ -2144,21 +2713,44 @@ function configurePage() {
       <div class="szero-header">
         <div>
           <div class="szero-title">Season Zero <span class="beta-badge">Beta</span></div>
-          <div class="szero-desc">Automatically adds a "Season Zero" inside every show you open, listing the top-rated episodes by TMDB score. Useful for exploring a new series. <strong style="color:var(--text-dim)">Note: streaming from Season Zero may not work on all platforms</strong> — for reliable streams, use Curated Lists above.</div>
+          <div class="szero-desc">Adds an auto “Best Of” season to every series.</div>
         </div>
-        <span class="szero-expand" id="szero-expand-btn" onclick="toggleSzeroExpand()">Configure &#9660;</span>
+        <span class="szero-expand" id="szero-expand-btn" onclick="toggleSzeroExpand()">Details &#9660;</span>
       </div>
       <div class="szero-body">
+        <div class="szero-desc" style="margin-top:2px">Automatically adds a <strong>Season 0</strong> inside every show you open, listing the top-rated episodes by TMDB score. Useful for exploring a new series. <strong style="color:var(--text-dim)">Warning:</strong> streaming from Season Zero may not work on all platforms.</div>
         <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-top:4px;">
           <div class="field" style="margin-bottom:0;flex:1;min-width:160px">
             <label>Top N Episodes</label>
             <input type="number" id="topN" placeholder="20" min="5" max="100" value="20"/>
           </div>
           <div class="catalog-row" style="flex:1;min-width:200px;margin-bottom:0">
-            <div class="catalog-row-info"><div style="font-size:0.87rem;font-weight:600;color:var(--text)">Enable Season Zero</div><div class="catalog-row-type">Off by default &mdash; works better on some platforms</div></div>
+            <div class="catalog-row-info"><div style="font-size:0.87rem;font-weight:600;color:var(--text)">Enable Season Zero</div><div class="catalog-row-type">TMDB-only</div></div>
             <label class="toggle"><input type="checkbox" id="showAutoSeason"/><span class="toggle-slider"></span></label>
           </div>
         </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-header">
+        <div>
+          <div style="font-size:0.9rem;font-weight:600;color:#fff">Import from IMDb <span style="font-size:0.68rem;color:var(--text-mute);font-weight:400;margin-left:6px">optional</span></div>
+          <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">Add an IMDb list as a movie or series catalog in Stremio</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/" style="flex:1;font-size:0.85rem"/>
+        <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
+      </div>
+      <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
+      <div id="imdb-cat-preview" style="display:none">
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
+          <div class="field" style="margin-bottom:0;flex:1;min-width:160px"><label>Catalog Name</label><input type="text" id="imdb-cat-name" placeholder="My IMDb List"/></div>
+          <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="imdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
+          <button class="btn btn-primary btn-sm" onclick="addImdbCatalog()">Add Catalog</button>
+        </div>
+        <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7;margin-top:4px"></div>
       </div>
     </div>
 
@@ -2237,12 +2829,12 @@ function configurePage() {
   <div class="page" id="page-4">
     <div class="card">
       <div class="install-hero">
-        <div class="install-hero-title">Ready to install</div>
+        <div class="install-hero-title">You have good taste.</div>
         <div class="install-hero-sub">Add GoodTaste directly to Stremio or copy the manifest URL</div>
       </div>
       <div id="ep-parade" class="ep-parade" style="display:none"></div>
       <div id="install-summary"></div>
-      <button class="btn btn-install" onclick="openStremio()">&#9889;&nbsp; Open in Stremio</button>
+      <button class="btn btn-install" onclick="openStremio()">Open in Stremio</button>
       <div class="or-divider">— or copy the manifest URL —</div>
       <div class="copy-row">
         <input type="text" id="manifest-url" readonly/>
