@@ -152,11 +152,12 @@ function buildManifest(config) {
     return d.enabled;
   });
 
-  // Apply custom ordering if present
+  // Apply custom ordering if present (unifiedOrder contains {kind,id} objects OR plain id strings for backwards compat)
   if (cfg.defaultCatalogOrder && Array.isArray(cfg.defaultCatalogOrder)) {
+    const order = cfg.defaultCatalogOrder;
     enabledDefaults.sort((a, b) => {
-      const ai = cfg.defaultCatalogOrder.indexOf(a.id);
-      const bi = cfg.defaultCatalogOrder.indexOf(b.id);
+      const ai = order.findIndex(o => (o.id || o) === a.id);
+      const bi = order.findIndex(o => (o.id || o) === b.id);
       return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
     });
   }
@@ -164,21 +165,62 @@ function buildManifest(config) {
   const customCatalogs = (cfg.customCatalogs || []).filter(c => c.enabled !== false);
   const customSeasons  = cfg.customSeasons || [];
 
-  const allCatalogs = [
-    ...enabledDefaults.map(d => {
-      const displayName = cfg.catalogNames && cfg.catalogNames[d.id] ? cfg.catalogNames[d.id] : d.name;
-      return {
-        id: d.id, type: d.type, name: displayName,
-        extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }],
-      };
-    }),
-    ...customCatalogs.map(c => ({
-      id: c.id, type: c.type, name: c.name,
-      extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }],
-    })),
+  // Build allCatalogs respecting the unified order (interleaved defaults + customs)
+  const defaultMap = new Map(enabledDefaults.map(d => [d.id, d]));
+  const customMap  = new Map(customCatalogs.map(c => [c.id, c]));
+
+  const allCatalogs = [];
+  // If we have a unified order, use it
+  if (cfg.defaultCatalogOrder && Array.isArray(cfg.defaultCatalogOrder)) {
+    const seen = new Set();
+    for (const entry of cfg.defaultCatalogOrder) {
+      const kind = entry.kind || 'default';
+      const id   = entry.id || entry;
+      if (kind === 'default' && defaultMap.has(id) && !seen.has('d:'+id)) {
+        const d = defaultMap.get(id);
+        const rawName = cfg.catalogNames && cfg.catalogNames[id] ? cfg.catalogNames[id] : d.name;
+        const displayName = rawName.replace(/\s+(movies?|series|shows?)$/i, '').trim() || rawName;
+        allCatalogs.push({ id: d.id, type: d.type, name: displayName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+        seen.add('d:'+id);
+      } else if (kind === 'custom' && customMap.has(id) && !seen.has('c:'+id)) {
+        const c = customMap.get(id);
+        const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
+        allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+        seen.add('c:'+id);
+      }
+    }
+    // Add any not yet seen
+    enabledDefaults.forEach(d => {
+      if (!seen.has('d:'+d.id)) {
+        const rawName = cfg.catalogNames && cfg.catalogNames[d.id] ? cfg.catalogNames[d.id] : d.name;
+        const displayName = rawName.replace(/\s+(movies?|series|shows?)$/i, '').trim() || rawName;
+        allCatalogs.push({ id: d.id, type: d.type, name: displayName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+      }
+    });
+    customCatalogs.forEach(c => {
+      if (!seen.has('c:'+c.id)) {
+        const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
+        allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+      }
+    });
+  } else {
+    // No order saved — defaults then customs
+    enabledDefaults.forEach(d => {
+      const rawName = cfg.catalogNames && cfg.catalogNames[d.id] ? cfg.catalogNames[d.id] : d.name;
+      const displayName = rawName.replace(/\s+(movies?|series|shows?)$/i, '').trim() || rawName;
+      allCatalogs.push({ id: d.id, type: d.type, name: displayName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+    });
+    customCatalogs.forEach(c => {
+      const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
+      allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+    });
+  }
+
+  // Always add search catalogs
+  allCatalogs.push(
     { id: 'tmdb.search_movies',  type: 'movie',  name: 'Search Movies',  extra: [{ name: 'search', isRequired: true }] },
-    { id: 'tmdb.search_series',  type: 'series', name: 'Search Series',  extra: [{ name: 'search', isRequired: true }] },
-  ];
+    { id: 'tmdb.search_series',  type: 'series', name: 'Search Series',  extra: [{ name: 'search', isRequired: true }] }
+  );
 
   if (customSeasons.length > 0) {
     allCatalogs.push({ id: 'tmdb.bestof', type: 'series', name: '\u2728 Curated Lists', extra: [] });
@@ -1215,54 +1257,53 @@ function configurePage() {
       overflow: hidden;
       pointer-events: none;
       z-index: 0;
-      display: flex;
-      flex-direction: column;
     }
     .hero-bg-row {
+      position: absolute;
+      left: 0; right: 0;
       display: flex;
       gap: 0;
-      flex: 1;
+      height: 52%;
       animation: bgScroll 55s linear infinite;
       will-change: transform;
-      min-height: 0;
     }
+    .hero-bg-row.row1 { top: 0; }
     .hero-bg-row.row2 {
+      top: calc(50% + 4px);
+      height: 50%;
       animation-direction: reverse;
       animation-duration: 70s;
-      margin-top: 6px;
     }
     @keyframes bgScroll {
       from { transform: translateX(0); }
       to   { transform: translateX(-50%); }
     }
     .hero-bg-item {
-      position: relative;
       flex-shrink: 0;
       height: 100%;
-      width: 160px;
+      width: 150px;
       padding: 0 4px;
-      transform: skewX(-10deg);
+      transform: skewX(-8deg);
     }
     .hero-bg-item img {
       width: 100%;
       height: 100%;
       object-fit: cover;
-      border-radius: 10px;
+      border-radius: 8px;
       opacity: 0;
-      transition: opacity 1.2s ease;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+      transition: opacity 1s ease;
       display: block;
     }
-    .hero-bg-item img.loaded { opacity: 0.72; }
+    .hero-bg-item img.loaded { opacity: 0.65; }
     .hero-bg-overlay {
       position: absolute;
       inset: 0;
       background: linear-gradient(
         to bottom,
-        rgba(8,8,8,0.45) 0%,
-        rgba(8,8,8,0.1) 30%,
-        rgba(8,8,8,0.1) 70%,
-        rgba(8,8,8,0.98) 100%
+        rgba(8,8,8,0.5) 0%,
+        rgba(8,8,8,0.05) 25%,
+        rgba(8,8,8,0.05) 75%,
+        rgba(8,8,8,1) 100%
       );
       z-index: 1;
     }
@@ -1714,55 +1755,53 @@ function configurePage() {
     .custom-catalog-item-name { font-size: 0.86rem; font-weight: 600; color: var(--text); }
     .custom-catalog-item-sub  { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; font-family: 'DM Mono', monospace; }
 
-    /* Custom catalog expanded editor */
-    .custom-catalog-item.expanded { border-color: var(--gold-border); }
+    /* Catalog rows — unified drag + custom expanded editor */
+    .catalog-row-custom { flex-wrap: wrap; }
+    .catalog-row-custom.expanded { border-color: var(--gold-border); border-radius: 10px 10px 0 0; border-bottom: none; }
     .custom-catalog-editor {
       display: none;
+      width: 100%;
+      border: 1px solid var(--gold-border);
       border-top: 1px solid var(--border);
       padding: 12px 14px 14px;
       background: var(--bg);
       border-radius: 0 0 10px 10px;
+      overflow: hidden;
     }
-    .custom-catalog-item.expanded .custom-catalog-editor { display: block; }
-    .cat-items-list { list-style: none; margin: 8px 0; }
+    .catalog-row-custom.expanded .custom-catalog-editor { display: block; }
+    .cat-items-list { list-style: none; margin: 6px 0 10px; }
     .cat-item-row {
       display: flex; align-items: center; gap: 8px;
       padding: 6px 8px; border-radius: 8px; background: var(--surface2);
       border: 1px solid var(--border); margin-bottom: 5px;
     }
     .cat-item-poster { width: 28px; height: 42px; border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--surface); }
-    .cat-item-info { flex: 1; min-width: 0; }
+    .cat-item-info { flex: 1; min-width: 0; overflow: hidden; }
     .cat-item-name { font-size: 0.8rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .cat-item-sub  { font-size: 0.68rem; color: var(--text-mute); margin-top: 1px; }
-    .cat-item-drag { color: var(--text-mute); font-size: 0.85rem; cursor: grab; padding: 4px; }
-    .cat-item-del  { color: var(--text-mute); cursor: pointer; padding: 4px 5px; border-radius: 4px; transition: color var(--transition); font-size: 0.88rem; }
+    .cat-item-drag { color: var(--text-mute); font-size: 0.85rem; cursor: grab; padding: 4px; touch-action: none; flex-shrink: 0; }
+    .cat-item-del  { color: var(--text-mute); cursor: pointer; padding: 4px 5px; border-radius: 4px; flex-shrink: 0; font-size: 0.9rem; }
     .cat-item-del:hover { color: #e05252; }
     .cat-item-row.dragging { opacity: 0.35; }
     .cat-item-row.drag-over-item { border-color: var(--gold); background: var(--gold-dim); }
 
-    /* Items search results inside editor */
     .cat-search-result {
       display: flex; align-items: center; gap: 8px;
       padding: 7px 10px; border-radius: 8px; cursor: pointer;
       transition: background var(--transition);
     }
-    .cat-search-result:hover { background: var(--surface2); }
+    .cat-search-result:hover:not(.cat-search-added) { background: var(--surface2); }
+    .cat-search-result.cat-search-added { opacity: 0.6; cursor: default; }
     .cat-search-result-poster { width: 28px; height: 42px; border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--surface2); }
 
     /* cc two-step workflow */
     .cc-step { display: none; }
     .cc-step.active { display: block; }
 
-    /* Custom catalog drag-reorder */
-    .custom-catalog-item { cursor: default; }
-    .custom-catalog-item.dragging-cat { opacity: 0.35; }
-    .custom-catalog-item.drag-over-cat { border-color: var(--gold); background: var(--gold-dim); }
-    .cat-drag-handle { color: var(--text-mute); font-size: 0.9rem; cursor: grab; padding: 4px 6px 4px 0; flex-shrink: 0; }
-
-    /* Default catalog drag reorder */
+    /* Unified catalog drag states */
     .catalog-row.dragging-def { opacity: 0.35; }
     .catalog-row.drag-over-def { border-color: var(--gold); background: var(--gold-dim); }
-    .catalog-drag-handle { color: var(--text-mute); font-size: 0.9rem; cursor: grab; padding: 4px 6px 4px 0; flex-shrink: 0; }
+    .catalog-drag-handle { color: var(--text-mute); font-size: 0.95rem; cursor: grab; padding: 4px 8px 4px 0; flex-shrink: 0; touch-action: none; }
 
     /* Add catalog tabs */
     .add-cat-tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 14px; overflow-x: auto; }
@@ -2186,71 +2225,284 @@ function configurePage() {
     "}",
     "",
 
-    // ── Catalog UI ──
-    "function initDefaultOrder() {",
-    "  if (!state.defaultCatalogOrder) {",
-    "    state.defaultCatalogOrder = DEFAULT_CATALOGS.map(function(c){ return c.id; });",
+    // ── Catalog UI — unified list (defaults + custom) with touch drag ──
+    // State: unifiedOrder = [{kind:'default',id} | {kind:'custom',id}]
+    "function initUnifiedOrder() {",
+    "  if (!state.unifiedOrder) {",
+    "    state.unifiedOrder = DEFAULT_CATALOGS.map(function(c){ return {kind:'default',id:c.id}; });",
     "  }",
     "}",
-    "function renderDefaultCatalogs() {",
-    "  initDefaultOrder();",
+    "function renderDefaultCatalogs() { renderUnifiedCatalogList(); }",
+    "function renderCustomCatalogsList() { renderUnifiedCatalogList(); }",
+    "function renderUnifiedCatalogList() {",
+    "  initUnifiedOrder();",
+    "  // Sync: add any new defaults/customs not yet in order",
+    "  DEFAULT_CATALOGS.forEach(function(c) {",
+    "    if (!state.unifiedOrder.find(function(o){ return o.kind==='default'&&o.id===c.id; })) {",
+    "      state.unifiedOrder.push({kind:'default',id:c.id});",
+    "    }",
+    "  });",
+    "  state.customCatalogs.forEach(function(c) {",
+    "    if (!state.unifiedOrder.find(function(o){ return o.kind==='custom'&&o.id===c.id; })) {",
+    "      state.unifiedOrder.push({kind:'custom',id:c.id});",
+    "    }",
+    "  });",
+    "  // Remove stale entries",
+    "  state.unifiedOrder = state.unifiedOrder.filter(function(o) {",
+    "    if (o.kind==='default') return !!DEFAULT_CATALOGS.find(function(c){ return c.id===o.id; });",
+    "    return !!state.customCatalogs.find(function(c){ return c.id===o.id; });",
+    "  });",
     "  var el = document.getElementById('all-catalogs-list');",
     "  if (!el) return;",
-    "  var ordered = state.defaultCatalogOrder.map(function(id){ return DEFAULT_CATALOGS.find(function(c){ return c.id===id; }); }).filter(Boolean);",
-    "  el.innerHTML = ordered.map(function(c, idx) {",
-    "    var checked = state.catalogEnabled[c.id]!==undefined ? state.catalogEnabled[c.id] : c.enabled;",
-    "    var displayName = state.catalogNames[c.id] || c.name;",
-    "    var typeLabel = c.type === 'movie' ? 'TMDB Movie' : 'TMDB Series';",
-    "    return '<div class=\"catalog-row\" data-defidx=\"'+idx+'\" data-catid=\"'+c.id+'\" draggable=\"true\">'+",
-    "      '<span class=\"catalog-drag-handle\" title=\"Drag to reorder\">&#8801;</span>'+",
-    "      '<div class=\"catalog-row-info\">'+",
-    "        '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(displayName)+'\" placeholder=\"'+esc(c.name)+'\" oninput=\"setCatalogName(\\'' + c.id + '\\',this.value)\" title=\"Click to rename\"/>'+",
-    "        '<div class=\"catalog-row-type\">'+typeLabel+'</div>'+",
-    "      '</div>'+",
-    "      '<label class=\"toggle\"><input type=\"checkbox\" '+(checked?'checked':'')+' onchange=\"setCatalogEnabled(\\'' + c.id + '\\',this.checked)\"/><span class=\"toggle-slider\"></span></label>'+",
-    "    '</div>';",
+    "  var sortLabels={'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'};",
+    "  el.innerHTML = state.unifiedOrder.map(function(entry, idx) {",
+    "    if (entry.kind==='default') {",
+    "      var c = DEFAULT_CATALOGS.find(function(x){ return x.id===entry.id; });",
+    "      if (!c) return '';",
+    "      var checked = state.catalogEnabled[c.id]!==undefined ? state.catalogEnabled[c.id] : c.enabled;",
+    "      var displayName = state.catalogNames[c.id] || c.name;",
+    "      var typeLabel = c.type==='movie'?'TMDB Movie':'TMDB Series';",
+    "      return '<div class=\"catalog-row\" data-uidx=\"'+idx+'\" data-uid=\"'+entry.kind+':'+entry.id+'\" draggable=\"true\">'",
+    "        + '<span class=\"catalog-drag-handle\">&#8801;</span>'",
+    "        + '<div class=\"catalog-row-info\">'",
+    "          + '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(displayName)+'\" placeholder=\"'+esc(c.name)+'\" oninput=\"setCatalogName(\\''+c.id+'\\',this.value)\" title=\"Tap to rename\"/>'",
+    "          + '<div class=\"catalog-row-type\">'+typeLabel+'</div>'",
+    "        + '</div>'",
+    "        + '<label class=\"toggle\"><input type=\"checkbox\" '+(checked?'checked':'')+' onchange=\"setCatalogEnabled(\\''+c.id+'\\',this.checked)\"/><span class=\"toggle-slider\"></span></label>'",
+    "        + '</div>';",
+    "    } else {",
+    "      var c = state.customCatalogs.find(function(x){ return x.id===entry.id; });",
+    "      if (!c) return '';",
+    "      var sub='';",
+    "      if (c.path==='_mdblist_') sub='MDBList &middot; '+c.type;",
+    "      else if (c.path==='_imdblist_') sub='IMDB &middot; '+c.type;",
+    "      else if (c.path==='_custom_items_') sub='Custom Items &middot; '+c.type+' &middot; '+(c.items&&c.items.length||0)+' item'+((!c.items||c.items.length!==1)?'s':'');",
+    "      else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; sub='TMDB Discover &middot; '+c.type+' &middot; '+sl; }",
+    "      var isItems = c.path==='_custom_items_';",
+    "      var html = '<div class=\"catalog-row catalog-row-custom\" id=\"ccat-'+c.id+'\" data-uidx=\"'+idx+'\" data-uid=\"'+entry.kind+':'+entry.id+'\" draggable=\"true\">'",
+    "        + '<span class=\"catalog-drag-handle\">&#8801;</span>'",
+    "        + '<div class=\"catalog-row-info\">'",
+    "          + '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(c.name)+'\" oninput=\"updateCustomCatName(\\''+c.id+'\\',this.value)\" onclick=\"event.stopPropagation()\" title=\"Tap to rename\"/>'",
+    "          + '<div class=\"catalog-row-type\">'+sub+'</div>'",
+    "        + '</div>'",
+    "        + (isItems ? '<button class=\"btn btn-ghost btn-sm\" style=\"padding:5px 8px;flex-shrink:0\" onclick=\"event.stopPropagation();toggleCustomCatExpand(\\''+c.id+'\\')\" title=\"Edit items\">&#9998;</button>' : '')",
+    "        + '<button class=\"btn btn-danger btn-sm\" style=\"flex-shrink:0\" onclick=\"event.stopPropagation();removeCustomCatalog(\\''+c.id+'\\')\">&times;</button>';",
+    "      if (isItems) {",
+    "        var items = c.items || [];",
+    "        var itemsHtml = items.length",
+    "          ? '<ul class=\"cat-items-list\">' + items.map(function(item, i) {",
+    "              var ph = item.poster ? '<img class=\"cat-item-poster\" src=\"'+item.poster+'\" loading=\"lazy\"/>' : '<div class=\"cat-item-poster\"></div>';",
+    "              return '<li class=\"cat-item-row\" data-catid=\"'+c.id+'\" data-itemidx=\"'+i+'\" draggable=\"true\">'",
+    "                + '<span class=\"cat-item-drag\">&#8801;</span>'",
+    "                + ph",
+    "                + '<div class=\"cat-item-info\"><div class=\"cat-item-name\">'+esc(item.name)+'</div><div class=\"cat-item-sub\">'+esc(item.itemType||'')+'</div></div>'",
+    "                + '<span class=\"cat-item-del\" onclick=\"removeCatalogItem(\\''+c.id+'\\','+i+')\">&#215;</span>'",
+    "                + '</li>';",
+    "            }).join('') + '</ul>'",
+    "          : '<p style=\"font-size:0.8rem;color:var(--text-mute);margin:4px 0 8px\">No items. Search below to add.</p>';",
+    "        html += '<div class=\"custom-catalog-editor\">'",
+    "          + '<div style=\"font-size:0.72rem;color:var(--text-dim);margin-bottom:8px;font-weight:600\">Items &mdash; drag to reorder, &times; to remove</div>'",
+    "          + itemsHtml",
+    "          + '<div style=\"margin-top:10px\">'",
+    "            + '<input type=\"text\" id=\"catitems-search-'+c.id+'\" placeholder=\"Search to add '+c.type+'s...\" oninput=\"debounceCatItemSearch(\\''+c.id+'\\',\\''+c.type+'\\',this.value)\" autocomplete=\"off\" style=\"font-size:0.82rem\"/>'",
+    "            + '<div id=\"catitems-results-'+c.id+'\" style=\"margin-top:4px;max-height:200px;overflow-y:auto\"></div>'",
+    "          + '</div>'",
+    "          + '</div>';",
+    "      }",
+    "      html += '</div>';",
+    "      return html;",
+    "    }",
     "  }).join('');",
-    "  initDefaultDragSort();",
+    "  initUnifiedDragSort();",
+    "  initCatalogItemsDragSort();",
     "}",
     "function setCatalogEnabled(id, val) { state.catalogEnabled[id]=val; }",
     "function setCatalogName(id, val) { state.catalogNames[id]=val; }",
-    "function initDefaultDragSort() {",
-    "  var items = document.querySelectorAll('#all-catalogs-list .catalog-row');",
+    "function updateCustomCatName(id, val) { var c=state.customCatalogs.find(function(x){return x.id===id;}); if(c) c.name=val; }",
+    "function removeCustomCatalog(id) {",
+    "  state.customCatalogs = state.customCatalogs.filter(function(c){ return c.id!==id; });",
+    "  state.unifiedOrder = state.unifiedOrder.filter(function(o){ return !(o.kind==='custom'&&o.id===id); });",
+    "  renderUnifiedCatalogList();",
+    "}",
+    "function toggleCustomCatExpand(id) { var el=document.getElementById('ccat-'+id); if(el) el.classList.toggle('expanded'); }",
+    "function removeCatalogItem(catId, idx) {",
+    "  var c=state.customCatalogs.find(function(x){return x.id===catId;});",
+    "  if (!c||!c.items) return;",
+    "  var wasExp = document.getElementById('ccat-'+catId) && document.getElementById('ccat-'+catId).classList.contains('expanded');",
+    "  c.items.splice(idx,1);",
+    "  renderUnifiedCatalogList();",
+    "  if (wasExp) { var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); }",
+    "}",
+    "",
+    "// ── Touch+Mouse drag for unified catalog list ──",
+    "function initUnifiedDragSort() {",
+    "  var listEl = document.getElementById('all-catalogs-list');",
+    "  if (!listEl) return;",
+    "  var items = listEl.querySelectorAll('.catalog-row[data-uidx]');",
     "  var dragIdx = null;",
+    "  // Desktop drag",
     "  items.forEach(function(item) {",
     "    item.addEventListener('dragstart', function(e) {",
-    "      dragIdx = parseInt(item.dataset.defidx);",
+    "      if (e.target.closest('.custom-catalog-editor')) { e.preventDefault(); return; }",
+    "      dragIdx = parseInt(item.dataset.uidx);",
     "      item.classList.add('dragging-def');",
-    "      e.dataTransfer.effectAllowed='move';",
+    "      e.dataTransfer.effectAllowed = 'move';",
     "    });",
     "    item.addEventListener('dragend', function() {",
     "      item.classList.remove('dragging-def');",
-    "      document.querySelectorAll('#all-catalogs-list .catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
+    "      listEl.querySelectorAll('.catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
     "    });",
     "    item.addEventListener('dragover', function(e) {",
+    "      if (e.target.closest('.custom-catalog-editor')) return;",
     "      e.preventDefault();",
-    "      document.querySelectorAll('#all-catalogs-list .catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
+    "      listEl.querySelectorAll('.catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
     "      item.classList.add('drag-over-def');",
     "    });",
     "    item.addEventListener('drop', function(e) {",
+    "      if (e.target.closest('.custom-catalog-editor')) return;",
     "      e.preventDefault();",
     "      item.classList.remove('drag-over-def');",
-    "      var toIdx = parseInt(item.dataset.defidx);",
+    "      var toIdx = parseInt(item.dataset.uidx);",
     "      if (dragIdx !== null && dragIdx !== toIdx) {",
-    "        initDefaultOrder();",
-    "        var moved = state.defaultCatalogOrder.splice(dragIdx, 1)[0];",
-    "        state.defaultCatalogOrder.splice(toIdx, 0, moved);",
-    "        renderDefaultCatalogs();",
+    "        initUnifiedOrder();",
+    "        var moved = state.unifiedOrder.splice(dragIdx, 1)[0];",
+    "        state.unifiedOrder.splice(toIdx, 0, moved);",
+    "        renderUnifiedCatalogList();",
+    "      }",
+    "      dragIdx = null;",
+    "    });",
+    "  });",
+    "  // Mobile touch drag",
+    "  items.forEach(function(item) {",
+    "    var handle = item.querySelector('.catalog-drag-handle');",
+    "    if (!handle) return;",
+    "    var clone = null, startY = 0, startScrollY = 0;",
+    "    handle.addEventListener('touchstart', function(e) {",
+    "      if (e.target.closest('.custom-catalog-editor')) return;",
+    "      dragIdx = parseInt(item.dataset.uidx);",
+    "      var touch = e.touches[0];",
+    "      startY = touch.clientY;",
+    "      startScrollY = window.scrollY;",
+    "      var rect = item.getBoundingClientRect();",
+    "      clone = item.cloneNode(true);",
+    "      clone.style.cssText = 'position:fixed;left:'+rect.left+'px;top:'+rect.top+'px;width:'+rect.width+'px;opacity:0.9;z-index:9999;pointer-events:none;border:1px solid var(--gold);border-radius:10px;background:var(--surface);';",
+    "      document.body.appendChild(clone);",
+    "      item.style.opacity = '0.3';",
+    "      e.preventDefault();",
+    "    }, { passive: false });",
+    "    handle.addEventListener('touchmove', function(e) {",
+    "      if (!clone || dragIdx === null) return;",
+    "      var touch = e.touches[0];",
+    "      var dy = touch.clientY - startY;",
+    "      var rect = item.getBoundingClientRect();",
+    "      clone.style.top = (rect.top + dy) + 'px';",
+    "      listEl.querySelectorAll('.catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
+    "      var el = document.elementFromPoint(touch.clientX, touch.clientY);",
+    "      var target = el ? el.closest('.catalog-row[data-uidx]') : null;",
+    "      if (target) target.classList.add('drag-over-def');",
+    "      e.preventDefault();",
+    "    }, { passive: false });",
+    "    handle.addEventListener('touchend', function(e) {",
+    "      if (clone) { document.body.removeChild(clone); clone = null; }",
+    "      item.style.opacity = '';",
+    "      listEl.querySelectorAll('.catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
+    "      if (dragIdx === null) return;",
+    "      var touch = e.changedTouches[0];",
+    "      var el = document.elementFromPoint(touch.clientX, touch.clientY);",
+    "      var target = el ? el.closest('.catalog-row[data-uidx]') : null;",
+    "      if (target) {",
+    "        var toIdx = parseInt(target.dataset.uidx);",
+    "        if (toIdx !== dragIdx) {",
+    "          initUnifiedOrder();",
+    "          var moved = state.unifiedOrder.splice(dragIdx, 1)[0];",
+    "          state.unifiedOrder.splice(toIdx, 0, moved);",
+    "          renderUnifiedCatalogList();",
+    "        }",
     "      }",
     "      dragIdx = null;",
     "    });",
     "  });",
     "}",
     "",
+    "// ── Touch+Mouse drag for catalog items list ──",
+    "function initCatalogItemsDragSort() {",
+    "  document.querySelectorAll('.cat-items-list').forEach(function(listEl) {",
+    "    var items = listEl.querySelectorAll('.cat-item-row');",
+    "    var dragItemIdx = null; var dragCatId = null;",
+    "    // Desktop drag",
+    "    items.forEach(function(item) {",
+    "      item.addEventListener('dragstart', function(e) {",
+    "        dragItemIdx=parseInt(item.dataset.itemidx); dragCatId=item.dataset.catid;",
+    "        item.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; e.stopPropagation();",
+    "      });",
+    "      item.addEventListener('dragend', function() { item.classList.remove('dragging'); items.forEach(function(i){i.classList.remove('drag-over-item');}); });",
+    "      item.addEventListener('dragover', function(e) { e.preventDefault(); e.stopPropagation(); items.forEach(function(i){i.classList.remove('drag-over-item');}); item.classList.add('drag-over-item'); });",
+    "      item.addEventListener('drop', function(e) {",
+    "        e.preventDefault(); e.stopPropagation(); item.classList.remove('drag-over-item');",
+    "        var toIdx=parseInt(item.dataset.itemidx);",
+    "        if (dragItemIdx===null||dragItemIdx===toIdx||!dragCatId) return;",
+    "        var c=state.customCatalogs.find(function(x){return x.id===dragCatId;});",
+    "        if (!c||!c.items) return;",
+    "        var moved=c.items.splice(dragItemIdx,1)[0]; c.items.splice(toIdx,0,moved);",
+    "        var wasExp=true;",
+    "        renderUnifiedCatalogList();",
+    "        setTimeout(function(){ var el=document.getElementById('ccat-'+dragCatId); if(el) el.classList.add('expanded'); },20);",
+    "        dragItemIdx=null;",
+    "      });",
+    "    });",
+    "    // Mobile touch drag",
+    "    items.forEach(function(item) {",
+    "      var handle = item.querySelector('.cat-item-drag');",
+    "      if (!handle) return;",
+    "      var clone = null;",
+    "      handle.addEventListener('touchstart', function(e) {",
+    "        dragItemIdx=parseInt(item.dataset.itemidx); dragCatId=item.dataset.catid;",
+    "        var touch=e.touches[0]; var rect=item.getBoundingClientRect();",
+    "        clone=item.cloneNode(true);",
+    "        clone.style.cssText='position:fixed;left:'+rect.left+'px;top:'+rect.top+'px;width:'+rect.width+'px;opacity:0.9;z-index:9999;pointer-events:none;border:1px solid var(--gold);border-radius:8px;background:var(--bg);';",
+    "        document.body.appendChild(clone);",
+    "        item.style.opacity='0.3';",
+    "        e.preventDefault(); e.stopPropagation();",
+    "      }, {passive:false});",
+    "      handle.addEventListener('touchmove', function(e) {",
+    "        if (!clone) return;",
+    "        var touch=e.touches[0];",
+    "        var dy=touch.clientY - (clone._startY||touch.clientY);",
+    "        if (!clone._startY) clone._startY=touch.clientY;",
+    "        clone.style.top=(parseFloat(clone.style.top)+dy)+'px';",
+    "        clone._startY=touch.clientY;",
+    "        items.forEach(function(i){i.classList.remove('drag-over-item');});",
+    "        var el=document.elementFromPoint(touch.clientX, touch.clientY);",
+    "        var target=el?el.closest('.cat-item-row'):null;",
+    "        if (target&&target.dataset.catid===dragCatId) target.classList.add('drag-over-item');",
+    "        e.preventDefault(); e.stopPropagation();",
+    "      }, {passive:false});",
+    "      handle.addEventListener('touchend', function(e) {",
+    "        if (clone) { document.body.removeChild(clone); clone=null; }",
+    "        item.style.opacity='';",
+    "        items.forEach(function(i){i.classList.remove('drag-over-item');});",
+    "        var touch=e.changedTouches[0];",
+    "        var el=document.elementFromPoint(touch.clientX,touch.clientY);",
+    "        var target=el?el.closest('.cat-item-row'):null;",
+    "        if (target&&target.dataset.catid===dragCatId) {",
+    "          var toIdx=parseInt(target.dataset.itemidx);",
+    "          if (toIdx!==dragItemIdx) {",
+    "            var c=state.customCatalogs.find(function(x){return x.id===dragCatId;});",
+    "            if (c&&c.items) { var moved=c.items.splice(dragItemIdx,1)[0]; c.items.splice(toIdx,0,moved); }",
+    "            renderUnifiedCatalogList();",
+    "            setTimeout(function(){ var el=document.getElementById('ccat-'+dragCatId); if(el) el.classList.add('expanded'); },20);",
+    "          }",
+    "        }",
+    "        dragItemIdx=null;",
+    "      });",
+    "    });",
+    "  });",
+    "}",
+    "",
     "function switchAddCatTab(tab) {",
     "  ['items','tmdb-builder','mdblist','imdb'].forEach(function(t) {",
-    "    var btn = document.getElementById('add-cat-tab-'+t);",
-    "    var panel = document.getElementById('add-cat-panel-'+t);",
+    "    var btn=document.getElementById('add-cat-tab-'+t);",
+    "    var panel=document.getElementById('add-cat-panel-'+t);",
     "    if (btn) btn.classList.toggle('active', t===tab);",
     "    if (panel) panel.classList.toggle('active', t===tab);",
     "  });",
@@ -2258,25 +2510,24 @@ function configurePage() {
     "}",
     "",
     "function toggleCustomCatalogForm() {",
-    "  var form = document.getElementById('custom-catalog-form');",
+    "  var form=document.getElementById('custom-catalog-form');",
     "  form.classList.toggle('open');",
     "  if (form.classList.contains('open')) {",
     "    document.getElementById('cc-step-name').classList.add('active');",
     "    document.getElementById('cc-step-source').classList.remove('active');",
-    "    document.getElementById('cc-new-name').value = '';",
-    "    document.getElementById('cc-new-type').value = 'movie';",
-    "    newCatalogItems = [];",
+    "    document.getElementById('cc-new-name').value='';",
+    "    document.getElementById('cc-new-type').value='movie';",
+    "    newCatalogItems=[];",
     "  }",
     "}",
     "function ccGoStep2() {",
-    "  var name = document.getElementById('cc-new-name').value.trim();",
+    "  var name=document.getElementById('cc-new-name').value.trim();",
     "  if (!name) { var n=document.getElementById('cc-new-name'); n.classList.add('error'); setTimeout(function(){ n.classList.remove('error'); },1500); return; }",
-    "  document.getElementById('cc-step2-name-display').textContent = name + ' (' + document.getElementById('cc-new-type').value + ')';",
+    "  document.getElementById('cc-step2-name-display').textContent=name+' ('+document.getElementById('cc-new-type').value+')';",
     "  document.getElementById('cc-step-name').classList.remove('active');",
     "  document.getElementById('cc-step-source').classList.add('active');",
     "  switchAddCatTab('items');",
-    "  newCatalogItems = [];",
-    "  renderNewCatalogItems();",
+    "  newCatalogItems=[]; renderNewCatalogItems();",
     "}",
     "function ccBackStep1() {",
     "  document.getElementById('cc-step-source').classList.remove('active');",
@@ -2284,12 +2535,12 @@ function configurePage() {
     "}",
     "",
     "async function loadGenresForCustom() {",
-    "  var type = document.getElementById('cc-new-type').value;",
-    "  var tt = type==='series'?'tv':'movie';",
+    "  var type=document.getElementById('cc-new-type').value;",
+    "  var tt=type==='series'?'tv':'movie';",
     "  if (genreCache[tt]) { populateGenreSelect(genreCache[tt]); return; }",
     "  try {",
-    "    var r = await fetch('/api/genres?apiKey='+encodeURIComponent(state.apiKey)+'&type='+tt);",
-    "    var d = await r.json();",
+    "    var r=await fetch('/api/genres?apiKey='+encodeURIComponent(state.apiKey)+'&type='+tt);",
+    "    var d=await r.json();",
     "    genreCache[tt]=d.genres||[]; populateGenreSelect(genreCache[tt]);",
     "  } catch(e) {}",
     "}",
@@ -2299,61 +2550,65 @@ function configurePage() {
     "  sel.innerHTML='<option value=\"\">Any Genre</option>'+genres.map(function(g){ return '<option value=\"'+g.id+'\">'+esc(g.name)+'</option>'; }).join('');",
     "}",
     "",
+    "// ── New catalog items picker ──",
     "var newCatalogItems = [];",
     "var itemsSearchTimer;",
     "function debounceItemsSearch(q) {",
     "  clearTimeout(itemsSearchTimer);",
-    "  var box = document.getElementById('cc-items-results');",
+    "  var box=document.getElementById('cc-items-results');",
     "  if (!q.trim()) { if(box) box.innerHTML=''; return; }",
-    "  itemsSearchTimer = setTimeout(function(){ doItemsSearch(q); }, 350);",
+    "  itemsSearchTimer=setTimeout(function(){ doItemsSearch(q); },350);",
     "}",
     "async function doItemsSearch(q) {",
-    "  var type = document.getElementById('cc-new-type').value;",
-    "  var box = document.getElementById('cc-items-results');",
+    "  var type=document.getElementById('cc-new-type').value;",
+    "  var box=document.getElementById('cc-items-results');",
     "  if (!box) return;",
-    "  box.innerHTML = '<div class=\"loading-state\" style=\"padding:0.6rem 0\"><div class=\"spinner-light\"></div> Searching...</div>';",
+    "  box.innerHTML='<div class=\"loading-state\" style=\"padding:0.5rem 0\"><div class=\"spinner-light\"></div> Searching...</div>';",
     "  try {",
-    "    var r = await fetch('/api/search-multi?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type='+type);",
-    "    var d = await r.json();",
-    "    if (!d.results || !d.results.length) { box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute);padding:4px 0\">No results.</p>'; return; }",
-    "    box.innerHTML = d.results.map(function(s) {",
-    "      var ph = s.poster ? '<img class=\"cat-search-result-poster\" src=\"'+s.poster+'\" loading=\"lazy\"/>' : '<div class=\"cat-search-result-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#127902;</div>';",
-    "      return '<div class=\"cat-search-result\" onclick=\"addItemToCatalog('+s.id+',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\',\\\''+type+'\\')\">'",
-    "        + ph + '<div><div style=\"font-size:0.82rem;font-weight:600;color:var(--text)\">'+esc(s.name)+'</div><div style=\"font-size:0.7rem;color:var(--text-mute)\">'+(s.year||'')+(s.vote_average?' &middot; &starf;'+s.vote_average:'')+'</div></div>'",
-    "        + '<div style=\"margin-left:auto;font-size:0.7rem;color:var(--gold)\">+ Add</div></div>';",
+    "    var r=await fetch('/api/search-multi?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type='+type);",
+    "    var d=await r.json();",
+    "    if (!d.results||!d.results.length) { box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute);padding:4px\">No results.</p>'; return; }",
+    "    box.innerHTML=d.results.map(function(s) {",
+    "      var already=newCatalogItems.find(function(i){ return i.tmdbId===String(s.id); });",
+    "      var ph=s.poster?'<img class=\"cat-search-result-poster\" src=\"'+s.poster+'\" loading=\"lazy\"/>':'<div class=\"cat-search-result-poster\"></div>';",
+    "      return '<div class=\"cat-search-result'+(already?' cat-search-added':'')+'\" onclick=\"addItemToCatalog('+s.id+',\\''+esc4attr(s.name)+'\\',\\''+esc4attr(s.poster||'')+'\\',\\''+type+'\\')\">'",
+    "        +ph+'<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.82rem;font-weight:600;color:var(--text)\">'+esc(s.name)+'</div><div style=\"font-size:0.7rem;color:var(--text-mute)\">'+(s.year||'')+'</div></div>'",
+    "        +'<div style=\"font-size:0.75rem;color:'+(already?'var(--gold)':'var(--text-mute)')+'\">'+(already?'&#10003; Added':'+ Add')+'</div></div>';",
     "    }).join('');",
-    "  } catch(e) { if(box) box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute)\">Search error.</p>'; }",
+    "  } catch(e) { if(box) box.innerHTML=''; }",
     "}",
     "function addItemToCatalog(tmdbId, name, poster, itemType) {",
-    "  var already = newCatalogItems.find(function(i){ return i.tmdbId===String(tmdbId); });",
+    "  var already=newCatalogItems.find(function(i){ return i.tmdbId===String(tmdbId); });",
     "  if (already) return;",
-    "  newCatalogItems.push({ tmdbId: String(tmdbId), name: name, poster: poster, itemType: itemType });",
+    "  newCatalogItems.push({tmdbId:String(tmdbId),name:name,poster:poster,itemType:itemType});",
     "  renderNewCatalogItems();",
+    "  // Refresh results to show checkmarks",
+    "  var inp=document.getElementById('cc-items-search');",
+    "  if (inp&&inp.value) doItemsSearch(inp.value);",
     "}",
-    "function removeNewCatalogItem(idx) { newCatalogItems.splice(idx, 1); renderNewCatalogItems(); }",
+    "function removeNewCatalogItem(idx) { newCatalogItems.splice(idx,1); renderNewCatalogItems(); }",
     "function renderNewCatalogItems() {",
-    "  var el = document.getElementById('cc-items-picked');",
-    "  if (!el) return;",
-    "  if (!newCatalogItems.length) { el.innerHTML = '<p style=\"font-size:0.75rem;color:var(--text-mute)\">No items added yet. Search above.</p>'; return; }",
-    "  el.innerHTML = '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:6px\">'+newCatalogItems.length+' item'+(newCatalogItems.length!==1?'s':'')+' added &mdash; click to remove</div>'",
-    "    + '<div style=\"display:flex;flex-wrap:wrap;gap:6px\">'",
-    "    + newCatalogItems.map(function(item, i) {",
-    "      var ph = item.poster ? '<img style=\"width:32px;height:48px;border-radius:4px;object-fit:cover\" src=\"'+item.poster+'\" loading=\"lazy\"/>' : '<div style=\"width:32px;height:48px;background:var(--surface2);border-radius:4px\"></div>';",
+    "  var el=document.getElementById('cc-items-picked'); if(!el) return;",
+    "  if (!newCatalogItems.length) { el.innerHTML='<p style=\"font-size:0.75rem;color:var(--text-mute)\">No items added yet.</p>'; return; }",
+    "  el.innerHTML='<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:6px\">'+newCatalogItems.length+' item'+(newCatalogItems.length!==1?'s':'')+' &mdash; tap to remove</div>'",
+    "    +'<div style=\"display:flex;flex-wrap:wrap;gap:6px\">'",
+    "    +newCatalogItems.map(function(item,i){",
+    "      var ph=item.poster?'<img style=\"width:36px;height:54px;border-radius:4px;object-fit:cover\" src=\"'+item.poster+'\" loading=\"lazy\"/>':'<div style=\"width:36px;height:54px;background:var(--surface2);border-radius:4px\"></div>';",
     "      return '<div style=\"position:relative;cursor:pointer\" title=\"'+esc(item.name)+'\" onclick=\"removeNewCatalogItem('+i+')\">'",
-    "        + ph",
-    "        + '<div style=\"position:absolute;top:-4px;right:-4px;width:14px;height:14px;background:#c0392b;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:0.55rem;color:#fff\">&times;</div>'",
-    "        + '</div>';",
-    "    }).join('')",
-    "    + '</div>';",
+    "        +ph+'<div style=\"position:absolute;top:-3px;right:-3px;width:14px;height:14px;background:#c0392b;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;color:#fff\">&times;</div>'",
+    "        +'</div>';",
+    "    }).join('')+'</div>';",
     "}",
     "function addItemsCatalog() {",
-    "  var name = document.getElementById('cc-new-name').value.trim();",
-    "  var type = document.getElementById('cc-new-type').value;",
+    "  var name=document.getElementById('cc-new-name').value.trim();",
+    "  var type=document.getElementById('cc-new-type').value;",
     "  if (!name) return;",
-    "  state.customCatalogs.push({ id:'custom_items.'+Date.now(), name:name, type:type, path:'_custom_items_', items: newCatalogItems.slice(), enabled:true });",
-    "  newCatalogItems = [];",
+    "  var newCat={id:'custom_items.'+Date.now(),name:name,type:type,path:'_custom_items_',items:newCatalogItems.slice(),enabled:true};",
+    "  state.customCatalogs.push(newCat);",
+    "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
+    "  newCatalogItems=[];",
     "  document.getElementById('custom-catalog-form').classList.remove('open');",
-    "  renderCustomCatalogsList();",
+    "  renderUnifiedCatalogList();",
     "}",
     "function addCustomCatalog() {",
     "  var name=document.getElementById('cc-new-name').value.trim();",
@@ -2362,152 +2617,55 @@ function configurePage() {
     "  var sort=document.getElementById('cc-sort').value;",
     "  if (!name) return;",
     "  var tt=type==='series'?'tv':'movie';",
-    "  var params={sort_by:sort};",
-    "  if (genre) params.with_genres=genre;",
-    "  state.customCatalogs.push({id:'custom.'+Date.now(), name:name, type:type, path:'/discover/'+tt, params:params, enabled:true});",
+    "  var params={sort_by:sort}; if(genre) params.with_genres=genre;",
+    "  var newCat={id:'custom.'+Date.now(),name:name,type:type,path:'/discover/'+tt,params:params,enabled:true};",
+    "  state.customCatalogs.push(newCat);",
+    "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
     "  document.getElementById('custom-catalog-form').classList.remove('open');",
-    "  renderCustomCatalogsList();",
+    "  renderUnifiedCatalogList();",
     "}",
-    "function removeCustomCatalog(id) { state.customCatalogs=state.customCatalogs.filter(function(c){ return c.id!==id; }); renderCustomCatalogsList(); }",
-    "function moveCustomCatalog(fromIdx, toIdx) {",
-    "  if (fromIdx===toIdx) return;",
-    "  var moved=state.customCatalogs.splice(fromIdx,1)[0];",
-    "  state.customCatalogs.splice(toIdx,0,moved);",
-    "  renderCustomCatalogsList();",
-    "}",
-    "function toggleCustomCatExpand(id) {",
-    "  var el = document.getElementById('ccat-'+id); if (el) el.classList.toggle('expanded');",
-    "}",
-    "function updateCustomCatName(id, val) {",
-    "  var c = state.customCatalogs.find(function(x){ return x.id===id; }); if (c) c.name = val;",
-    "}",
-    "function renderCustomCatalogsList() {",
-    "  var el=document.getElementById('custom-catalogs-list');",
-    "  if (!state.customCatalogs.length) { el.innerHTML='<div class=\"empty-state\" style=\"padding:1rem 0\">No custom catalogs yet.</div>'; return; }",
-    "  var sortLabels={'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'};",
-    "  el.innerHTML=state.customCatalogs.map(function(c,idx){",
-    "    var sub='';",
-    "    if (c.path==='_mdblist_') sub='MDBList &middot; '+c.type;",
-    "    else if (c.path==='_imdblist_') sub='IMDB &middot; '+c.type;",
-    "    else if (c.path==='_custom_items_') sub='Custom Items &middot; '+c.type+' &middot; '+(c.items&&c.items.length||0)+' item'+((!c.items||c.items.length!==1)?'s':'');",
-    "    else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; var gp=c.params&&c.params.with_genres?' &middot; Genre '+c.params.with_genres:''; sub='TMDB &middot; '+c.type+' &middot; '+sl+gp; }",
-    "    var isItems = c.path==='_custom_items_';",
-    "    var html = '<div class=\"custom-catalog-item\" id=\"ccat-'+c.id+'\" data-catidx=\"'+idx+'\" draggable=\"true\">'",
-    "      + '<span class=\"cat-drag-handle\">&#8801;</span>'",
-    "      + '<div class=\"custom-catalog-item-info\">'",
-    "        + '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(c.name)+'\" oninput=\"updateCustomCatName(\\'' + c.id + '\\',this.value)\" onclick=\"event.stopPropagation()\" title=\"Click to rename\"/>'",
-    "        + '<div class=\"custom-catalog-item-sub\">'+sub+'</div>'",
-    "      + '</div>'",
-    "      + (isItems ? '<button class=\"btn btn-ghost btn-sm\" onclick=\"event.stopPropagation();toggleCustomCatExpand(\\'' + c.id + '\\')\" style=\"padding:5px 10px\">&#9998;</button>' : '')",
-    "      + '<button class=\"btn btn-danger btn-sm\" onclick=\"event.stopPropagation();removeCustomCatalog(\\'' + c.id + '\\')\">&times;</button>';",
-    "    if (isItems) {",
-    "      var items = c.items || [];",
-    "      var itemsHtml = items.length",
-    "        ? '<ul class=\"cat-items-list\">' + items.map(function(item, i) {",
-    "            var ph = item.poster ? '<img class=\"cat-item-poster\" src=\"'+item.poster+'\" loading=\"lazy\"/>' : '<div class=\"cat-item-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#127902;</div>';",
-    "            return '<li class=\"cat-item-row\" data-catid=\"'+c.id+'\" data-itemidx=\"'+i+'\" draggable=\"true\">'",
-    "              + '<span class=\"cat-item-drag\">&#8801;</span>'",
-    "              + ph",
-    "              + '<div class=\"cat-item-info\"><div class=\"cat-item-name\">'+esc(item.name)+'</div><div class=\"cat-item-sub\">'+esc(item.itemType||'')+'</div></div>'",
-    "              + '<span class=\"cat-item-del\" onclick=\"removeCatalogItem(\\'' + c.id + '\\','+i+')\">&times;</span>'",
-    "              + '</li>';",
-    "          }).join('')",
-    "          + '</ul>'",
-    "        : '<p style=\"font-size:0.8rem;color:var(--text-mute);margin:4px 0 8px\">No items. Search below to add.</p>';",
-    "      html += '<div class=\"custom-catalog-editor\">'",
-    "        + '<div style=\"font-size:0.75rem;font-weight:600;color:var(--text-dim);margin-bottom:8px\">Items &mdash; drag to reorder, &times; to remove</div>'",
-    "        + itemsHtml",
-    "        + '<div style=\"margin-top:10px\">'",
-    "          + '<input type=\"text\" id=\"catitems-search-'+c.id+'\" placeholder=\"Search to add '+c.type+'s...\" oninput=\"debounceCatItemSearch(\\'' + c.id + '\\',\\\''+c.type+'\\',this.value)\" autocomplete=\"off\" style=\"font-size:0.82rem\"/>'",
-    "          + '<div id=\"catitems-results-'+c.id+'\" style=\"margin-top:4px\"></div>'",
-    "        + '</div>'",
-    "        + '</div>';",
-    "    }",
-    "    html += '</div>';",
-    "    return html;",
-    "  }).join('');",
-    "  initCatalogDragSort();",
-    "  initCatalogItemsDragSort();",
-    "}",
-    "function removeCatalogItem(catId, idx) {",
-    "  var c = state.customCatalogs.find(function(x){ return x.id===catId; });",
-    "  if (c && c.items) { c.items.splice(idx,1); var wasExp = document.getElementById('ccat-'+catId) && document.getElementById('ccat-'+catId).classList.contains('expanded'); renderCustomCatalogsList(); if(wasExp){ var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); } }",
-    "}",
-    "var catItemSearchTimers = {};",
-    "function debounceCatItemSearch(catId, itemType, q) {",
+    "",
+    "// ── Existing catalog items search (edit mode) ──",
+    "var catItemSearchTimers={};",
+    "function debounceCatItemSearch(catId,itemType,q) {",
     "  clearTimeout(catItemSearchTimers[catId]);",
-    "  var box = document.getElementById('catitems-results-'+catId);",
+    "  var box=document.getElementById('catitems-results-'+catId);",
     "  if (!q.trim()) { if(box) box.innerHTML=''; return; }",
-    "  catItemSearchTimers[catId] = setTimeout(function(){ doCatItemSearch(catId, itemType, q); }, 350);",
+    "  catItemSearchTimers[catId]=setTimeout(function(){ doCatItemSearch(catId,itemType,q); },350);",
     "}",
-    "async function doCatItemSearch(catId, itemType, q) {",
-    "  var box = document.getElementById('catitems-results-'+catId);",
-    "  if (!box) return;",
-    "  box.innerHTML = '<div class=\"loading-state\" style=\"padding:0.4rem 0\"><div class=\"spinner-light\"></div></div>';",
+    "async function doCatItemSearch(catId,itemType,q) {",
+    "  var box=document.getElementById('catitems-results-'+catId); if(!box) return;",
+    "  box.innerHTML='<div class=\"loading-state\" style=\"padding:0.4rem 0\"><div class=\"spinner-light\"></div></div>';",
     "  try {",
-    "    var r = await fetch('/api/search-multi?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type='+itemType);",
-    "    var d = await r.json();",
+    "    var r=await fetch('/api/search-multi?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type='+itemType);",
+    "    var d=await r.json();",
     "    if (!d.results||!d.results.length) { box.innerHTML='<p style=\"font-size:0.75rem;color:var(--text-mute)\">No results.</p>'; return; }",
-    "    box.innerHTML = d.results.slice(0,6).map(function(s) {",
-    "      var ph = s.poster ? '<img class=\"cat-search-result-poster\" src=\"'+s.poster+'\" loading=\"lazy\"/>' : '<div class=\"cat-search-result-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#9670;</div>';",
-    "      return '<div class=\"cat-search-result\" onclick=\"addItemToExistingCatalog(\\'' + catId + '\\','+s.id+',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\',\\\''+itemType+'\\')\">'",
-    "        + ph + '<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.79rem;font-weight:600;color:var(--text)\">'+esc(s.name)+'</div><div style=\"font-size:0.68rem;color:var(--text-mute)\">'+(s.year||'')+'</div></div>'",
-    "        + '<div style=\"font-size:0.7rem;color:var(--gold);flex-shrink:0\">+ Add</div></div>';",
+    "    var c=state.customCatalogs.find(function(x){ return x.id===catId; });",
+    "    box.innerHTML=d.results.slice(0,6).map(function(s) {",
+    "      var already=c&&c.items&&c.items.find(function(i){ return i.tmdbId===String(s.id); });",
+    "      var ph=s.poster?'<img class=\"cat-search-result-poster\" src=\"'+s.poster+'\" loading=\"lazy\"/>':'<div class=\"cat-search-result-poster\"></div>';",
+    "      return '<div class=\"cat-search-result'+(already?' cat-search-added':'')+'\" onclick=\"addItemToExistingCatalog(\\''+catId+'\\','+s.id+',\\''+esc4attr(s.name)+'\\',\\''+esc4attr(s.poster||'')+'\\',\\''+itemType+'\\')\">'",
+    "        +ph+'<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.79rem;font-weight:600;color:var(--text)\">'+esc(s.name)+'</div><div style=\"font-size:0.68rem;color:var(--text-mute)\">'+(s.year||'')+'</div></div>'",
+    "        +'<div style=\"font-size:0.73rem;color:'+(already?'var(--gold)':'var(--text-mute)')+'\">'+(already?'&#10003;':'+ Add')+'</div></div>';",
     "    }).join('');",
     "  } catch(e) { if(box) box.innerHTML=''; }",
     "}",
-    "function addItemToExistingCatalog(catId, tmdbId, name, poster, itemType) {",
-    "  var c = state.customCatalogs.find(function(x){ return x.id===catId; });",
-    "  if (!c) return;",
-    "  if (!c.items) c.items = [];",
-    "  if (c.items.find(function(i){ return i.tmdbId===String(tmdbId); })) return;",
-    "  c.items.push({ tmdbId: String(tmdbId), name: name, poster: poster, itemType: itemType });",
-    "  var inp = document.getElementById('catitems-search-'+catId); if (inp) inp.value = '';",
-    "  var box = document.getElementById('catitems-results-'+catId); if (box) box.innerHTML = '';",
-    "  renderCustomCatalogsList();",
-    "  setTimeout(function(){ var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); }, 20);",
-    "}",
-    "function initCatalogItemsDragSort() {",
-    "  document.querySelectorAll('.cat-items-list').forEach(function(listEl) {",
-    "    var dragItemIdx = null; var dragCatId = null;",
-    "    listEl.querySelectorAll('.cat-item-row').forEach(function(item) {",
-    "      item.addEventListener('dragstart', function(e) { dragItemIdx=parseInt(item.dataset.itemidx); dragCatId=item.dataset.catid; item.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; e.stopPropagation(); });",
-    "      item.addEventListener('dragend', function() { item.classList.remove('dragging'); listEl.querySelectorAll('.cat-item-row').forEach(function(i){ i.classList.remove('drag-over-item'); }); });",
-    "      item.addEventListener('dragover', function(e) { e.preventDefault(); e.stopPropagation(); listEl.querySelectorAll('.cat-item-row').forEach(function(i){ i.classList.remove('drag-over-item'); }); item.classList.add('drag-over-item'); });",
-    "      item.addEventListener('drop', function(e) {",
-    "        e.preventDefault(); e.stopPropagation(); item.classList.remove('drag-over-item');",
-    "        var toIdx=parseInt(item.dataset.itemidx);",
-    "        if (dragItemIdx===null||dragItemIdx===toIdx||!dragCatId) return;",
-    "        var c=state.customCatalogs.find(function(x){ return x.id===dragCatId; });",
-    "        if (!c||!c.items) return;",
-    "        var moved=c.items.splice(dragItemIdx,1)[0]; c.items.splice(toIdx,0,moved);",
-    "        renderCustomCatalogsList();",
-    "        setTimeout(function(){ var el=document.getElementById('ccat-'+dragCatId); if(el) el.classList.add('expanded'); },20);",
-    "        dragItemIdx=null;",
-    "      });",
-    "    });",
-    "  });",
-    "}",
-    "function initCatalogDragSort() {",
-    "  var items = document.querySelectorAll('.custom-catalog-item');",
-    "  var dragIdx = null;",
-    "  items.forEach(function(item) {",
-    "    item.addEventListener('dragstart', function(e) {",
-    "      if (e.target.closest('.custom-catalog-editor')||e.target.closest('.cat-items-list')) { e.stopPropagation(); return; }",
-    "      dragIdx=parseInt(item.dataset.catidx); item.classList.add('dragging-cat'); e.dataTransfer.effectAllowed='move';",
-    "    });",
-    "    item.addEventListener('dragend', function() { item.classList.remove('dragging-cat'); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); });",
-    "    item.addEventListener('dragover', function(e) {",
-    "      if (e.target.closest('.custom-catalog-editor')||e.target.closest('.cat-items-list')) return;",
-    "      e.preventDefault(); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); item.classList.add('drag-over-cat');",
-    "    });",
-    "    item.addEventListener('drop', function(e) {",
-    "      if (e.target.closest('.custom-catalog-editor')||e.target.closest('.cat-items-list')) return;",
-    "      e.preventDefault(); item.classList.remove('drag-over-cat'); var toIdx=parseInt(item.dataset.catidx); if(dragIdx!==null&&dragIdx!==toIdx) moveCustomCatalog(dragIdx,toIdx); dragIdx=null;",
-    "    });",
-    "  });",
+    "function addItemToExistingCatalog(catId,tmdbId,name,poster,itemType) {",
+    "  var c=state.customCatalogs.find(function(x){return x.id===catId;}); if(!c) return;",
+    "  if (!c.items) c.items=[];",
+    "  if (c.items.find(function(i){return i.tmdbId===String(tmdbId);})) return;",
+    "  c.items.push({tmdbId:String(tmdbId),name:name,poster:poster,itemType:itemType});",
+    "  // Re-render search with updated added state",
+    "  var inp=document.getElementById('catitems-search-'+catId);",
+    "  var q=inp?inp.value:'';",
+    "  renderUnifiedCatalogList();",
+    "  setTimeout(function(){",
+    "    var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded');",
+    "    if (q) { var newInp=document.getElementById('catitems-search-'+catId); if(newInp){newInp.value=q; doCatItemSearch(catId,itemType,q);} }",
+    "  },20);",
     "}",
     "",
+
     // ── MDBList catalog ──
     "var mdbCatalogPreviewData = null;",
     "async function previewMdbCatalog() {",
@@ -2983,7 +3141,7 @@ function configurePage() {
     "  });",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
-    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.defaultCatalogOrder};",
+    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
     "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
     "  var manifestUrl=window.location.origin+'/'+encoded+'/manifest.json';",
     "  document.getElementById('manifest-url').value=manifestUrl;",
@@ -3159,21 +3317,15 @@ function configurePage() {
     <div class="card">
       <div class="card-eyebrow">Step 3 of 4</div>
       <div class="card-title">Catalog Manager</div>
-      <div class="card-sub">Drag to reorder all catalogs. Click a name to rename it. Toggle to enable or disable. Add custom catalogs below.</div>
+      <div class="card-sub">Drag ≡ to reorder. Tap a name to rename. Toggle to enable/disable. Custom catalogs live in the same list — reorder them anywhere.</div>
 
-      <!-- Unified sortable catalog list (default + custom mixed) -->
-      <div id="all-catalogs-list"></div>
+      <!-- Unified list: defaults + custom all together -->
+      <div id="all-catalogs-list" style="margin-bottom:1rem"></div>
 
-      <!-- Add custom catalog button + form -->
-      <div class="section-header" style="margin-top:1.2rem">
-        <div>
-          <div style="font-size:0.9rem;font-weight:600;color:#fff">Custom Catalogs</div>
-          <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">TMDB Discover, picked items, MDBList, or IMDB</div>
-        </div>
-        <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">+ Add</button>
-      </div>
-      <div id="custom-catalogs-section">
-        <div id="custom-catalogs-list"><div class="empty-state" style="padding:1rem 0">No custom catalogs yet.</div></div>
+      <!-- Add custom catalog -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem">
+        <div style="font-size:0.7rem;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-mute)">Add Custom Catalog</div>
+        <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()" id="btn-add-cat">+ Add</button>
       </div>
 
       <!-- New catalog form -->
@@ -3200,11 +3352,11 @@ function configurePage() {
             <button class="add-cat-tab" id="add-cat-tab-imdb" onclick="switchAddCatTab('imdb')">IMDB</button>
           </div>
 
-          <!-- Pick Items panel — search TMDB and manually add movies/shows -->
+          <!-- Pick Items panel -->
           <div class="add-cat-panel active" id="add-cat-panel-items">
             <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Search TMDB to hand-pick specific movies or shows for this catalog.</div>
             <input type="text" id="cc-items-search" placeholder="Search for a movie or show..." oninput="debounceItemsSearch(this.value)" autocomplete="off"/>
-            <div id="cc-items-results" style="margin-top:6px"></div>
+            <div id="cc-items-results" style="margin-top:6px;max-height:220px;overflow-y:auto"></div>
             <div id="cc-items-picked" style="margin-top:10px"></div>
             <div style="display:flex;gap:8px;margin-top:12px">
               <button class="btn btn-primary btn-sm" onclick="addItemsCatalog()">Create Catalog</button>
@@ -3214,7 +3366,7 @@ function configurePage() {
 
           <!-- TMDB Builder panel -->
           <div class="add-cat-panel" id="add-cat-panel-tmdb-builder">
-            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Build a dynamic catalog from TMDB Discover with genre and sort filters.</div>
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Build a dynamic catalog from TMDB Discover.</div>
             <div class="form-row">
               <div class="field" style="margin-bottom:0"><label>Genre</label><select id="cc-genre"><option value="">Any Genre</option></select></div>
               <div class="field" style="margin-bottom:0"><label>Sort By</label><select id="cc-sort"><option value="popularity.desc">Most Popular</option><option value="vote_average.desc">Highest Rated</option><option value="release_date.desc">Newest First</option><option value="revenue.desc">Highest Revenue</option></select></div>
@@ -3245,13 +3397,12 @@ function configurePage() {
 
           <!-- IMDB panel -->
           <div class="add-cat-panel" id="add-cat-panel-imdb">
-            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ IMDB import is experimental — IMDB may block access.</div>
-            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:6px">Paste an IMDB list or chart URL.</div>
+            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ IMDB import is experimental.</div>
             <div style="display:flex;gap:8px;margin-bottom:4px">
               <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/ or /chart/top/" style="flex:1;font-size:0.85rem"/>
               <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
             </div>
-            <div style="font-size:0.68rem;color:var(--text-mute);margin-bottom:8px">Charts: /chart/top/ · /chart/moviemeter/ · /chart/toptv/ · /chart/tvmeter/ · /chart/boxoffice/</div>
+            <div style="font-size:0.68rem;color:var(--text-mute);margin-bottom:8px">Charts: /chart/top/ · /chart/moviemeter/ · /chart/toptv/ · /chart/boxoffice/</div>
             <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
             <div id="imdb-cat-preview" style="display:none">
               <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
