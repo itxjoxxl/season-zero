@@ -634,9 +634,9 @@ app.get('/api/proxy-img', async function(req, res) {
   }
 });
 
-// Return list of proxied static poster URLs (no API key needed)
+// Return list of static poster URLs (direct TMDB CDN — no API key needed for image delivery)
 app.get('/api/static-backdrops', function(req, res) {
-  const urls = STATIC_POSTER_PATHS.map(p => '/api/proxy-img?path=' + encodeURIComponent(p));
+  const urls = STATIC_POSTER_PATHS.map(p => 'https://image.tmdb.org/t/p/w342' + p);
   res.json({ posters: urls });
 });
 
@@ -1290,14 +1290,14 @@ function configurePage(existingConfig) {
       display: flex;
       gap: 0;
       height: 52%;
-      animation: bgScroll 55s linear infinite;
+      animation: bgScroll 38s linear infinite;
       will-change: transform;
     }
     .hero-bg-row.row2 {
       top: calc(50% + 4px);
       height: 50%;
       animation-direction: reverse;
-      animation-duration: 70s;
+      animation-duration: 49s;
     }
     @keyframes bgScroll {
       from { transform: translateX(0); }
@@ -1778,12 +1778,12 @@ function configurePage(existingConfig) {
     "  if (topNInp) topNInp.value = state.topN;",
     "  var szeroChk = document.getElementById('showAutoSeason');",
     "  if (szeroChk) szeroChk.checked = state.showAutoSeason;",
-    "  // If we have an API key, skip to page 2 right away",
+    "  // If we have an API key, load the hero and render catalogs but stay on page 1",
     "  if (state.apiKey) {",
     "    refreshHeroWithApiKey(state.apiKey);",
     "    renderDefaultCatalogs();",
     "    renderCustomSeasonsList();",
-    "    goTo(2);",
+    "    goTo(1);",
     "    // Enrich episodes with thumbnails in the background",
     "    enrichAllEpisodeThumbnails();",
     "  }",
