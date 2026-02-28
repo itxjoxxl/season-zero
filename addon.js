@@ -589,6 +589,57 @@ app.get('/api/hero-backdrops', async function(req, res) {
   } catch (e) { res.status(500).json({ error: e.message, backdrops: [] }); }
 });
 
+// ─── STATIC HERO BACKDROPS (no API key needed, proxied server-side) ──────────
+// These are real TMDB poster paths for popular/timeless titles.
+// We proxy them server-side so the browser never hotlinks TMDB directly.
+const STATIC_POSTER_PATHS = [
+  '/pB8BM7pdSp6B6Ih7QZ4DrQ3PmJK.jpg','/hOSeglBprJKjt0e6bSDkBJKk4cn.jpg',
+  '/qNBAXBIQlnOThrVvA6mA2B5ggkl.jpg','/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg',
+  '/gPbM0MK8CP8A174rmUwGsADNYKD.jpg','/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg',
+  '/lZ8NkZQoKjhsIxcnuKHqVs7J49.jpg', '/uXDfjJbdP4ijW5hWSBrPu1LjPD.jpg',
+  '/kqjL17yufvn9OVLyXYpvtyrFfak.jpg','/rktDFPbfHfUbArZ6OOOKsXcv0Bm.jpg',
+  '/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg','/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg',
+  '/vZloFAK7NmvMGKE7VkF5UHaz0I.jpg', '/AkE13D8b8wWODSMScSYkjKlVF7z.jpg',
+  '/ggFHVNu6YYI5L9pCfOacjizRGt.jpg', '/t6HIqrRAclMCA60NsSmeqe9RmNV.jpg',
+  '/jpurJ9jAcLCYjgHHfYF32m3zJYm.jpg','/vxnx4svEVHkLyPGEW6r8QDxPeMF.jpg',
+  '/kve20tXygoszhtaLAQ5sqc3q3Ca.jpg','/rSPw7tgCH9c6NqICZef4kZjFOQ5.jpg',
+  '/pFlaoHTZeyNkG83vxsAJiGzfSsa.jpg','/udDclJoHjfjb8Ekgsd4FDteOkCU.jpg',
+  '/jAHkz9HZf6pLc3gMQ6rPqmUO8dl.jpg', '/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg',
+  '/fOy2Jurz9k6RnJnMbD0eMPKEezr.jpg', '/sRLC052ionqa9y2y4RKNqmGXAYR.jpg',
+  '/1XS1oqL89opfnbLl8WnZY1O1uJx.jpg', '/5Wy0XBrh7z3nVYHcOSanwp4FHIX.jpg',
+  '/pHkKbud4Dn0D0vBKMJBN8CCGJ6S.jpg', '/z1p34vh7dEOnLDmyCrlUVLuoDzd.jpg',
+];
+
+// Proxy a single TMDB image server-side (no API key needed, avoids hotlink blocking)
+app.get('/api/proxy-img', async function(req, res) {
+  const { path: imgPath } = req.query;
+  if (!imgPath || !imgPath.match(/^\/[a-zA-Z0-9]+\.jpg$/)) {
+    return res.status(400).send('Invalid path');
+  }
+  try {
+    const tmdbUrl = 'https://image.tmdb.org/t/p/w342' + imgPath;
+    const r = await axios.get(tmdbUrl, {
+      responseType: 'arraybuffer',
+      headers: {
+        'Referer': 'https://www.themoviedb.org/',
+        'User-Agent': 'Mozilla/5.0 (compatible; GoodTaste/1.0)',
+      },
+      timeout: 10000,
+    });
+    res.set('Content-Type', r.headers['content-type'] || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(r.data));
+  } catch (e) {
+    res.status(404).send('Not found');
+  }
+});
+
+// Return list of proxied static poster URLs (no API key needed)
+app.get('/api/static-backdrops', function(req, res) {
+  const urls = STATIC_POSTER_PATHS.map(p => '/api/proxy-img?path=' + encodeURIComponent(p));
+  res.json({ posters: urls });
+});
+
 // ─── IMDB LIST IMPORT ─────────────────────────────────────────────────────────
 app.get('/api/imdb-list', async function(req, res) {
   let { url: listUrl, apiKey, tmdbId } = req.query;
@@ -1732,8 +1783,53 @@ function configurePage(existingConfig) {
     "    refreshHeroWithApiKey(state.apiKey);",
     "    renderDefaultCatalogs();",
     "    renderCustomSeasonsList();",
-    "    // Go to page 2 (skip key entry since we have it)",
     "    goTo(2);",
+    "    // Enrich episodes with thumbnails in the background",
+    "    enrichAllEpisodeThumbnails();",
+    "  }",
+    "}",
+    "",
+    "// After loading existing config, fetch episode stills for all shows so thumbnails display",
+    "async function enrichAllEpisodeThumbnails() {",
+    "  if (!state.customSeasons.length || !state.apiKey) return;",
+    "  // Group lists by tmdbId so we only fetch each show once",
+    "  var byShow = {};",
+    "  state.customSeasons.forEach(function(list) {",
+    "    if (!byShow[list.tmdbId]) byShow[list.tmdbId] = [];",
+    "    byShow[list.tmdbId].push(list);",
+    "  });",
+    "  for (var tmdbId in byShow) {",
+    "    try {",
+    "      var r = await fetch('/api/episodes?tmdbId=' + tmdbId + '&apiKey=' + encodeURIComponent(state.apiKey));",
+    "      var d = await r.json();",
+    "      if (!d.episodes || !d.episodes.length) continue;",
+    "      // Build a lookup map: 'season:episode' -> full episode data",
+    "      var epMap = {};",
+    "      d.episodes.forEach(function(ep) { epMap[ep.season + ':' + ep.episode] = ep; });",
+    "      // Enrich each list for this show",
+    "      byShow[tmdbId].forEach(function(list) {",
+    "        // Also update the poster if not stored",
+    "        if (!list.tmdbPoster && d.show && d.show.poster) list.tmdbPoster = d.show.poster;",
+    "        list.episodes = list.episodes.map(function(ep) {",
+    "          var key = ep.season + ':' + ep.episode;",
+    "          var full = epMap[key];",
+    "          if (full) {",
+    "            return {",
+    "              season: ep.season, episode: ep.episode,",
+    "              name: full.name || ep.name,",
+    "              overview: full.overview || ep.overview || '',",
+    "              still: full.still || ep.still || null,",
+    "              vote_average: full.vote_average || ep.vote_average || 0,",
+    "              vote_count: full.vote_count || ep.vote_count || 0,",
+    "              air_date: full.air_date || ep.air_date || '',",
+    "            };",
+    "          }",
+    "          return ep;",
+    "        });",
+    "        // Re-render this list's episodes now that we have stills",
+    "        renderListEpisodes(list.listId);",
+    "      });",
+    "    } catch(e) { /* skip show on error */ }",
     "  }",
     "}",
     "",
@@ -1755,41 +1851,34 @@ function configurePage(existingConfig) {
     "",
 
     // ── Hero background — all 30 posters, two complete rows ──
-    "var HERO_POSTERS = [",
-    "  '/pB8BM7pdSp6B6Ih7QZ4DrQ3PmJK.jpg','/hOSeglBprJKjt0e6bSDkBJKk4cn.jpg','/qNBAXBIQlnOThrVvA6mA2B5ggkl.jpg','/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg',",
-    "  '/gPbM0MK8CP8A174rmUwGsADNYKD.jpg','/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg','/lZ8NkZQoKjhsIxcnuKHqVs7J49.jpg','/uXDfjJbdP4ijW5hWSBrPu1LjPD.jpg',",
-    "  '/kqjL17yufvn9OVLyXYpvtyrFfak.jpg','/rktDFPbfHfUbArZ6OOOKsXcv0Bm.jpg','/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg','/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg',",
-    "  '/vZloFAK7NmvMGKE7VkF5UHaz0I.jpg','/AkE13D8b8wWODSMScSYkjKlVF7z.jpg','/ggFHVNu6YYI5L9pCfOacjizRGt.jpg','/t6HIqrRAclMCA60NsSmeqe9RmNV.jpg',",
-    "  '/jpurJ9jAcLCYjgHHfYF32m3zJYm.jpg','/vxnx4svEVHkLyPGEW6r8QDxPeMF.jpg','/kve20tXygoszhtaLAQ5sqc3q3Ca.jpg','/rSPw7tgCH9c6NqICZef4kZjFOQ5.jpg',",
-    "  '/pFlaoHTZeyNkG83vxsAJiGzfSsa.jpg','/udDclJoHjfjb8Ekgsd4FDteOkCU.jpg','/jAHkz9HZf6pLc3gMQ6rPqmUO8dl.jpg','/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg',",
-    "  '/fOy2Jurz9k6RnJnMbD0eMPKEezr.jpg','/sRLC052ionqa9y2y4RKNqmGXAYR.jpg','/1XS1oqL89opfnbLl8WnZY1O1uJx.jpg','/5Wy0XBrh7z3nVYHcOSanwp4FHIX.jpg',",
-    "  '/pHkKbud4Dn0D0vBKMJBN8CCGJ6S.jpg','/z1p34vh7dEOnLDmyCrlUVLuoDzd.jpg'",
-    "];",
-    "var TMDB_IMG_MD_CLIENT = 'https://image.tmdb.org/t/p/w342';",
-    "",
-    "function loadHeroBackgrounds() {",
+    // Hero background: fetch proxied URLs from server so TMDB images always load",
+    "async function loadHeroBackgrounds() {",
     "  var row1 = document.getElementById('hero-bg-row1');",
     "  var row2 = document.getElementById('hero-bg-row2');",
     "  if (!row1 || !row2) return;",
-    "  // Use all 30 posters split evenly across two rows",
-    "  var half = Math.ceil(HERO_POSTERS.length / 2);",
-    "  var set1 = HERO_POSTERS.slice(0, half);",
-    "  var set2 = HERO_POSTERS.slice(half);",
-    "  // Duplicate each set so the scroll loop is seamless",
-    "  function makeItems(arr) {",
-    "    return arr.concat(arr).map(function(p) {",
-    "      return '<div class=\"hero-bg-item\"><img src=\"' + TMDB_IMG_MD_CLIENT + p + '\" alt=\"\" loading=\"lazy\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
-    "    }).join('');",
-    "  }",
-    "  row1.innerHTML = makeItems(set1);",
-    "  row2.innerHTML = makeItems(set2);",
+    "  try {",
+    "    var r = await fetch('/api/static-backdrops');",
+    "    var d = await r.json();",
+    "    var posters = d.posters || [];",
+    "    if (!posters.length) return;",
+    "    var half = Math.ceil(posters.length / 2);",
+    "    var set1 = posters.slice(0, half);",
+    "    var set2 = posters.slice(half);",
+    "    function makeItems(arr) {",
+    "      return arr.concat(arr).map(function(src) {",
+    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
+    "      }).join('');",
+    "    }",
+    "    row1.innerHTML = makeItems(set1);",
+    "    row2.innerHTML = makeItems(set2);",
+    "  } catch(e) { /* silent fail */ }",
     "}",
     "",
     "async function refreshHeroWithApiKey(apiKey) {",
     "  try {",
     "    var r = await fetch('/api/hero-backdrops?apiKey=' + encodeURIComponent(apiKey));",
     "    var d = await r.json();",
-    "    if (!d.backdrops || d.backdrops.length < 8) return;",
+    "    if (!d.backdrops || d.backdrops.length < 4) return;",
     "    var row1 = document.getElementById('hero-bg-row1');",
     "    var row2 = document.getElementById('hero-bg-row2');",
     "    if (!row1 || !row2) return;",
@@ -1797,13 +1886,14 @@ function configurePage(existingConfig) {
     "    var half = Math.ceil(all.length / 2);",
     "    function makeFromBackdrops(arr) {",
     "      return arr.concat(arr).map(function(b) {",
+    "        // Use poster (portrait) for the skewed wall — better aspect ratio",
     "        var src = b.poster || b.backdrop;",
-    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" loading=\"lazy\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
+    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
     "      }).join('');",
     "    }",
     "    row1.innerHTML = makeFromBackdrops(all.slice(0, half));",
     "    row2.innerHTML = makeFromBackdrops(all.slice(half));",
-    "  } catch(e) { /* silent fail */ }",
+    "  } catch(e) { /* silent fail, static stays */ }",
     "}",
     "",
 
