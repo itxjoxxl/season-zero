@@ -265,11 +265,13 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
         const prefix  = list.prefix || '\u2728';
         const label   = list.label  || 'Curated';
         const epCount = (list.episodes || []).length;
+        // Resolve poster: custom URL > banner-generated (passed as posterUrl) > TMDB default
+        const posterUrl = list.posterUrl || (series.poster_path ? TMDB_IMG_MD + series.poster_path : null);
         return {
           id:          'bestof:' + list.listId,
           type:        'series',
           name:        prefix + ' ' + label + ' \u2014 ' + (series.name || 'Unknown'),
-          poster:      series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
+          poster:      posterUrl,
           background:  series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
           description: label + ': ' + epCount + ' episode' + (epCount !== 1 ? 's' : '') + ' from ' + (series.name || 'Unknown') + '.\n\n' + (series.overview || ''),
           releaseInfo: series.first_air_date ? series.first_air_date.substring(0, 4) : '',
@@ -394,6 +396,37 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
         } catch (e) { /* skip */ }
       }
       return res.json({ metas });
+    }
+
+    if (catDef.path === '_bestof_') {
+      const bestofListId = catDef.bestofListId;
+      const customSeasons = cfg.customSeasons || [];
+      const list = customSeasons.find(l => l.listId === bestofListId);
+      if (!list || !list.episodes || !list.episodes.length) return res.json({ metas: [] });
+      try {
+        const series = await getSeries(list.tmdbId, apiKey);
+        const allEps = await getAllEpisodes(list.tmdbId, apiKey, series.number_of_seasons || 1);
+        const bestOfEps = [];
+        for (const ref of list.episodes) {
+          const ep = allEps.find(e => e.season === ref.season && e.episode === ref.episode);
+          if (ep) bestOfEps.push(ep);
+        }
+        const posterUrl = list.posterUrl || (series.poster_path ? TMDB_IMG_MD + series.poster_path : null);
+        const meta = {
+          id: 'bestof:' + bestofListId, type: 'series',
+          name: (list.prefix || '\u2728') + ' ' + (list.label || 'Curated') + ' \u2014 ' + series.name,
+          poster: posterUrl,
+          background: series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+          description: (list.label || 'Curated') + ': ' + bestOfEps.length + ' episodes from ' + series.name,
+          releaseInfo: series.first_air_date ? series.first_air_date.substring(0, 4) : '',
+          imdbRating: series.vote_average ? series.vote_average.toFixed(1) : null,
+          genres: (series.genres || []).map(g => g.name),
+        };
+        return res.json({ metas: [meta] });
+      } catch (e) {
+        console.error('[bestof catalog item]', e.message);
+        return res.json({ metas: [] });
+      }
     }
 
     if (catDef.path === '_custom_items_') {
@@ -592,22 +625,46 @@ app.get('/api/hero-backdrops', async function(req, res) {
 // ─── STATIC HERO BACKDROPS (no API key needed, proxied server-side) ──────────
 // These are real TMDB poster paths for popular/timeless titles.
 // We proxy them server-side so the browser never hotlinks TMDB directly.
-const STATIC_POSTER_PATHS = [
-  '/pB8BM7pdSp6B6Ih7QZ4DrQ3PmJK.jpg','/hOSeglBprJKjt0e6bSDkBJKk4cn.jpg',
-  '/qNBAXBIQlnOThrVvA6mA2B5ggkl.jpg','/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg',
-  '/gPbM0MK8CP8A174rmUwGsADNYKD.jpg','/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg',
-  '/lZ8NkZQoKjhsIxcnuKHqVs7J49.jpg', '/uXDfjJbdP4ijW5hWSBrPu1LjPD.jpg',
-  '/kqjL17yufvn9OVLyXYpvtyrFfak.jpg','/rktDFPbfHfUbArZ6OOOKsXcv0Bm.jpg',
-  '/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg','/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg',
-  '/vZloFAK7NmvMGKE7VkF5UHaz0I.jpg', '/AkE13D8b8wWODSMScSYkjKlVF7z.jpg',
-  '/ggFHVNu6YYI5L9pCfOacjizRGt.jpg', '/t6HIqrRAclMCA60NsSmeqe9RmNV.jpg',
-  '/jpurJ9jAcLCYjgHHfYF32m3zJYm.jpg','/vxnx4svEVHkLyPGEW6r8QDxPeMF.jpg',
-  '/kve20tXygoszhtaLAQ5sqc3q3Ca.jpg','/rSPw7tgCH9c6NqICZef4kZjFOQ5.jpg',
-  '/pFlaoHTZeyNkG83vxsAJiGzfSsa.jpg','/udDclJoHjfjb8Ekgsd4FDteOkCU.jpg',
-  '/jAHkz9HZf6pLc3gMQ6rPqmUO8dl.jpg', '/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg',
-  '/fOy2Jurz9k6RnJnMbD0eMPKEezr.jpg', '/sRLC052ionqa9y2y4RKNqmGXAYR.jpg',
-  '/1XS1oqL89opfnbLl8WnZY1O1uJx.jpg', '/5Wy0XBrh7z3nVYHcOSanwp4FHIX.jpg',
-  '/pHkKbud4Dn0D0vBKMJBN8CCGJ6S.jpg', '/z1p34vh7dEOnLDmyCrlUVLuoDzd.jpg',
+// Static poster URLs served from TMDB's public CDN (no API key required for image delivery)
+// Using highly-popular titles whose poster hashes are stable long-term
+const STATIC_POSTER_URLS = [
+  'https://image.tmdb.org/t/p/w342/d5NXSklXo0qyIYkgV94XAgMIckC.jpg', // Breaking Bad
+  'https://image.tmdb.org/t/p/w342/ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg', // The Wire
+  'https://image.tmdb.org/t/p/w342/7uoiKOEjkDMJQ5ND7aFYnv7FPXH.jpg', // Sopranos
+  'https://image.tmdb.org/t/p/w342/hUu9zyZmKuTFqHzsvTBWBlCPyOy.jpg', // Game of Thrones
+  'https://image.tmdb.org/t/p/w342/49WJfeN0moxb9IPfGn8AIqMGskD.jpg', // Succession
+  'https://image.tmdb.org/t/p/w342/56v2KjBlU4XaOv9rVYEQypROD7P.jpg', // The Bear
+  'https://image.tmdb.org/t/p/w342/2Xvj0HzOihoWvuCvbdAGtJWO1Qv.jpg', // Chernobyl
+  'https://image.tmdb.org/t/p/w342/loRmRzQXZeqG78TqZuyvSlEQfZb.jpg', // Better Call Saul
+  'https://image.tmdb.org/t/p/w342/5MkFUqGHsMpPJJRXeDkR9qdtqPd.jpg', // True Detective
+  'https://image.tmdb.org/t/p/w342/q2VIiGicGCdCFoGNvuLOSbMVCOC.jpg', // Severance
+  'https://image.tmdb.org/t/p/w342/9PFonBhy4cQy7Jz20NpMygczOkv.jpg', // Squid Game
+  'https://image.tmdb.org/t/p/w342/ggFHVNu6YYI5L9pCfOacjizRGt.jpg',  // The Last of Us
+  'https://image.tmdb.org/t/p/w342/8Xs20y8gFR0W9u8Yy9NKdpZtSu7.jpg', // Andor
+  'https://image.tmdb.org/t/p/w342/3bhkrj58Vtu7enYsLori8pJkiuA.jpg', // The Godfather
+  'https://image.tmdb.org/t/p/w342/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg', // Parasite
+  'https://image.tmdb.org/t/p/w342/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg', // Interstellar
+  'https://image.tmdb.org/t/p/w342/pB8BM7pdSp6B6Ih7QZ4DrQ3PmJK.jpg', // The Dark Knight
+  'https://image.tmdb.org/t/p/w342/hOSeglBprJKjt0e6bSDkBJKk4cn.jpg', // Inception
+  'https://image.tmdb.org/t/p/w342/qNBAXBIQlnOThrVvA6mA2B5ggkl.jpg', // Pulp Fiction
+  'https://image.tmdb.org/t/p/w342/rktDFPbfHfUbArZ6OOOKsXcv0Bm.jpg', // Oppenheimer
+  'https://image.tmdb.org/t/p/w342/vZloFAK7NmvMGKE7VkF5UHaz0I.jpg',  // No Country for Old Men
+  'https://image.tmdb.org/t/p/w342/kqjL17yufvn9OVLyXYpvtyrFfak.jpg', // Blade Runner 2049
+  'https://image.tmdb.org/t/p/w342/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg', // There Will Be Blood
+  'https://image.tmdb.org/t/p/w342/fOy2Jurz9k6RnJnMbD0eMPKEezr.jpg', // Whiplash
+  'https://image.tmdb.org/t/p/w342/sRLC052ionqa9y2y4RKNqmGXAYR.jpg', // 1917
+  'https://image.tmdb.org/t/p/w342/pFlaoHTZeyNkG83vxsAJiGzfSsa.jpg', // 12 Years a Slave
+  'https://image.tmdb.org/t/p/w342/udDclJoHjfjb8Ekgsd4FDteOkCU.jpg', // Mad Max: Fury Road
+  'https://image.tmdb.org/t/p/w342/jAHkz9HZf6pLc3gMQ6rPqmUO8dl.jpg', // Drive
+  'https://image.tmdb.org/t/p/w342/5Wy0XBrh7z3nVYHcOSanwp4FHIX.jpg', // A Separation
+  'https://image.tmdb.org/t/p/w342/pHkKbud4Dn0D0vBKMJBN8CCGJ6S.jpg', // Moonlight
+  'https://image.tmdb.org/t/p/w342/z1p34vh7dEOnLDmyCrlUVLuoDzd.jpg', // Portrait of a Lady on Fire
+  'https://image.tmdb.org/t/p/w342/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg', // Her
+  'https://image.tmdb.org/t/p/w342/1XS1oqL89opfnbLl8WnZY1O1uJx.jpg', // Arrival
+  'https://image.tmdb.org/t/p/w342/AkE13D8b8wWODSMScSYkjKlVF7z.jpg', // Dune
+  'https://image.tmdb.org/t/p/w342/t6HIqrRAclMCA60NsSmeqe9RmNV.jpg', // The Revenant
+  'https://image.tmdb.org/t/p/w342/jpurJ9jAcLCYjgHHfYF32m3zJYm.jpg', // Ex Machina
+  'https://image.tmdb.org/t/p/w342/vxnx4svEVHkLyPGEW6r8QDxPeMF.jpg', // Midsommar
 ];
 
 // Proxy a single TMDB image server-side (no API key needed, avoids hotlink blocking)
@@ -636,8 +693,7 @@ app.get('/api/proxy-img', async function(req, res) {
 
 // Return list of static poster URLs (direct TMDB CDN — no API key needed for image delivery)
 app.get('/api/static-backdrops', function(req, res) {
-  const urls = STATIC_POSTER_PATHS.map(p => 'https://image.tmdb.org/t/p/w342' + p);
-  res.json({ posters: urls });
+  res.json({ posters: STATIC_POSTER_URLS });
 });
 
 // ─── IMDB LIST IMPORT ─────────────────────────────────────────────────────────
@@ -983,6 +1039,25 @@ app.get('/api/mdblist-catalog', async function(req, res) {
   }
 });
 
+// ─── SERIES LOGO ENDPOINT (for poster customization) ─────────────────────────
+app.get('/api/series-logo', async function(req, res) {
+  const { tmdbId, apiKey } = req.query;
+  if (!tmdbId || !apiKey) return res.status(400).json({ error: 'tmdbId and apiKey required' });
+  try {
+    const data = await tmdb('/tv/' + tmdbId + '/images', apiKey, { include_image_language: 'en,null' });
+    const logos = (data.logos || []).filter(l => l.file_path);
+    const best = logos.sort((a, b) => (b.vote_average || 0) - (a.vote_average || 0))[0];
+    if (best) {
+      return res.json({ logoUrl: 'https://image.tmdb.org/t/p/w500' + best.file_path });
+    }
+    // Fallback: try series backdrop as logo source
+    const seriesData = await tmdb('/tv/' + tmdbId, apiKey);
+    res.json({ logoUrl: null, backdropUrl: seriesData.backdrop_path ? 'https://image.tmdb.org/t/p/w1280' + seriesData.backdrop_path : null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── META ENDPOINTS ───────────────────────────────────────────────────────────
 app.get('/:config/meta/movie/:id.json', async function(req, res) {
   const cfg = parseConfig(req.params.config);
@@ -1042,10 +1117,11 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
       const releaseInfo = series.status === 'Ended' && endYear ? startYear + '-' + endYear : startYear;
       const prefix      = list.prefix || '\u2728';
       const label       = list.label  || 'Curated';
+      const posterUrl   = list.posterUrl || (series.poster_path ? TMDB_IMG_MD + series.poster_path : null);
       return res.json({ meta: {
         id: 'bestof:' + listId, type: 'series',
         name:        prefix + ' ' + label + ' \u2014 ' + series.name,
-        poster:      series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
+        poster:      posterUrl,
         background:  series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
         description: bestOfEps.length + ' episodes \u2014 ' + label + '\n\n' + (series.overview || ''),
         releaseInfo, videos,
@@ -1587,6 +1663,21 @@ function configurePage(existingConfig) {
     .show-rename-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
     .show-rename-prefix { max-width: 70px; font-size: 1.1rem; text-align: center; padding: 9px 10px; }
     .show-rename-label { flex: 1; }
+
+    .poster-customizer { border: 1px solid var(--border); border-radius: 10px; background: var(--bg); padding: 12px 14px; margin-bottom: 14px; }
+    .poster-customizer-label { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-mute); margin-bottom: 8px; }
+    .poster-mode-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 10px; }
+    .poster-mode-tab { padding: 5px 10px; font-size: 0.72rem; font-weight: 600; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--text-mute); cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all var(--transition); }
+    .poster-mode-tab.active { border-color: var(--gold); color: var(--gold); background: var(--gold-dim); }
+    .poster-mode-tab:hover:not(.active) { border-color: var(--border2); color: var(--text-dim); }
+    .poster-mode-panel { display: none; }
+    .poster-mode-panel.active { display: block; }
+    .poster-options-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+    .poster-opt-field { display: flex; flex-direction: column; gap: 4px; }
+    .poster-opt-field label { font-size: 0.68rem; color: var(--text-mute); white-space: nowrap; }
+    .poster-opt-field input[type=color] { width: 36px; height: 28px; border: 1px solid var(--border); border-radius: 5px; background: transparent; cursor: pointer; padding: 2px; }
+    .poster-opt-field input[type=range] { width: 90px; }
+    .poster-opt-field select { font-size: 0.75rem; padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
 
     .add-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); }
     .add-tab { flex: 1; padding: 9px 8px; font-size: 0.73rem; font-weight: 600; text-align: center; cursor: pointer; color: var(--text-mute); background: transparent; border: none; font-family: 'DM Sans', sans-serif; transition: all var(--transition); border-bottom: 2px solid transparent; letter-spacing: 0.03em; }
@@ -2191,13 +2282,14 @@ function configurePage(existingConfig) {
     "}",
     "",
     "function switchAddCatTab(tab) {",
-    "  ['items','tmdb-builder','mdblist','imdb'].forEach(function(t) {",
+    "  ['items','tmdb-builder','mdblist','imdb','bestof'].forEach(function(t) {",
     "    var btn=document.getElementById('add-cat-tab-'+t);",
     "    var panel=document.getElementById('add-cat-panel-'+t);",
     "    if (btn) btn.classList.toggle('active', t===tab);",
     "    if (panel) panel.classList.toggle('active', t===tab);",
     "  });",
     "  if (tab==='tmdb-builder') loadGenresForCustom();",
+    "  if (tab==='bestof') renderBestOfCatalogPicker();",
     "}",
     "",
     "function toggleCustomCatalogForm() {",
@@ -2304,15 +2396,62 @@ function configurePage(existingConfig) {
     "  var type=document.getElementById('cc-new-type').value;",
     "  var genre=document.getElementById('cc-genre').value;",
     "  var sort=document.getElementById('cc-sort').value;",
+    "  // Additional discover filters",
+    "  var minVotes=document.getElementById('cc-min-votes')?document.getElementById('cc-min-votes').value.trim():'';",
+    "  var minYear=document.getElementById('cc-min-year')?document.getElementById('cc-min-year').value.trim():'';",
+    "  var maxYear=document.getElementById('cc-max-year')?document.getElementById('cc-max-year').value.trim():'';",
+    "  var lang=document.getElementById('cc-language')?document.getElementById('cc-language').value.trim():'';",
+    "  var minRating=document.getElementById('cc-min-rating')?document.getElementById('cc-min-rating').value.trim():'';",
+    "  var keyword=document.getElementById('cc-keyword')?document.getElementById('cc-keyword').value.trim():'';",
+    "  var network=document.getElementById('cc-network')?document.getElementById('cc-network').value.trim():'';",
+    "  var region=document.getElementById('cc-region')?document.getElementById('cc-region').value.trim():'';",
+    "  var adult=document.getElementById('cc-adult')?document.getElementById('cc-adult').checked:false;",
     "  if (!name) return;",
-    "  // FIX: strip trailing movie/series/show suffix",
     "  var cleanName = name.replace(/\\s+(movies?|series|shows?)$/i, '').trim() || name;",
     "  var tt=type==='series'?'tv':'movie';",
-    "  var params={sort_by:sort}; if(genre) params.with_genres=genre;",
+    "  var params={sort_by:sort};",
+    "  if(genre) params.with_genres=genre;",
+    "  if(minVotes) params['vote_count.gte']=minVotes;",
+    "  if(minRating) params['vote_average.gte']=minRating;",
+    "  if(lang) params.with_original_language=lang;",
+    "  if(keyword) params.with_keywords=keyword;",
+    "  if(adult) params.include_adult='true';",
+    "  if(type==='movie'){",
+    "    if(minYear) params['primary_release_date.gte']=minYear+'-01-01';",
+    "    if(maxYear) params['primary_release_date.lte']=maxYear+'-12-31';",
+    "    if(region) params.region=region;",
+    "  } else {",
+    "    if(minYear) params['first_air_date.gte']=minYear+'-01-01';",
+    "    if(maxYear) params['first_air_date.lte']=maxYear+'-12-31';",
+    "    if(network) params.with_networks=network;",
+    "  }",
     "  var newCat={id:'custom.'+Date.now(),name:cleanName,type:type,path:'/discover/'+tt,params:params,enabled:true};",
     "  state.customCatalogs.push(newCat);",
     "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
     "  document.getElementById('custom-catalog-form').classList.remove('open');",
+    "  renderUnifiedCatalogList();",
+    "}",
+    "",
+    "function renderBestOfCatalogPicker() {",
+    "  var el=document.getElementById('add-cat-panel-bestof'); if(!el) return;",
+    "  var lists=state.customSeasons;",
+    "  if(!lists.length){el.querySelector('.bestof-pick-list').innerHTML='<div style=\"font-size:0.78rem;color:var(--text-mute);padding:8px 0\">No curated lists yet. Create some in the Lists step.</div>';return;}",
+    "  var alreadyAdded=state.customCatalogs.filter(function(c){return c.path==='_bestof_';}).map(function(c){return c.bestofListId;});",
+    "  el.querySelector('.bestof-pick-list').innerHTML=lists.map(function(list){",
+    "    var added=alreadyAdded.indexOf(list.listId)!==-1;",
+    "    var ph=list.posterUrl||list.tmdbPoster;",
+    "    var img=ph?'<img src=\"'+ph+'\" style=\"width:28px;height:42px;object-fit:cover;border-radius:4px;flex-shrink:0\" loading=\"lazy\"/>':'<div style=\"width:28px;height:42px;background:var(--surface);border-radius:4px;flex-shrink:0\"></div>';",
+    "    var name=esc((list.label||'Best Of')+' \u2014 '+list.tmdbName);",
+    "    return '<div class=\"cat-search-result'+(added?' cat-search-added':'')+'\" style=\"cursor:'+(added?'default':'pointer')+'\" onclick=\"'+(added?'':\"addBestOfCatalog('\" + list.listId + \"')\")+'\">'+img+'<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.82rem;font-weight:600;color:var(--text)\">'+name+'</div><div style=\"font-size:0.7rem;color:var(--text-mute)\">'+list.episodes.length+' ep'+(list.episodes.length!==1?'s':'')+'</div></div><div style=\"font-size:0.75rem;color:'+(added?'var(--gold)':'var(--text-mute)')+'\">'+(added?'&#10003; Added':'+ Add')+'</div></div>';",
+    "  }).join('');",
+    "}",
+    "function addBestOfCatalog(listId) {",
+    "  var list=state.customSeasons.find(function(l){return l.listId===listId;}); if(!list) return;",
+    "  var name=(list.label||'Best Of')+' \u2014 '+list.tmdbName;",
+    "  var newCat={id:'bestofcat.'+Date.now(),name:name,type:'series',path:'_bestof_',bestofListId:listId,enabled:true};",
+    "  state.customCatalogs.push(newCat);",
+    "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
+    "  renderBestOfCatalogPicker();",
     "  renderUnifiedCatalogList();",
     "}",
     "",
@@ -2465,7 +2604,7 @@ function configurePage(existingConfig) {
     "",
     "function addShowToList(tmdbId, name, poster) {",
     "  var listId=uid();",
-    "  state.customSeasons.push({ listId:listId, tmdbId:String(tmdbId), tmdbName:name, tmdbPoster:poster, label:'Best Of', prefix:'\u2728', episodes:[] });",
+    "  state.customSeasons.push({ listId:listId, tmdbId:String(tmdbId), tmdbName:name, tmdbPoster:poster, label:'Best Of', prefix:'\u2728', posterUrl:null, episodes:[] });",
     "  document.getElementById('search-results').classList.remove('visible');",
     "  document.getElementById('series-search').value='';",
     "  renderCustomSeasonsList();",
@@ -2520,23 +2659,262 @@ function configurePage(existingConfig) {
     "  if (!state.customSeasons.length) { el.innerHTML='<div class=\"empty-state\">No shows yet. Search above to get started.</div>'; return; }",
     "  el.innerHTML=state.customSeasons.map(function(list){",
     "    var tid=list.listId;",
-    "    var ph=list.tmdbPoster?'<img class=\"show-poster\" src=\"'+list.tmdbPoster+'\" alt=\"\" loading=\"lazy\"/>':'<div class=\"show-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#128250;</div>';",
+    "    var effectivePoster=list.posterUrl||list.tmdbPoster||null;",
+    "    var ph=effectivePoster?'<img class=\"show-poster\" src=\"'+effectivePoster+'\" alt=\"\" loading=\"lazy\"/>':'<div class=\"show-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#128250;</div>';",
     "    var displayName=(list.prefix||'\u2728')+' '+(list.label||'Best Of')+' \u2014 '+list.tmdbName;",
     "    var hasCnt=list.episodes.length>0;",
+    "    var posterMode=list.posterMode||'default';",
+    "    var bannerPos=list.bannerPos||'bottom';",
+    "    var bannerColor=list.bannerColor||'#000000';",
+    "    var bannerOpacity=list.bannerOpacity!=null?list.bannerOpacity:0.75;",
+    "    var bannerTextColor=list.bannerTextColor||'#ffffff';",
+    "    var customPosterUrl=list.posterUrl||'';",
     "    return '<div class=\"show-card\" id=\"show-'+tid+'\">'+",
     "      '<div class=\"show-card-header\">'+ph+'<div class=\"show-card-info\"><div class=\"show-card-name\" id=\"show-name-display-'+tid+'\">'+esc(displayName)+'</div><div class=\"show-card-sub\">'+esc(list.tmdbName)+'</div></div>'+'<div class=\"show-card-actions\"><span class=\"ep-count-badge'+(hasCnt?' has-eps':'')+' \" id=\"ep-count-'+tid+'\">'+list.episodes.length+' ep'+(list.episodes.length!==1?'s':'')+'</span><button class=\"btn btn-ghost btn-sm\" onclick=\"toggleShowCard(\\'' + tid + '\\')\" style=\"min-width:32px\">\u22ef</button></div></div>'+",
     "      '<div class=\"show-ep-body\">'+",
     "        '<div style=\"padding:14px 16px 0;\">'+",
     "          '<div class=\"show-rename-row\">'+'<input class=\"show-rename-prefix\" type=\"text\" value=\"'+esc(list.prefix||'\u2728')+'\" placeholder=\"\u2728\" oninput=\"updateListMeta(\\'' + tid + '\\',\\'prefix\\',this.value)\" title=\"Prefix emoji\"/>'+'<input class=\"show-rename-label\" type=\"text\" value=\"'+esc(list.label||'Best Of')+'\" placeholder=\"List name\" oninput=\"updateListMeta(\\'' + tid + '\\',\\'label\\',this.value)\"/>'+'<button class=\"btn btn-danger btn-sm\" onclick=\"removeList(\\'' + tid + '\\')\" title=\"Delete\">\u00d7</button></div>'+",
+    "          '<div class=\"poster-customizer\">'+",
+    "            '<div class=\"poster-customizer-label\">Poster Style</div>'+",
+    "            '<div class=\"poster-mode-tabs\">'+",
+    "              '<button class=\"poster-mode-tab'+(posterMode==='default'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'default\\')\">Default</button>'+",
+    "              '<button class=\"poster-mode-tab'+(posterMode==='banner'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'banner\\')\">Banner</button>'+",
+    "              '<button class=\"poster-mode-tab'+(posterMode==='logo'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'logo\\')\">Logo</button>'+",
+    "              '<button class=\"poster-mode-tab'+(posterMode==='url'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'url\\')\">Custom URL</button>'+",
+    "            '</div>'+",
+    "            '<div class=\"poster-mode-panel'+(posterMode==='default'?' active':'')+'\" id=\"pmp-default-'+tid+'\">'+",
+    "              '<div style=\"font-size:0.72rem;color:var(--text-mute)\">Uses the original TMDB series poster.</div>'+",
+    "            '</div>'+",
+    "            '<div class=\"poster-mode-panel'+(posterMode==='banner'?' active':'')+'\" id=\"pmp-banner-'+tid+'\">'+",
+    "              '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:8px\">Overlay a title banner on the series poster.</div>'+",
+    "              '<div class=\"poster-options-row\">'+",
+    "                '<div class=\"poster-opt-field\"><label>Position</label><select onchange=\"updateBannerOption(\\'' + tid + '\\')\"><option value=\"top\"'+(bannerPos==='top'?' selected':'')+'>Top</option><option value=\"bottom\"'+(bannerPos==='bottom'?' selected':'')+'>Bottom</option></select></div>'+",
+    "                '<div class=\"poster-opt-field\"><label>Bar Color</label><input type=\"color\" value=\"'+bannerColor+'\" onchange=\"updateBannerOption(\\'' + tid + '\\')\" id=\"bcolor-'+tid+'\"/></div>'+",
+    "                '<div class=\"poster-opt-field\"><label>Opacity '+Math.round(bannerOpacity*100)+'%</label><input type=\"range\" min=\"0\" max=\"1\" step=\"0.05\" value=\"'+bannerOpacity+'\" oninput=\"updateBannerOpacityLabel(\\'' + tid + '\\',this);updateBannerOption(\\'' + tid + '\\')\"/></div>'+",
+    "                '<div class=\"poster-opt-field\"><label>Text Color</label><input type=\"color\" value=\"'+bannerTextColor+'\" onchange=\"updateBannerOption(\\'' + tid + '\\')\" id=\"btcolor-'+tid+'\"/></div>'+",
+    "              '</div>'+",
+    "              '<button class=\"btn btn-primary btn-sm\" style=\"margin-top:8px\" onclick=\"generateBannerPoster(\\'' + tid + '\\')\">\u270f Generate Poster</button>'+",
+    "              '<span id=\"banner-status-'+tid+'\" style=\"font-size:0.72rem;color:var(--text-mute);margin-left:8px\"></span>'+",
+    "            '</div>'+",
+    "            '<div class=\"poster-mode-panel'+(posterMode==='logo'?' active':'')+'\" id=\"pmp-logo-'+tid+'\">'+",
+    "              '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:8px\">Series logo on a dark background with your list title below.</div>'+",
+    "              '<div class=\"poster-options-row\">'+",
+    "                '<div class=\"poster-opt-field\"><label>Background</label><input type=\"color\" value=\"'+(list.logoBgColor||'#111111')+'\" onchange=\"updateListMeta(\\'' + tid + '\\',\\'logoBgColor\\',this.value)\" /></div>'+",
+    "                '<div class=\"poster-opt-field\"><label>Text Color</label><input type=\"color\" value=\"'+(list.logoTextColor||'#ffffff')+'\" onchange=\"updateListMeta(\\'' + tid + '\\',\\'logoTextColor\\',this.value)\" /></div>'+",
+    "              '</div>'+",
+    "              '<button class=\"btn btn-primary btn-sm\" style=\"margin-top:8px\" onclick=\"generateLogoPoster(\\'' + tid + '\\')\">\u270f Generate Poster</button>'+",
+    "              '<span id=\"logo-status-'+tid+'\" style=\"font-size:0.72rem;color:var(--text-mute);margin-left:8px\"></span>'+",
+    "            '</div>'+",
+    "            '<div class=\"poster-mode-panel'+(posterMode==='url'?' active':'')+'\" id=\"pmp-url-'+tid+'\">'+",
+    "              '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:6px\">Paste any direct image URL to use as the poster.</div>'+",
+    "              '<div style=\"display:flex;gap:6px\"><input type=\"text\" id=\"custom-poster-url-'+tid+'\" placeholder=\"https://example.com/poster.jpg\" value=\"'+esc(customPosterUrl)+'\" style=\"flex:1;font-size:0.8rem\"/><button class=\"btn btn-primary btn-sm\" onclick=\"applyCustomPosterUrl(\\'' + tid + '\\')\">\u2713 Apply</button></div>'+",
+    "            '</div>'+",
+    "          '</div>'+",
     "        '</div>'+",
     "        '<div class=\"add-tabs\">'+'<button class=\"add-tab active\" id=\"add-tab-picker-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'picker\\')\">Browse</button>'+'<button class=\"add-tab\" id=\"add-tab-imdb-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'imdb\\')\">IMDB List</button>'+'<button class=\"add-tab\" id=\"add-tab-paste-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'paste\\')\">Paste</button></div>'+",
-    "        '<div class=\"add-panel active\" id=\"add-panel-picker-'+tid+'\">'+'<button class=\"btn btn-ghost btn-sm\" style=\"width:100%\" onclick=\"openModal(\\'' + tid + '\\')\">\u2318 Browse &amp; select episodes\u2026</button></div>'+",
+    "        '<div class=\"add-panel active\" id=\"add-panel-picker-'+tid+'\">'+'<button class=\"btn btn-ghost btn-sm\" style=\"width:100%\" onclick=\"openModal(\\'' + tid + '\\')\">&#8984; Browse &amp; select episodes\u2026</button></div>'+",
     "        '<div class=\"add-panel\" id=\"add-panel-imdb-'+tid+'\">'+'<div class=\"import-row\"><input type=\"text\" id=\"imdb-url-'+tid+'\" placeholder=\"https://www.imdb.com/list/ls086682535/\" onkeydown=\"if(event.key===\\'Enter\\') importImdbList(\\'' + tid + '\\')\"/><button class=\"btn btn-ghost btn-sm\" id=\"imdb-btn-'+tid+'\" onclick=\"importImdbList(\\'' + tid + '\\')\">\u2193 Import</button></div><div class=\"import-status\" id=\"imdb-status-'+tid+'\"></div></div>'+",
     "        '<div class=\"add-panel\" id=\"add-panel-paste-'+tid+'\">'+'<p class=\"paste-hint\">Accepts S01E01, s1e1, 1x01 formats. One per line or space-separated.</p>'+'<textarea id=\"paste-input-'+tid+'\" placeholder=\"S01E01\\nS01E05\\nS02E03\"></textarea>'+'<div class=\"paste-actions\"><button class=\"btn btn-primary btn-sm\" onclick=\"applyPaste(\\'' + tid + '\\')\">\u2713 Add Episodes</button><span class=\"paste-status\" id=\"paste-status-'+tid+'\"></span></div></div>'+",
     "        '<div style=\"padding:0 16px 16px;\">'+'<ul class=\"ep-list mt-2\" id=\"eplist-'+tid+'\"><li class=\"ep-list-empty\">No episodes yet. Use the tabs above to add some.</li></ul></div>'+",
     "      '</div>'+'</div>';",
     "  }).join('');",
     "  state.customSeasons.forEach(function(list){ renderListEpisodes(list.listId); initDragSort(list.listId); });",
+    "}",
+    "",
+    "",
+    "function setPosterMode(listId, mode) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  list.posterMode=mode;",
+    "  ['default','banner','logo','url'].forEach(function(m){",
+    "    var tab=document.querySelector('#show-'+listId+' .poster-mode-tab[onclick*=\"\\''+m+'\\'\"]');",
+    "    var panel=document.getElementById('pmp-'+m+'-'+listId);",
+    "    if(tab) tab.classList.toggle('active',m===mode);",
+    "    if(panel) panel.classList.toggle('active',m===mode);",
+    "  });",
+    "  if(mode==='default'){",
+    "    list.posterUrl=null;",
+    "    updateShowPosterThumb(listId);",
+    "  }",
+    "}",
+    "",
+    "function updateBannerOpacityLabel(listId, input) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  list.bannerOpacity=parseFloat(input.value);",
+    "  var label=input.parentElement&&input.parentElement.querySelector('label');",
+    "  if(label) label.textContent='Opacity '+Math.round(list.bannerOpacity*100)+'%';",
+    "}",
+    "",
+    "function updateBannerOption(listId) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  var panel=document.getElementById('pmp-banner-'+listId); if(!panel) return;",
+    "  var sel=panel.querySelector('select'); if(sel) list.bannerPos=sel.value;",
+    "  var bcolor=document.getElementById('bcolor-'+listId); if(bcolor) list.bannerColor=bcolor.value;",
+    "  var btcolor=document.getElementById('btcolor-'+listId); if(btcolor) list.bannerTextColor=btcolor.value;",
+    "}",
+    "",
+    "async function generateBannerPoster(listId) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  updateBannerOption(listId);",
+    "  var statusEl=document.getElementById('banner-status-'+listId);",
+    "  if(statusEl) statusEl.textContent='Generating\u2026';",
+    "  var basePoster=list.tmdbPoster||null;",
+    "  if(!basePoster){if(statusEl)statusEl.textContent='No poster available.';return;}",
+    "  var label=(list.label||'Best Of')+' \u2014 '+list.tmdbName;",
+    "  var pos=list.bannerPos||'bottom';",
+    "  var barColor=list.bannerColor||'#000000';",
+    "  var opacity=list.bannerOpacity!=null?list.bannerOpacity:0.75;",
+    "  var textColor=list.bannerTextColor||'#ffffff';",
+    "  try {",
+    "    var dataUrl=await drawBannerPoster(basePoster,label,pos,barColor,opacity,textColor);",
+    "    list.posterUrl=dataUrl;",
+    "    updateShowPosterThumb(listId);",
+    "    if(statusEl)statusEl.textContent='\u2713 Applied';",
+    "    setTimeout(function(){if(statusEl)statusEl.textContent='';},2500);",
+    "  } catch(e) { if(statusEl)statusEl.textContent='Error: '+e.message; }",
+    "}",
+    "",
+    "async function generateLogoPoster(listId) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  var statusEl=document.getElementById('logo-status-'+listId);",
+    "  if(statusEl) statusEl.textContent='Fetching logo\u2026';",
+    "  try {",
+    "    var r=await fetch('/api/series-logo?tmdbId='+list.tmdbId+'&apiKey='+encodeURIComponent(state.apiKey));",
+    "    var d=await r.json();",
+    "    var bgColor=list.logoBgColor||'#111111';",
+    "    var textColor=list.logoTextColor||'#ffffff';",
+    "    var label=(list.label||'Best Of')+' \u2014 '+list.tmdbName;",
+    "    var dataUrl=await drawLogoPoster(d.logoUrl||null,label,bgColor,textColor,list.tmdbName);",
+    "    list.posterUrl=dataUrl;",
+    "    updateShowPosterThumb(listId);",
+    "    if(statusEl)statusEl.textContent='\u2713 Applied';",
+    "    setTimeout(function(){if(statusEl)statusEl.textContent='';},2500);",
+    "  } catch(e) { if(statusEl)statusEl.textContent='Error: '+e.message; }",
+    "}",
+    "",
+    "function applyCustomPosterUrl(listId) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  var inp=document.getElementById('custom-poster-url-'+listId); if(!inp) return;",
+    "  var url=inp.value.trim();",
+    "  list.posterUrl=url||null;",
+    "  updateShowPosterThumb(listId);",
+    "}",
+    "",
+    "function updateShowPosterThumb(listId) {",
+    "  var list=getList(listId); if(!list) return;",
+    "  var header=document.querySelector('#show-'+listId+' .show-card-header');",
+    "  if(!header) return;",
+    "  var effectivePoster=list.posterUrl||list.tmdbPoster||null;",
+    "  var ph=header.querySelector('.show-poster');",
+    "  if(ph&&effectivePoster){",
+    "    if(ph.tagName==='IMG'){ph.src=effectivePoster;}",
+    "    else{var img=document.createElement('img');img.className='show-poster';img.src=effectivePoster;img.alt='';img.loading='lazy';ph.parentNode.replaceChild(img,ph);}",
+    "  }",
+    "}",
+    "",
+    "function loadImageAsDataUrl(src) {",
+    "  return new Promise(function(resolve,reject){",
+    "    var img=new Image();",
+    "    img.crossOrigin='anonymous';",
+    "    img.onload=function(){resolve(img);};",
+    "    img.onerror=function(){reject(new Error('Failed to load image: '+src));};",
+    "    img.src=src;",
+    "  });",
+    "}",
+    "",
+    "async function drawBannerPoster(posterSrc,label,position,barColor,opacity,textColor) {",
+    "  var img=await loadImageAsDataUrl(posterSrc);",
+    "  var W=342,H=513;",
+    "  var canvas=document.createElement('canvas');",
+    "  canvas.width=W; canvas.height=H;",
+    "  var ctx=canvas.getContext('2d');",
+    "  ctx.drawImage(img,0,0,W,H);",
+    "  var barH=Math.round(H*0.14);",
+    "  var barY=position==='top'?0:H-barH;",
+    "  // Parse barColor hex to rgba",
+    "  var r=parseInt(barColor.slice(1,3),16),g=parseInt(barColor.slice(3,5),16),b=parseInt(barColor.slice(5,7),16);",
+    "  ctx.fillStyle='rgba('+r+','+g+','+b+','+opacity+')';",
+    "  ctx.fillRect(0,barY,W,barH);",
+    "  // Draw text",
+    "  var fontSize=Math.round(barH*0.32);",
+    "  ctx.fillStyle=textColor;",
+    "  ctx.font='600 '+fontSize+'px system-ui,sans-serif';",
+    "  ctx.textAlign='center';",
+    "  ctx.textBaseline='middle';",
+    "  // Word wrap if needed",
+    "  var maxWidth=W-24;",
+    "  var words=label.split(' ');",
+    "  var lines=[]; var line='';",
+    "  for(var i=0;i<words.length;i++){",
+    "    var test=(line?line+' ':'')+words[i];",
+    "    if(ctx.measureText(test).width>maxWidth&&line){lines.push(line);line=words[i];}",
+    "    else line=test;",
+    "  }",
+    "  if(line) lines.push(line);",
+    "  var lineH=fontSize*1.2;",
+    "  var totalTextH=lines.length*lineH;",
+    "  var startY=barY+(barH-totalTextH)/2+lineH/2;",
+    "  for(var j=0;j<lines.length;j++){ctx.fillText(lines[j],W/2,startY+j*lineH);}",
+    "  return canvas.toDataURL('image/jpeg',0.92);",
+    "}",
+    "",
+    "async function drawLogoPoster(logoSrc,label,bgColor,textColor,seriesName) {",
+    "  var W=342,H=513;",
+    "  var canvas=document.createElement('canvas');",
+    "  canvas.width=W; canvas.height=H;",
+    "  var ctx=canvas.getContext('2d');",
+    "  // Background",
+    "  ctx.fillStyle=bgColor;",
+    "  ctx.fillRect(0,0,W,H);",
+    "  // Subtle gradient overlay",
+    "  var grad=ctx.createRadialGradient(W/2,H*0.35,10,W/2,H*0.35,W*0.7);",
+    "  grad.addColorStop(0,'rgba(255,255,255,0.07)');",
+    "  grad.addColorStop(1,'rgba(0,0,0,0)');",
+    "  ctx.fillStyle=grad;",
+    "  ctx.fillRect(0,0,W,H);",
+    "  // Logo image centered in upper 60%",
+    "  if(logoSrc){",
+    "    try{",
+    "      var logoImg=await loadImageAsDataUrl(logoSrc);",
+    "      var lW=W-60,lH=Math.round(H*0.25);",
+    "      var scale=Math.min(lW/logoImg.naturalWidth,lH/logoImg.naturalHeight);",
+    "      var dW=logoImg.naturalWidth*scale,dH=logoImg.naturalHeight*scale;",
+    "      ctx.drawImage(logoImg,(W-dW)/2,(H*0.28-dH/2),dW,dH);",
+    "    }catch(e){",
+    "      // fallback: draw series name as big text",
+    "      ctx.fillStyle=textColor;",
+    "      ctx.font='bold '+Math.round(W*0.09)+'px system-ui,sans-serif';",
+    "      ctx.textAlign='center';ctx.textBaseline='middle';",
+    "      ctx.fillText(seriesName,W/2,H*0.32);",
+    "    }",
+    "  } else {",
+    "    ctx.fillStyle=textColor;",
+    "    ctx.font='bold '+Math.round(W*0.09)+'px system-ui,sans-serif';",
+    "    ctx.textAlign='center';ctx.textBaseline='middle';",
+    "    ctx.fillText(seriesName,W/2,H*0.32);",
+    "  }",
+    "  // Divider line",
+    "  ctx.strokeStyle='rgba(255,255,255,0.15)';",
+    "  ctx.lineWidth=1;",
+    "  ctx.beginPath();ctx.moveTo(40,H*0.58);ctx.lineTo(W-40,H*0.58);ctx.stroke();",
+    "  // Label text",
+    "  ctx.fillStyle=textColor;",
+    "  ctx.textAlign='center';ctx.textBaseline='middle';",
+    "  var fontSize=Math.round(W*0.065);",
+    "  ctx.font='600 '+fontSize+'px system-ui,sans-serif';",
+    "  var maxWidth=W-48;",
+    "  var words=label.split(' ');",
+    "  var lines2=[]; var line2='';",
+    "  for(var i=0;i<words.length;i++){",
+    "    var test=(line2?line2+' ':'')+words[i];",
+    "    if(ctx.measureText(test).width>maxWidth&&line2){lines2.push(line2);line2=words[i];}",
+    "    else line2=test;",
+    "  }",
+    "  if(line2) lines2.push(line2);",
+    "  var lineH2=fontSize*1.35;",
+    "  var totalH=lines2.length*lineH2;",
+    "  var startY2=H*0.72-totalH/2+lineH2/2;",
+    "  for(var j=0;j<lines2.length;j++){ctx.fillText(lines2[j],W/2,startY2+j*lineH2);}",
+    "  return canvas.toDataURL('image/jpeg',0.92);",
     "}",
     "",
     "function initDragSort(listId) {",
@@ -2636,7 +3014,7 @@ function configurePage(existingConfig) {
     "function toggleSzeroExpand() { var card = document.getElementById('szero-card'); if (card) card.classList.toggle('expanded'); }",
     "",
     "function buildInstallPage() {",
-    "  var flat=state.customSeasons.map(function(list){ return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'\u2728', episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) }; });",
+    "  var flat=state.customSeasons.map(function(list){ return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'\u2728', posterUrl:list.posterUrl||null, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) }; });",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
     "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
@@ -2809,6 +3187,7 @@ function configurePage(existingConfig) {
             <button class="add-cat-tab" id="add-cat-tab-tmdb-builder" onclick="switchAddCatTab('tmdb-builder')">TMDB Discover</button>
             <button class="add-cat-tab" id="add-cat-tab-mdblist" onclick="switchAddCatTab('mdblist')">MDBList</button>
             <button class="add-cat-tab" id="add-cat-tab-imdb" onclick="switchAddCatTab('imdb')">IMDB</button>
+            <button class="add-cat-tab" id="add-cat-tab-bestof" onclick="switchAddCatTab('bestof')">Best Of Lists</button>
           </div>
           <div class="add-cat-panel active" id="add-cat-panel-items">
             <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Search TMDB to hand-pick specific movies or shows.</div>
@@ -2824,7 +3203,46 @@ function configurePage(existingConfig) {
             <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Build a dynamic catalog from TMDB Discover.</div>
             <div class="form-row">
               <div class="field" style="margin-bottom:0"><label>Genre</label><select id="cc-genre"><option value="">Any Genre</option></select></div>
-              <div class="field" style="margin-bottom:0"><label>Sort By</label><select id="cc-sort"><option value="popularity.desc">Most Popular</option><option value="vote_average.desc">Highest Rated</option><option value="release_date.desc">Newest First</option><option value="revenue.desc">Highest Revenue</option></select></div>
+              <div class="field" style="margin-bottom:0"><label>Sort By</label><select id="cc-sort">
+                <option value="popularity.desc">Most Popular</option>
+                <option value="vote_average.desc">Highest Rated</option>
+                <option value="release_date.desc">Newest First</option>
+                <option value="release_date.asc">Oldest First</option>
+                <option value="revenue.desc">Highest Revenue</option>
+                <option value="primary_release_date.desc">Release Date ↓</option>
+                <option value="original_title.asc">Title A–Z</option>
+                <option value="vote_count.desc">Most Voted</option>
+              </select></div>
+            </div>
+            <div class="form-row" style="margin-top:10px">
+              <div class="field" style="margin-bottom:0"><label>Min Year</label><input type="number" id="cc-min-year" placeholder="e.g. 2010" style="width:90px"/></div>
+              <div class="field" style="margin-bottom:0"><label>Max Year</label><input type="number" id="cc-max-year" placeholder="e.g. 2024" style="width:90px"/></div>
+              <div class="field" style="margin-bottom:0"><label>Min Rating</label><input type="number" id="cc-min-rating" placeholder="e.g. 7.5" step="0.1" min="0" max="10" style="width:80px"/></div>
+              <div class="field" style="margin-bottom:0"><label>Min Votes</label><input type="number" id="cc-min-votes" placeholder="e.g. 100" style="width:90px"/></div>
+            </div>
+            <div class="form-row" style="margin-top:10px">
+              <div class="field" style="margin-bottom:0"><label>Language</label><select id="cc-language">
+                <option value="">Any</option>
+                <option value="en">English</option>
+                <option value="ko">Korean</option>
+                <option value="ja">Japanese</option>
+                <option value="fr">French</option>
+                <option value="es">Spanish</option>
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="pt">Portuguese</option>
+                <option value="zh">Chinese</option>
+                <option value="hi">Hindi</option>
+                <option value="ar">Arabic</option>
+                <option value="ru">Russian</option>
+                <option value="tr">Turkish</option>
+                <option value="th">Thai</option>
+              </select></div>
+              <div class="field" style="margin-bottom:0"><label>Network ID <span style="font-size:0.65rem;color:var(--text-mute)">(TV only)</span></label><input type="text" id="cc-network" placeholder="e.g. 213=Netflix" style="width:130px"/></div>
+              <div class="field" style="margin-bottom:0"><label>Region</label><input type="text" id="cc-region" placeholder="e.g. US" maxlength="2" style="width:60px;text-transform:uppercase"/></div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+              <label style="display:flex;align-items:center;gap:6px;font-size:0.75rem;color:var(--text-mute);cursor:pointer"><input type="checkbox" id="cc-adult"/> Include Adult</label>
             </div>
             <div style="display:flex;gap:8px;margin-top:12px">
               <button class="btn btn-primary btn-sm" onclick="addCustomCatalog()">Add Catalog</button>
@@ -2850,6 +3268,11 @@ function configurePage(existingConfig) {
               <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end"><div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="imdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div><button class="btn btn-primary btn-sm" onclick="addImdbCatalog()">Add</button></div>
               <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7"></div>
             </div>
+            <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
+          </div>
+          <div class="add-cat-panel" id="add-cat-panel-bestof">
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Add one of your curated Best Of lists as a standalone catalog in Stremio.</div>
+            <div class="bestof-pick-list" style="max-height:280px;overflow-y:auto"></div>
             <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
           </div>
         </div>
