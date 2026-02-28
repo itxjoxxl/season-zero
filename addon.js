@@ -152,6 +152,15 @@ function buildManifest(config) {
     return d.enabled;
   });
 
+  // Apply custom ordering if present
+  if (cfg.defaultCatalogOrder && Array.isArray(cfg.defaultCatalogOrder)) {
+    enabledDefaults.sort((a, b) => {
+      const ai = cfg.defaultCatalogOrder.indexOf(a.id);
+      const bi = cfg.defaultCatalogOrder.indexOf(b.id);
+      return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    });
+  }
+
   const customCatalogs = (cfg.customCatalogs || []).filter(c => c.enabled !== false);
   const customSeasons  = cfg.customSeasons || [];
 
@@ -292,18 +301,45 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
     // Handle MDBList-sourced catalogs
     if (catDef.path === '_mdblist_' && catDef.mdblistUrl) {
       const listUrl = String(catDef.mdblistUrl).trim();
-      let fetchUrl = listUrl.endsWith('.json') ? listUrl : listUrl.replace(/\/$/, '') + '.json';
-      const resp = await axios.get(fetchUrl, {
-        headers: { 'Accept': 'application/json', 'User-Agent': 'GoodTaste/1.0' },
-        timeout: 15000,
-      });
-      const raw = Array.isArray(resp.data) ? resp.data : (resp.data && resp.data.items ? resp.data.items : []);
-      const pageItems = raw.slice(skip, skip + 20);
+      const slugMatch = listUrl.match(/mdblist\.com\/(?:lists\/|@?)([^/]+)\/([^/?#]+)/);
+      let ttItems = [];
+
+      async function tryFetchMdb(fetchUrl) {
+        try {
+          const r = await axios.get(fetchUrl, {
+            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (compatible; GoodTaste/1.0)' },
+            timeout: 15000, validateStatus: (s) => s < 500,
+          });
+          if (r.status !== 200) return null;
+          return r;
+        } catch(e) { return null; }
+      }
+
+      let resp = null;
+      if (slugMatch) {
+        const u = slugMatch[1], s = slugMatch[2];
+        for (const c of [`https://mdblist.com/lists/${u}/${s}/json/`, `https://mdblist.com/lists/${u}/${s}.json`]) {
+          resp = await tryFetchMdb(c); if (resp) break;
+        }
+      }
+      if (!resp) {
+        const stripped = listUrl.replace(/\/?$/, '');
+        for (const suf of ['/json/', '.json']) {
+          resp = await tryFetchMdb(stripped + suf); if (resp) break;
+        }
+      }
+
+      if (resp) {
+        const d = resp.data;
+        ttItems = Array.isArray(d) ? d : (Array.isArray(d && d.items) ? d.items : []);
+      }
+
+      const pageItems = ttItems.slice(skip, skip + 20);
       const metas = [];
       for (const item of pageItems) {
-        const imdbId     = item.imdb_id || item.imdbid || null;
-        const itemTmdbId = item.tmdb_id || item.tmdbid || null;
-        const mediatype  = (item.mediatype || item.type || '').toLowerCase();
+        const imdbId     = item.imdb_id || item.imdbid || item.imdb || null;
+        const itemTmdbId = item.tmdb_id || item.tmdbid || item.tmdb || null;
+        const mediatype  = (item.mediatype || item.type || item.media_type || '').toLowerCase();
         const isMovie    = mediatype === 'movie' || mediatype === 'movies';
         try {
           if (itemTmdbId) {
@@ -322,7 +358,25 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
       return res.json({ metas });
     }
 
-    // Handle IMDB list-sourced catalogs (lists and charts)
+    // Handle custom hand-picked item catalogs
+    if (catDef.path === '_custom_items_') {
+      const items = catDef.items || [];
+      const pageItems = items.slice(skip, skip + 20);
+      const metas = [];
+      for (const item of pageItems) {
+        try {
+          if (item.tmdbId && item.itemType) {
+            const isMovie = item.itemType === 'movie';
+            const d = await tmdb((isMovie ? '/movie/' : '/tv/') + item.tmdbId, apiKey);
+            const m = isMovie ? movieToMeta(d) : seriesToMeta(d);
+            if (m.poster) metas.push(m);
+          }
+        } catch(e) { /* skip */ }
+      }
+      return res.json({ metas });
+    }
+
+
     if (catDef.path === '_imdblist_') {
       const listId = catDef.imdbListId;
       const imdbUrl = catDef.imdbUrl;
@@ -447,7 +501,26 @@ app.get('/api/genres', async function(req, res) {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── TMDB CATALOG SEARCH API ──────────────────────────────────────────────────
+// ─── MULTI-TYPE TMDB SEARCH (for custom catalog item picker) ──────────────────
+app.get('/api/search-multi', async function(req, res) {
+  const { q, apiKey, type = 'movie' } = req.query;
+  if (!q || !apiKey) return res.json({ results: [] });
+  try {
+    const tmdbType = type === 'series' ? 'tv' : 'movie';
+    const data = await tmdb('/search/' + tmdbType, apiKey, { query: q });
+    const results = (data.results || []).slice(0, 10).map(s => ({
+      id: s.id,
+      name: tmdbType === 'movie' ? (s.title || s.original_title) : (s.name || s.original_name),
+      poster: s.poster_path ? TMDB_IMG_SM + s.poster_path : null,
+      year: ((tmdbType === 'movie' ? s.release_date : s.first_air_date) || '').substring(0, 4),
+      vote_average: s.vote_average ? s.vote_average.toFixed(1) : '?',
+      type: type,
+    }));
+    res.json({ results });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
 app.get('/api/tmdb-search', async function(req, res) {
   const { q, apiKey, type = 'movie' } = req.query;
   if (!q || !apiKey) return res.json({ results: [] });
@@ -743,27 +816,76 @@ app.get('/api/mdblist-catalog', async function(req, res) {
 
   const urlStr = String(listUrl).trim();
 
+  // Parse username and list slug from MDBList URL
+  // Formats: mdblist.com/lists/username/listname  OR  mdblist.com/@username/listname
+  const slugMatch = urlStr.match(/mdblist\.com\/(?:lists\/|@?)([^/]+)\/([^/?#]+)/);
+
+  async function tryFetch(fetchUrl) {
+    const resp = await axios.get(fetchUrl, {
+      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (compatible; GoodTaste/1.0)' },
+      timeout: 15000,
+      validateStatus: (s) => s < 500,
+    });
+    if (resp.status === 404) return null;
+    return resp;
+  }
+
   try {
-    let fetchUrl = urlStr;
-    if (!fetchUrl.endsWith('.json')) {
-      fetchUrl = fetchUrl.replace(/\/$/, '') + '.json';
+    let raw = [];
+    let listName = '';
+    let resp = null;
+
+    if (slugMatch) {
+      const username = slugMatch[1];
+      const slug = slugMatch[2];
+      // Try several MDBList API formats
+      const candidates = [
+        `https://mdblist.com/lists/${username}/${slug}/json/`,
+        `https://mdblist.com/lists/${username}/${slug}.json`,
+        `https://mdblist.com/@${username}/${slug}/json/`,
+        `https://mdblist.com/lists/${username}/${slug}/`,
+      ];
+      for (const candidate of candidates) {
+        resp = await tryFetch(candidate);
+        if (resp && resp.status === 200) break;
+        resp = null;
+      }
     }
 
-    const resp = await axios.get(fetchUrl, {
-      headers: { 'Accept': 'application/json', 'User-Agent': 'GoodTaste/1.0' },
-      timeout: 15000,
-    });
+    // Fallback: try appending .json or /json/ directly to original URL
+    if (!resp) {
+      const stripped = urlStr.replace(/\/?$/, '');
+      for (const suffix of ['/json/', '.json', '']) {
+        resp = await tryFetch(stripped + suffix);
+        if (resp && resp.status === 200) break;
+        resp = null;
+      }
+    }
 
-    const raw = Array.isArray(resp.data) ? resp.data : (resp.data && resp.data.items ? resp.data.items : []);
-    if (!raw.length) return res.json({ metas: [], count: 0, name: '' });
+    if (!resp) {
+      return res.status(404).json({ error: 'MDBList list not found. Make sure the URL is correct and the list is set to Public.' });
+    }
 
-    const listName = (resp.data && resp.data.name) ? resp.data.name : '';
+    const data = resp.data;
+    if (Array.isArray(data)) {
+      raw = data;
+    } else if (data && Array.isArray(data.items)) {
+      raw = data.items;
+      listName = data.name || '';
+    } else if (data && Array.isArray(data.movies)) {
+      raw = data.movies;
+      listName = data.name || '';
+    } else {
+      return res.json({ metas: [], count: 0, name: '' });
+    }
+
+    if (!raw.length) return res.json({ metas: [], count: 0, name: listName });
 
     const metas = [];
     for (const item of raw.slice(0, 50)) {
-      const imdbId    = item.imdb_id || item.imdbid || null;
-      const itemTmdbId = item.tmdb_id || item.tmdbid || null;
-      const mediatype  = (item.mediatype || item.type || '').toLowerCase();
+      const imdbId     = item.imdb_id || item.imdbid || item.imdb || null;
+      const itemTmdbId = item.tmdb_id || item.tmdbid || item.tmdb || null;
+      const mediatype  = (item.mediatype || item.type || item.media_type || '').toLowerCase();
       const isMovie    = mediatype === 'movie' || mediatype === 'movies';
       const isTv       = mediatype === 'show' || mediatype === 'tv' || mediatype === 'series';
 
@@ -771,13 +893,14 @@ app.get('/api/mdblist-catalog', async function(req, res) {
         if (itemTmdbId && (isMovie || isTv)) {
           const path = isMovie ? '/movie/' + itemTmdbId : '/tv/' + itemTmdbId;
           const d = await tmdb(path, apiKey);
-          metas.push(isMovie ? movieToMeta(d) : seriesToMeta(d));
+          const m = isMovie ? movieToMeta(d) : seriesToMeta(d);
+          if (m.poster) metas.push(m);
         } else if (imdbId) {
           const found = await tmdb('/find/' + imdbId, apiKey, { external_source: 'imdb_id' });
           const mv = (found.movie_results || [])[0];
           const tv = (found.tv_results || [])[0];
-          if (mv) metas.push(movieToMeta(mv));
-          else if (tv) metas.push(seriesToMeta(tv));
+          if (mv) { const m = movieToMeta(mv); if (m.poster) metas.push(m); }
+          else if (tv) { const m = seriesToMeta(tv); if (m.poster) metas.push(m); }
         }
       } catch (e) { /* skip unresolvable */ }
     }
@@ -785,11 +908,7 @@ app.get('/api/mdblist-catalog', async function(req, res) {
     res.json({ metas, count: raw.length, name: listName });
   } catch (e) {
     console.error('[mdblist-catalog]', e.message);
-    // Return a more user-friendly error
-    if (e.response && e.response.status === 404) {
-      return res.status(404).json({ error: 'MDBList URL not found (404). Check the URL is correct and the list is public.' });
-    }
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: 'Failed to fetch MDBList: ' + e.message });
   }
 });
 
@@ -1096,19 +1215,21 @@ function configurePage() {
       overflow: hidden;
       pointer-events: none;
       z-index: 0;
+      display: flex;
+      flex-direction: column;
     }
     .hero-bg-row {
       display: flex;
       gap: 0;
-      height: 52%;
+      flex: 1;
       animation: bgScroll 55s linear infinite;
       will-change: transform;
+      min-height: 0;
     }
     .hero-bg-row.row2 {
-      height: 52%;
       animation-direction: reverse;
       animation-duration: 70s;
-      margin-top: -4%;
+      margin-top: 6px;
     }
     @keyframes bgScroll {
       from { transform: translateX(0); }
@@ -1130,6 +1251,7 @@ function configurePage() {
       opacity: 0;
       transition: opacity 1.2s ease;
       box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+      display: block;
     }
     .hero-bg-item img.loaded { opacity: 0.72; }
     .hero-bg-overlay {
@@ -1138,8 +1260,8 @@ function configurePage() {
       background: linear-gradient(
         to bottom,
         rgba(8,8,8,0.45) 0%,
-        rgba(8,8,8,0.15) 35%,
-        rgba(8,8,8,0.15) 65%,
+        rgba(8,8,8,0.1) 30%,
+        rgba(8,8,8,0.1) 70%,
         rgba(8,8,8,0.98) 100%
       );
       z-index: 1;
@@ -1592,17 +1714,55 @@ function configurePage() {
     .custom-catalog-item-name { font-size: 0.86rem; font-weight: 600; color: var(--text); }
     .custom-catalog-item-sub  { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; font-family: 'DM Mono', monospace; }
 
+    /* Custom catalog expanded editor */
+    .custom-catalog-item.expanded { border-color: var(--gold-border); }
+    .custom-catalog-editor {
+      display: none;
+      border-top: 1px solid var(--border);
+      padding: 12px 14px 14px;
+      background: var(--bg);
+      border-radius: 0 0 10px 10px;
+    }
+    .custom-catalog-item.expanded .custom-catalog-editor { display: block; }
+    .cat-items-list { list-style: none; margin: 8px 0; }
+    .cat-item-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 8px; border-radius: 8px; background: var(--surface2);
+      border: 1px solid var(--border); margin-bottom: 5px;
+    }
+    .cat-item-poster { width: 28px; height: 42px; border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--surface); }
+    .cat-item-info { flex: 1; min-width: 0; }
+    .cat-item-name { font-size: 0.8rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cat-item-sub  { font-size: 0.68rem; color: var(--text-mute); margin-top: 1px; }
+    .cat-item-drag { color: var(--text-mute); font-size: 0.85rem; cursor: grab; padding: 4px; }
+    .cat-item-del  { color: var(--text-mute); cursor: pointer; padding: 4px 5px; border-radius: 4px; transition: color var(--transition); font-size: 0.88rem; }
+    .cat-item-del:hover { color: #e05252; }
+    .cat-item-row.dragging { opacity: 0.35; }
+    .cat-item-row.drag-over-item { border-color: var(--gold); background: var(--gold-dim); }
+
+    /* Items search results inside editor */
+    .cat-search-result {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 10px; border-radius: 8px; cursor: pointer;
+      transition: background var(--transition);
+    }
+    .cat-search-result:hover { background: var(--surface2); }
+    .cat-search-result-poster { width: 28px; height: 42px; border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--surface2); }
+
     /* cc two-step workflow */
     .cc-step { display: none; }
     .cc-step.active { display: block; }
 
     /* Custom catalog drag-reorder */
-    .custom-catalog-item {
-      cursor: grab;
-    }
-    .custom-catalog-item.dragging { opacity: 0.35; }
+    .custom-catalog-item { cursor: default; }
+    .custom-catalog-item.dragging-cat { opacity: 0.35; }
     .custom-catalog-item.drag-over-cat { border-color: var(--gold); background: var(--gold-dim); }
     .cat-drag-handle { color: var(--text-mute); font-size: 0.9rem; cursor: grab; padding: 4px 6px 4px 0; flex-shrink: 0; }
+
+    /* Default catalog drag reorder */
+    .catalog-row.dragging-def { opacity: 0.35; }
+    .catalog-row.drag-over-def { border-color: var(--gold); background: var(--gold-dim); }
+    .catalog-drag-handle { color: var(--text-mute); font-size: 0.9rem; cursor: grab; padding: 4px 6px 4px 0; flex-shrink: 0; }
 
     /* Add catalog tabs */
     .add-cat-tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 14px; overflow-x: auto; }
@@ -1867,7 +2027,7 @@ function configurePage() {
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
     "var state = {",
     "  apiKey: '', topN: 20, showAutoSeason: false,",
-    "  customSeasons: [], catalogEnabled: {}, catalogNames: {}, customCatalogs: []",
+    "  customSeasons: [], catalogEnabled: {}, catalogNames: {}, customCatalogs: [], defaultCatalogOrder: null",
     "};",
     "var modalData = { listId: null, tmdbId: null, allEpisodes: [], filteredSeason: 'all', selected: new Set() };",
     "var genreCache = { movie: null, tv: null };",
@@ -1912,7 +2072,7 @@ function configurePage() {
     "  var set2 = HERO_POSTERS.slice(half);",
     "  function makeItems(arr) {",
     "    return arr.concat(arr).map(function(p) {",
-    "      return '<div class=\"hero-bg-item\"><img src=\"' + TMDB_IMG_MD_CLIENT + p + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\" loading=\"lazy\"/></div>';",
+    "      return '<div class=\"hero-bg-item\"><img src=\"' + TMDB_IMG_MD_CLIENT + p + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
     "    }).join('');",
     "  }",
     "  row1.innerHTML = makeItems(set1);",
@@ -1935,7 +2095,7 @@ function configurePage() {
     "    function makeFromBackdrops(arr) {",
     "      return arr.concat(arr).map(function(b) {",
     "        var src = b.poster || b.backdrop;",
-    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\" loading=\"lazy\"/></div>';",
+    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
     "      }).join('');",
     "    }",
     "    row1.innerHTML = makeFromBackdrops(all.slice(0, half));",
@@ -2027,34 +2187,68 @@ function configurePage() {
     "",
 
     // ── Catalog UI ──
+    "function initDefaultOrder() {",
+    "  if (!state.defaultCatalogOrder) {",
+    "    state.defaultCatalogOrder = DEFAULT_CATALOGS.map(function(c){ return c.id; });",
+    "  }",
+    "}",
     "function renderDefaultCatalogs() {",
-    "  ['movie','series'].forEach(function(type) {",
-    "    var el = document.getElementById('catalog-defaults-'+type);",
-    "    var cats = DEFAULT_CATALOGS.filter(function(c){ return c.type===type; });",
-    "    el.innerHTML = cats.map(function(c) {",
-    "      var checked = state.catalogEnabled[c.id]!==undefined ? state.catalogEnabled[c.id] : c.enabled;",
-    "      var displayName = state.catalogNames[c.id] || c.name;",
-    "      return '<div class=\"catalog-row\">'+",
-    "        '<div class=\"catalog-row-info\">'+",
-    "          '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(displayName)+'\" placeholder=\"'+esc(c.name)+'\" oninput=\"setCatalogName(\\'' + c.id + '\\',this.value)\" title=\"Rename catalog\"/>'+",
-    "          '<div class=\"catalog-row-type\">'+c.type+'</div>'+",
-    "        '</div>'+",
-    "        '<label class=\"toggle\"><input type=\"checkbox\" '+(checked?'checked':'')+' onchange=\"setCatalogEnabled(\\'' + c.id + '\\',this.checked)\"/><span class=\"toggle-slider\"></span></label>'+",
-    "      '</div>';",
-    "    }).join('');",
-    "  });",
+    "  initDefaultOrder();",
+    "  var el = document.getElementById('all-catalogs-list');",
+    "  if (!el) return;",
+    "  var ordered = state.defaultCatalogOrder.map(function(id){ return DEFAULT_CATALOGS.find(function(c){ return c.id===id; }); }).filter(Boolean);",
+    "  el.innerHTML = ordered.map(function(c, idx) {",
+    "    var checked = state.catalogEnabled[c.id]!==undefined ? state.catalogEnabled[c.id] : c.enabled;",
+    "    var displayName = state.catalogNames[c.id] || c.name;",
+    "    var typeLabel = c.type === 'movie' ? 'TMDB Movie' : 'TMDB Series';",
+    "    return '<div class=\"catalog-row\" data-defidx=\"'+idx+'\" data-catid=\"'+c.id+'\" draggable=\"true\">'+",
+    "      '<span class=\"catalog-drag-handle\" title=\"Drag to reorder\">&#8801;</span>'+",
+    "      '<div class=\"catalog-row-info\">'+",
+    "        '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(displayName)+'\" placeholder=\"'+esc(c.name)+'\" oninput=\"setCatalogName(\\'' + c.id + '\\',this.value)\" title=\"Click to rename\"/>'+",
+    "        '<div class=\"catalog-row-type\">'+typeLabel+'</div>'+",
+    "      '</div>'+",
+    "      '<label class=\"toggle\"><input type=\"checkbox\" '+(checked?'checked':'')+' onchange=\"setCatalogEnabled(\\'' + c.id + '\\',this.checked)\"/><span class=\"toggle-slider\"></span></label>'+",
+    "    '</div>';",
+    "  }).join('');",
+    "  initDefaultDragSort();",
     "}",
     "function setCatalogEnabled(id, val) { state.catalogEnabled[id]=val; }",
     "function setCatalogName(id, val) { state.catalogNames[id]=val; }",
-    "function toggleCatalogGroup(type) {",
-    "  var grp = document.getElementById('catalog-group-'+type);",
-    "  if (grp) grp.classList.toggle('collapsed');",
+    "function initDefaultDragSort() {",
+    "  var items = document.querySelectorAll('#all-catalogs-list .catalog-row');",
+    "  var dragIdx = null;",
+    "  items.forEach(function(item) {",
+    "    item.addEventListener('dragstart', function(e) {",
+    "      dragIdx = parseInt(item.dataset.defidx);",
+    "      item.classList.add('dragging-def');",
+    "      e.dataTransfer.effectAllowed='move';",
+    "    });",
+    "    item.addEventListener('dragend', function() {",
+    "      item.classList.remove('dragging-def');",
+    "      document.querySelectorAll('#all-catalogs-list .catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
+    "    });",
+    "    item.addEventListener('dragover', function(e) {",
+    "      e.preventDefault();",
+    "      document.querySelectorAll('#all-catalogs-list .catalog-row').forEach(function(i){ i.classList.remove('drag-over-def'); });",
+    "      item.classList.add('drag-over-def');",
+    "    });",
+    "    item.addEventListener('drop', function(e) {",
+    "      e.preventDefault();",
+    "      item.classList.remove('drag-over-def');",
+    "      var toIdx = parseInt(item.dataset.defidx);",
+    "      if (dragIdx !== null && dragIdx !== toIdx) {",
+    "        initDefaultOrder();",
+    "        var moved = state.defaultCatalogOrder.splice(dragIdx, 1)[0];",
+    "        state.defaultCatalogOrder.splice(toIdx, 0, moved);",
+    "        renderDefaultCatalogs();",
+    "      }",
+    "      dragIdx = null;",
+    "    });",
+    "  });",
     "}",
     "",
-
-    // ── Add catalog tab switching (step 2) ──
     "function switchAddCatTab(tab) {",
-    "  ['tmdb-builder','tmdb-pick','mdblist','imdb'].forEach(function(t) {",
+    "  ['items','tmdb-builder','mdblist','imdb'].forEach(function(t) {",
     "    var btn = document.getElementById('add-cat-tab-'+t);",
     "    var panel = document.getElementById('add-cat-panel-'+t);",
     "    if (btn) btn.classList.toggle('active', t===tab);",
@@ -2071,6 +2265,7 @@ function configurePage() {
     "    document.getElementById('cc-step-source').classList.remove('active');",
     "    document.getElementById('cc-new-name').value = '';",
     "    document.getElementById('cc-new-type').value = 'movie';",
+    "    newCatalogItems = [];",
     "  }",
     "}",
     "function ccGoStep2() {",
@@ -2079,7 +2274,9 @@ function configurePage() {
     "  document.getElementById('cc-step2-name-display').textContent = name + ' (' + document.getElementById('cc-new-type').value + ')';",
     "  document.getElementById('cc-step-name').classList.remove('active');",
     "  document.getElementById('cc-step-source').classList.add('active');",
-    "  switchAddCatTab('tmdb-builder');",
+    "  switchAddCatTab('items');",
+    "  newCatalogItems = [];",
+    "  renderNewCatalogItems();",
     "}",
     "function ccBackStep1() {",
     "  document.getElementById('cc-step-source').classList.remove('active');",
@@ -2101,6 +2298,63 @@ function configurePage() {
     "  if (!sel) return;",
     "  sel.innerHTML='<option value=\"\">Any Genre</option>'+genres.map(function(g){ return '<option value=\"'+g.id+'\">'+esc(g.name)+'</option>'; }).join('');",
     "}",
+    "",
+    "var newCatalogItems = [];",
+    "var itemsSearchTimer;",
+    "function debounceItemsSearch(q) {",
+    "  clearTimeout(itemsSearchTimer);",
+    "  var box = document.getElementById('cc-items-results');",
+    "  if (!q.trim()) { if(box) box.innerHTML=''; return; }",
+    "  itemsSearchTimer = setTimeout(function(){ doItemsSearch(q); }, 350);",
+    "}",
+    "async function doItemsSearch(q) {",
+    "  var type = document.getElementById('cc-new-type').value;",
+    "  var box = document.getElementById('cc-items-results');",
+    "  if (!box) return;",
+    "  box.innerHTML = '<div class=\"loading-state\" style=\"padding:0.6rem 0\"><div class=\"spinner-light\"></div> Searching...</div>';",
+    "  try {",
+    "    var r = await fetch('/api/search-multi?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type='+type);",
+    "    var d = await r.json();",
+    "    if (!d.results || !d.results.length) { box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute);padding:4px 0\">No results.</p>'; return; }",
+    "    box.innerHTML = d.results.map(function(s) {",
+    "      var ph = s.poster ? '<img class=\"cat-search-result-poster\" src=\"'+s.poster+'\" loading=\"lazy\"/>' : '<div class=\"cat-search-result-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#127902;</div>';",
+    "      return '<div class=\"cat-search-result\" onclick=\"addItemToCatalog('+s.id+',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\',\\\''+type+'\\')\">'",
+    "        + ph + '<div><div style=\"font-size:0.82rem;font-weight:600;color:var(--text)\">'+esc(s.name)+'</div><div style=\"font-size:0.7rem;color:var(--text-mute)\">'+(s.year||'')+(s.vote_average?' &middot; &starf;'+s.vote_average:'')+'</div></div>'",
+    "        + '<div style=\"margin-left:auto;font-size:0.7rem;color:var(--gold)\">+ Add</div></div>';",
+    "    }).join('');",
+    "  } catch(e) { if(box) box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute)\">Search error.</p>'; }",
+    "}",
+    "function addItemToCatalog(tmdbId, name, poster, itemType) {",
+    "  var already = newCatalogItems.find(function(i){ return i.tmdbId===String(tmdbId); });",
+    "  if (already) return;",
+    "  newCatalogItems.push({ tmdbId: String(tmdbId), name: name, poster: poster, itemType: itemType });",
+    "  renderNewCatalogItems();",
+    "}",
+    "function removeNewCatalogItem(idx) { newCatalogItems.splice(idx, 1); renderNewCatalogItems(); }",
+    "function renderNewCatalogItems() {",
+    "  var el = document.getElementById('cc-items-picked');",
+    "  if (!el) return;",
+    "  if (!newCatalogItems.length) { el.innerHTML = '<p style=\"font-size:0.75rem;color:var(--text-mute)\">No items added yet. Search above.</p>'; return; }",
+    "  el.innerHTML = '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:6px\">'+newCatalogItems.length+' item'+(newCatalogItems.length!==1?'s':'')+' added &mdash; click to remove</div>'",
+    "    + '<div style=\"display:flex;flex-wrap:wrap;gap:6px\">'",
+    "    + newCatalogItems.map(function(item, i) {",
+    "      var ph = item.poster ? '<img style=\"width:32px;height:48px;border-radius:4px;object-fit:cover\" src=\"'+item.poster+'\" loading=\"lazy\"/>' : '<div style=\"width:32px;height:48px;background:var(--surface2);border-radius:4px\"></div>';",
+    "      return '<div style=\"position:relative;cursor:pointer\" title=\"'+esc(item.name)+'\" onclick=\"removeNewCatalogItem('+i+')\">'",
+    "        + ph",
+    "        + '<div style=\"position:absolute;top:-4px;right:-4px;width:14px;height:14px;background:#c0392b;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:0.55rem;color:#fff\">&times;</div>'",
+    "        + '</div>';",
+    "    }).join('')",
+    "    + '</div>';",
+    "}",
+    "function addItemsCatalog() {",
+    "  var name = document.getElementById('cc-new-name').value.trim();",
+    "  var type = document.getElementById('cc-new-type').value;",
+    "  if (!name) return;",
+    "  state.customCatalogs.push({ id:'custom_items.'+Date.now(), name:name, type:type, path:'_custom_items_', items: newCatalogItems.slice(), enabled:true });",
+    "  newCatalogItems = [];",
+    "  document.getElementById('custom-catalog-form').classList.remove('open');",
+    "  renderCustomCatalogsList();",
+    "}",
     "function addCustomCatalog() {",
     "  var name=document.getElementById('cc-new-name').value.trim();",
     "  var type=document.getElementById('cc-new-type').value;",
@@ -2121,38 +2375,139 @@ function configurePage() {
     "  state.customCatalogs.splice(toIdx,0,moved);",
     "  renderCustomCatalogsList();",
     "}",
+    "function toggleCustomCatExpand(id) {",
+    "  var el = document.getElementById('ccat-'+id); if (el) el.classList.toggle('expanded');",
+    "}",
+    "function updateCustomCatName(id, val) {",
+    "  var c = state.customCatalogs.find(function(x){ return x.id===id; }); if (c) c.name = val;",
+    "}",
     "function renderCustomCatalogsList() {",
     "  var el=document.getElementById('custom-catalogs-list');",
-    "  if (!state.customCatalogs.length) { el.innerHTML='<div class=\"empty-state\">No custom catalogs yet.</div>'; return; }",
+    "  if (!state.customCatalogs.length) { el.innerHTML='<div class=\"empty-state\" style=\"padding:1rem 0\">No custom catalogs yet.</div>'; return; }",
     "  var sortLabels={'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'};",
     "  el.innerHTML=state.customCatalogs.map(function(c,idx){",
     "    var sub='';",
-    "    if (c.path==='_mdblist_') sub='MDBList \u00b7 '+c.type;",
-    "    else if (c.path==='_imdblist_') sub='IMDB \u00b7 '+c.type;",
-    "    else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; var gp=c.params&&c.params.with_genres?' \u00b7 Genre '+c.params.with_genres:''; sub='TMDB \u00b7 '+c.type+' \u00b7 '+sl+gp; }",
-    "    return '<div class=\"custom-catalog-item\" data-catidx=\"'+idx+'\" draggable=\"true\">'+",
-    "      '<span class=\"cat-drag-handle\" title=\"Drag to reorder\">\u2261</span>'+",
-    "      '<div class=\"custom-catalog-item-info\">'+",
-    "        '<div class=\"custom-catalog-item-name\">'+esc(c.name)+'</div>'+",
-    "        '<div class=\"custom-catalog-item-sub\">'+sub+'</div>'+",
-    "      '</div>'+",
-    "      '<button class=\"btn btn-danger btn-sm\" onclick=\"removeCustomCatalog(\\'' + c.id + '\\')\">\u00d7</button>'+",
-    "    '</div>';",
+    "    if (c.path==='_mdblist_') sub='MDBList &middot; '+c.type;",
+    "    else if (c.path==='_imdblist_') sub='IMDB &middot; '+c.type;",
+    "    else if (c.path==='_custom_items_') sub='Custom Items &middot; '+c.type+' &middot; '+(c.items&&c.items.length||0)+' item'+((!c.items||c.items.length!==1)?'s':'');",
+    "    else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; var gp=c.params&&c.params.with_genres?' &middot; Genre '+c.params.with_genres:''; sub='TMDB &middot; '+c.type+' &middot; '+sl+gp; }",
+    "    var isItems = c.path==='_custom_items_';",
+    "    var html = '<div class=\"custom-catalog-item\" id=\"ccat-'+c.id+'\" data-catidx=\"'+idx+'\" draggable=\"true\">'",
+    "      + '<span class=\"cat-drag-handle\">&#8801;</span>'",
+    "      + '<div class=\"custom-catalog-item-info\">'",
+    "        + '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(c.name)+'\" oninput=\"updateCustomCatName(\\'' + c.id + '\\',this.value)\" onclick=\"event.stopPropagation()\" title=\"Click to rename\"/>'",
+    "        + '<div class=\"custom-catalog-item-sub\">'+sub+'</div>'",
+    "      + '</div>'",
+    "      + (isItems ? '<button class=\"btn btn-ghost btn-sm\" onclick=\"event.stopPropagation();toggleCustomCatExpand(\\'' + c.id + '\\')\" style=\"padding:5px 10px\">&#9998;</button>' : '')",
+    "      + '<button class=\"btn btn-danger btn-sm\" onclick=\"event.stopPropagation();removeCustomCatalog(\\'' + c.id + '\\')\">&times;</button>';",
+    "    if (isItems) {",
+    "      var items = c.items || [];",
+    "      var itemsHtml = items.length",
+    "        ? '<ul class=\"cat-items-list\">' + items.map(function(item, i) {",
+    "            var ph = item.poster ? '<img class=\"cat-item-poster\" src=\"'+item.poster+'\" loading=\"lazy\"/>' : '<div class=\"cat-item-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#127902;</div>';",
+    "            return '<li class=\"cat-item-row\" data-catid=\"'+c.id+'\" data-itemidx=\"'+i+'\" draggable=\"true\">'",
+    "              + '<span class=\"cat-item-drag\">&#8801;</span>'",
+    "              + ph",
+    "              + '<div class=\"cat-item-info\"><div class=\"cat-item-name\">'+esc(item.name)+'</div><div class=\"cat-item-sub\">'+esc(item.itemType||'')+'</div></div>'",
+    "              + '<span class=\"cat-item-del\" onclick=\"removeCatalogItem(\\'' + c.id + '\\','+i+')\">&times;</span>'",
+    "              + '</li>';",
+    "          }).join('')",
+    "          + '</ul>'",
+    "        : '<p style=\"font-size:0.8rem;color:var(--text-mute);margin:4px 0 8px\">No items. Search below to add.</p>';",
+    "      html += '<div class=\"custom-catalog-editor\">'",
+    "        + '<div style=\"font-size:0.75rem;font-weight:600;color:var(--text-dim);margin-bottom:8px\">Items &mdash; drag to reorder, &times; to remove</div>'",
+    "        + itemsHtml",
+    "        + '<div style=\"margin-top:10px\">'",
+    "          + '<input type=\"text\" id=\"catitems-search-'+c.id+'\" placeholder=\"Search to add '+c.type+'s...\" oninput=\"debounceCatItemSearch(\\'' + c.id + '\\',\\\''+c.type+'\\',this.value)\" autocomplete=\"off\" style=\"font-size:0.82rem\"/>'",
+    "          + '<div id=\"catitems-results-'+c.id+'\" style=\"margin-top:4px\"></div>'",
+    "        + '</div>'",
+    "        + '</div>';",
+    "    }",
+    "    html += '</div>';",
+    "    return html;",
     "  }).join('');",
     "  initCatalogDragSort();",
+    "  initCatalogItemsDragSort();",
+    "}",
+    "function removeCatalogItem(catId, idx) {",
+    "  var c = state.customCatalogs.find(function(x){ return x.id===catId; });",
+    "  if (c && c.items) { c.items.splice(idx,1); var wasExp = document.getElementById('ccat-'+catId) && document.getElementById('ccat-'+catId).classList.contains('expanded'); renderCustomCatalogsList(); if(wasExp){ var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); } }",
+    "}",
+    "var catItemSearchTimers = {};",
+    "function debounceCatItemSearch(catId, itemType, q) {",
+    "  clearTimeout(catItemSearchTimers[catId]);",
+    "  var box = document.getElementById('catitems-results-'+catId);",
+    "  if (!q.trim()) { if(box) box.innerHTML=''; return; }",
+    "  catItemSearchTimers[catId] = setTimeout(function(){ doCatItemSearch(catId, itemType, q); }, 350);",
+    "}",
+    "async function doCatItemSearch(catId, itemType, q) {",
+    "  var box = document.getElementById('catitems-results-'+catId);",
+    "  if (!box) return;",
+    "  box.innerHTML = '<div class=\"loading-state\" style=\"padding:0.4rem 0\"><div class=\"spinner-light\"></div></div>';",
+    "  try {",
+    "    var r = await fetch('/api/search-multi?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type='+itemType);",
+    "    var d = await r.json();",
+    "    if (!d.results||!d.results.length) { box.innerHTML='<p style=\"font-size:0.75rem;color:var(--text-mute)\">No results.</p>'; return; }",
+    "    box.innerHTML = d.results.slice(0,6).map(function(s) {",
+    "      var ph = s.poster ? '<img class=\"cat-search-result-poster\" src=\"'+s.poster+'\" loading=\"lazy\"/>' : '<div class=\"cat-search-result-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#9670;</div>';",
+    "      return '<div class=\"cat-search-result\" onclick=\"addItemToExistingCatalog(\\'' + catId + '\\','+s.id+',\\'' + esc4attr(s.name) + '\\',\\'' + esc4attr(s.poster||'') + '\\',\\\''+itemType+'\\')\">'",
+    "        + ph + '<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.79rem;font-weight:600;color:var(--text)\">'+esc(s.name)+'</div><div style=\"font-size:0.68rem;color:var(--text-mute)\">'+(s.year||'')+'</div></div>'",
+    "        + '<div style=\"font-size:0.7rem;color:var(--gold);flex-shrink:0\">+ Add</div></div>';",
+    "    }).join('');",
+    "  } catch(e) { if(box) box.innerHTML=''; }",
+    "}",
+    "function addItemToExistingCatalog(catId, tmdbId, name, poster, itemType) {",
+    "  var c = state.customCatalogs.find(function(x){ return x.id===catId; });",
+    "  if (!c) return;",
+    "  if (!c.items) c.items = [];",
+    "  if (c.items.find(function(i){ return i.tmdbId===String(tmdbId); })) return;",
+    "  c.items.push({ tmdbId: String(tmdbId), name: name, poster: poster, itemType: itemType });",
+    "  var inp = document.getElementById('catitems-search-'+catId); if (inp) inp.value = '';",
+    "  var box = document.getElementById('catitems-results-'+catId); if (box) box.innerHTML = '';",
+    "  renderCustomCatalogsList();",
+    "  setTimeout(function(){ var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); }, 20);",
+    "}",
+    "function initCatalogItemsDragSort() {",
+    "  document.querySelectorAll('.cat-items-list').forEach(function(listEl) {",
+    "    var dragItemIdx = null; var dragCatId = null;",
+    "    listEl.querySelectorAll('.cat-item-row').forEach(function(item) {",
+    "      item.addEventListener('dragstart', function(e) { dragItemIdx=parseInt(item.dataset.itemidx); dragCatId=item.dataset.catid; item.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; e.stopPropagation(); });",
+    "      item.addEventListener('dragend', function() { item.classList.remove('dragging'); listEl.querySelectorAll('.cat-item-row').forEach(function(i){ i.classList.remove('drag-over-item'); }); });",
+    "      item.addEventListener('dragover', function(e) { e.preventDefault(); e.stopPropagation(); listEl.querySelectorAll('.cat-item-row').forEach(function(i){ i.classList.remove('drag-over-item'); }); item.classList.add('drag-over-item'); });",
+    "      item.addEventListener('drop', function(e) {",
+    "        e.preventDefault(); e.stopPropagation(); item.classList.remove('drag-over-item');",
+    "        var toIdx=parseInt(item.dataset.itemidx);",
+    "        if (dragItemIdx===null||dragItemIdx===toIdx||!dragCatId) return;",
+    "        var c=state.customCatalogs.find(function(x){ return x.id===dragCatId; });",
+    "        if (!c||!c.items) return;",
+    "        var moved=c.items.splice(dragItemIdx,1)[0]; c.items.splice(toIdx,0,moved);",
+    "        renderCustomCatalogsList();",
+    "        setTimeout(function(){ var el=document.getElementById('ccat-'+dragCatId); if(el) el.classList.add('expanded'); },20);",
+    "        dragItemIdx=null;",
+    "      });",
+    "    });",
+    "  });",
     "}",
     "function initCatalogDragSort() {",
     "  var items = document.querySelectorAll('.custom-catalog-item');",
     "  var dragIdx = null;",
     "  items.forEach(function(item) {",
-    "    item.addEventListener('dragstart', function(e) { dragIdx=parseInt(item.dataset.catidx); item.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; });",
-    "    item.addEventListener('dragend', function() { item.classList.remove('dragging'); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); });",
-    "    item.addEventListener('dragover', function(e) { e.preventDefault(); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); item.classList.add('drag-over-cat'); });",
-    "    item.addEventListener('drop', function(e) { e.preventDefault(); item.classList.remove('drag-over-cat'); var toIdx=parseInt(item.dataset.catidx); if(dragIdx!==null&&dragIdx!==toIdx) moveCustomCatalog(dragIdx,toIdx); dragIdx=null; });",
+    "    item.addEventListener('dragstart', function(e) {",
+    "      if (e.target.closest('.custom-catalog-editor')||e.target.closest('.cat-items-list')) { e.stopPropagation(); return; }",
+    "      dragIdx=parseInt(item.dataset.catidx); item.classList.add('dragging-cat'); e.dataTransfer.effectAllowed='move';",
+    "    });",
+    "    item.addEventListener('dragend', function() { item.classList.remove('dragging-cat'); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); });",
+    "    item.addEventListener('dragover', function(e) {",
+    "      if (e.target.closest('.custom-catalog-editor')||e.target.closest('.cat-items-list')) return;",
+    "      e.preventDefault(); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); item.classList.add('drag-over-cat');",
+    "    });",
+    "    item.addEventListener('drop', function(e) {",
+    "      if (e.target.closest('.custom-catalog-editor')||e.target.closest('.cat-items-list')) return;",
+    "      e.preventDefault(); item.classList.remove('drag-over-cat'); var toIdx=parseInt(item.dataset.catidx); if(dragIdx!==null&&dragIdx!==toIdx) moveCustomCatalog(dragIdx,toIdx); dragIdx=null;",
+    "    });",
     "  });",
     "}",
     "",
-
     // ── MDBList catalog ──
     "var mdbCatalogPreviewData = null;",
     "async function previewMdbCatalog() {",
@@ -2245,43 +2600,6 @@ function configurePage() {
     "  document.getElementById('imdb-cat-status').textContent = '\u2713 Added \"' + name + '\"';",
     "  document.getElementById('imdb-cat-status').style.color = 'var(--gold)';",
     "  imdbCatalogPreviewData = null;",
-    "  document.getElementById('custom-catalog-form').classList.remove('open');",
-    "  renderCustomCatalogsList();",
-    "}",
-    "",
-
-    // ── TMDB catalog search ──
-    "var tmdbCatSearchTimer;",
-    "function debounceTmdbCatSearch(q) {",
-    "  clearTimeout(tmdbCatSearchTimer);",
-    "  if (!q.trim()) { document.getElementById('tmdb-cat-results').innerHTML=''; return; }",
-    "  tmdbCatSearchTimer = setTimeout(function(){ doTmdbCatSearch(q); }, 350);",
-    "}",
-    "async function doTmdbCatSearch(q) {",
-    "  var type = document.getElementById('cc-new-type').value;",
-    "  var box = document.getElementById('tmdb-cat-results');",
-    "  box.innerHTML = '<div class=\"loading-state\" style=\"padding:0.8rem 0\"><div class=\"spinner-light\"></div> Searching...</div>';",
-    "  try {",
-    "    var r = await fetch('/api/tmdb-search?q='+encodeURIComponent(q)+'&apiKey='+encodeURIComponent(state.apiKey)+'&type='+type);",
-    "    var d = await r.json();",
-    "    if (!d.results || !d.results.length) { box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute);padding:4px 0\">No results.</p>'; return; }",
-    "    box.innerHTML = d.results.map(function(s) {",
-    "      var ph = s.poster ? '<img src=\"'+s.poster+'\" style=\"width:28px;height:42px;border-radius:4px;object-fit:cover;flex-shrink:0\" loading=\"lazy\"/>' : '<div style=\"width:28px;height:42px;background:var(--surface);border-radius:4px;flex-shrink:0\"></div>';",
-    "      return '<div class=\"search-result-item\" style=\"padding:8px 10px\" onclick=\"selectTmdbCatalogItem('+s.id+',\\''+ esc4attr(s.name) +'\\',\\''+type+'\\')\">' +",
-    "        ph + '<div><div style=\"font-size:0.82rem;font-weight:600;color:var(--text)\">'+esc(s.name)+'</div><div style=\"font-size:0.7rem;color:var(--text-mute)\">'+(s.year||'')+(s.vote_average?' \u00b7 \u2605'+s.vote_average:'')+'</div></div></div>';",
-    "    }).join('');",
-    "  } catch(e) { box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute);padding:4px 0\">Search error.</p>'; }",
-    "}",
-    "function selectTmdbCatalogItem(tmdbId, name, type) {",
-    "  var catName = document.getElementById('cc-new-name');",
-    "  if (!catName.value) catName.value = name;",
-    "  var tt = type==='series'?'tv':'movie';",
-    "  var params = { sort_by: 'popularity.desc' };",
-    "  var genre = document.getElementById('cc-genre'); if(genre&&genre.value) params.with_genres=genre.value;",
-    "  state.customCatalogs.push({ id: 'tmdb_pick.'+Date.now(), name: catName.value || name, type: type, path: '/discover/'+tt, params: params, enabled: true });",
-    "  document.getElementById('cc-new-name').value = '';",
-    "  document.getElementById('tmdb-cat-results').innerHTML = '';",
-    "  document.getElementById('cc-search').value = '';",
     "  document.getElementById('custom-catalog-form').classList.remove('open');",
     "  renderCustomCatalogsList();",
     "}",
@@ -2665,7 +2983,7 @@ function configurePage() {
     "  });",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
-    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs};",
+    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.defaultCatalogOrder};",
     "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
     "  var manifestUrl=window.location.origin+'/'+encoded+'/manifest.json';",
     "  document.getElementById('manifest-url').value=manifestUrl;",
@@ -2841,42 +3159,27 @@ function configurePage() {
     <div class="card">
       <div class="card-eyebrow">Step 3 of 4</div>
       <div class="card-title">Catalog Manager</div>
-      <div class="card-sub">Enable or disable default TMDB catalogs, rename them, and add custom catalogs from TMDB, MDBList, or IMDB.</div>
+      <div class="card-sub">Drag to reorder all catalogs. Click a name to rename it. Toggle to enable or disable. Add custom catalogs below.</div>
 
-      <div class="catalog-group" id="catalog-group-movie">
-        <div class="catalog-group-header" onclick="toggleCatalogGroup('movie')">
-          <span class="catalog-section-label">TMDB Movies</span>
-          <span class="catalog-group-chevron">&#9660;</span>
-        </div>
-        <div class="catalog-group-body">
-          <div id="catalog-defaults-movie"></div>
-        </div>
-      </div>
+      <!-- Unified sortable catalog list (default + custom mixed) -->
+      <div id="all-catalogs-list"></div>
 
-      <div class="catalog-group" id="catalog-group-series">
-        <div class="catalog-group-header" onclick="toggleCatalogGroup('series')">
-          <span class="catalog-section-label">TMDB Series</span>
-          <span class="catalog-group-chevron">&#9660;</span>
-        </div>
-        <div class="catalog-group-body">
-          <div id="catalog-defaults-series"></div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="section-header">
+      <!-- Add custom catalog button + form -->
+      <div class="section-header" style="margin-top:1.2rem">
         <div>
           <div style="font-size:0.9rem;font-weight:600;color:#fff">Custom Catalogs</div>
-          <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">Add catalogs from TMDB, MDBList, or IMDB</div>
+          <div style="font-size:0.78rem;color:var(--text-mute);margin-top:2px">TMDB Discover, picked items, MDBList, or IMDB</div>
         </div>
         <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">+ Add</button>
       </div>
+      <div id="custom-catalogs-section">
+        <div id="custom-catalogs-list"><div class="empty-state" style="padding:1rem 0">No custom catalogs yet.</div></div>
+      </div>
 
-      <!-- Step 1: Name the catalog -->
+      <!-- New catalog form -->
       <div class="custom-catalog-form" id="custom-catalog-form">
         <div id="cc-step-name" class="cc-step active">
-          <div style="font-size:0.8rem;font-weight:600;color:var(--text-dim);margin-bottom:10px">New Catalog — Step 1 of 2</div>
+          <div style="font-size:0.8rem;font-weight:600;color:var(--text-dim);margin-bottom:10px">New Catalog — Name &amp; Type</div>
           <div class="form-row">
             <div class="field" style="margin-bottom:0"><label>Catalog Name</label><input type="text" id="cc-new-name" placeholder="e.g. Sci-Fi Classics" onkeydown="if(event.key==='Enter') ccGoStep2()"/></div>
             <div class="field" style="margin-bottom:0"><label>Type</label><select id="cc-new-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
@@ -2887,19 +3190,30 @@ function configurePage() {
           </div>
         </div>
 
-        <!-- Step 2: Choose source -->
         <div id="cc-step-source" class="cc-step">
-          <div style="font-size:0.8rem;font-weight:600;color:var(--text-dim);margin-bottom:2px">New Catalog — Step 2 of 2</div>
-          <div style="font-size:0.75rem;color:var(--text-mute);margin-bottom:12px">Name: <span id="cc-step2-name-display" style="color:var(--gold)"></span> &nbsp;·&nbsp; <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:0.7rem" onclick="ccBackStep1()">← Edit</button></div>
+          <div style="font-size:0.8rem;font-weight:600;color:var(--text-dim);margin-bottom:2px">Choose Source</div>
+          <div style="font-size:0.75rem;color:var(--text-mute);margin-bottom:12px">Catalog: <span id="cc-step2-name-display" style="color:var(--gold)"></span> &nbsp;·&nbsp; <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:0.7rem" onclick="ccBackStep1()">← Edit</button></div>
           <div class="add-cat-tabs">
-            <button class="add-cat-tab active" id="add-cat-tab-tmdb-builder" onclick="switchAddCatTab('tmdb-builder')">TMDB Builder</button>
-            <button class="add-cat-tab" id="add-cat-tab-tmdb-pick" onclick="switchAddCatTab('tmdb-pick')">Pick from TMDB</button>
+            <button class="add-cat-tab active" id="add-cat-tab-items" onclick="switchAddCatTab('items')">Pick Items</button>
+            <button class="add-cat-tab" id="add-cat-tab-tmdb-builder" onclick="switchAddCatTab('tmdb-builder')">TMDB Discover</button>
             <button class="add-cat-tab" id="add-cat-tab-mdblist" onclick="switchAddCatTab('mdblist')">MDBList</button>
             <button class="add-cat-tab" id="add-cat-tab-imdb" onclick="switchAddCatTab('imdb')">IMDB</button>
           </div>
 
+          <!-- Pick Items panel — search TMDB and manually add movies/shows -->
+          <div class="add-cat-panel active" id="add-cat-panel-items">
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Search TMDB to hand-pick specific movies or shows for this catalog.</div>
+            <input type="text" id="cc-items-search" placeholder="Search for a movie or show..." oninput="debounceItemsSearch(this.value)" autocomplete="off"/>
+            <div id="cc-items-results" style="margin-top:6px"></div>
+            <div id="cc-items-picked" style="margin-top:10px"></div>
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <button class="btn btn-primary btn-sm" onclick="addItemsCatalog()">Create Catalog</button>
+              <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button>
+            </div>
+          </div>
+
           <!-- TMDB Builder panel -->
-          <div class="add-cat-panel active" id="add-cat-panel-tmdb-builder">
+          <div class="add-cat-panel" id="add-cat-panel-tmdb-builder">
             <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Build a dynamic catalog from TMDB Discover with genre and sort filters.</div>
             <div class="form-row">
               <div class="field" style="margin-bottom:0"><label>Genre</label><select id="cc-genre"><option value="">Any Genre</option></select></div>
@@ -2911,17 +3225,9 @@ function configurePage() {
             </div>
           </div>
 
-          <!-- TMDB Pick panel (pick a specific movie/show from TMDB) -->
-          <div class="add-cat-panel" id="add-cat-panel-tmdb-pick">
-            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Search TMDB to create a catalog pre-populated with similar titles.</div>
-            <input type="text" id="cc-search" placeholder="Search TMDB for a movie or show..." oninput="debounceTmdbCatSearch(this.value)"/>
-            <div id="tmdb-cat-results" style="margin-top:6px"></div>
-            <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
-          </div>
-
           <!-- MDBList panel -->
           <div class="add-cat-panel" id="add-cat-panel-mdblist">
-            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ MDBList import is experimental — some lists may not resolve correctly.</div>
+            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ MDBList import is experimental. List must be Public.</div>
             <div style="display:flex;gap:8px;margin-bottom:8px">
               <input type="text" id="mdb-cat-url" placeholder="https://mdblist.com/lists/username/listname" style="flex:1;font-size:0.85rem"/>
               <button class="btn btn-ghost btn-sm" id="mdb-cat-btn" onclick="previewMdbCatalog()" style="white-space:nowrap">Preview</button>
@@ -2939,8 +3245,8 @@ function configurePage() {
 
           <!-- IMDB panel -->
           <div class="add-cat-panel" id="add-cat-panel-imdb">
-            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ IMDB import is experimental — IMDB frequently blocks automated access.</div>
-            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Paste an IMDB list URL or a chart URL (e.g. Top 250, Box Office).</div>
+            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ IMDB import is experimental — IMDB may block access.</div>
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:6px">Paste an IMDB list or chart URL.</div>
             <div style="display:flex;gap:8px;margin-bottom:4px">
               <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/ or /chart/top/" style="flex:1;font-size:0.85rem"/>
               <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
@@ -2958,8 +3264,6 @@ function configurePage() {
           </div>
         </div>
       </div>
-
-      <div id="custom-catalogs-list" style="margin-top:12px"><div class="empty-state">No custom catalogs yet.</div></div>
     </div>
 
     <div class="nav-row">
