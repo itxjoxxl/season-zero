@@ -322,37 +322,52 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
       return res.json({ metas });
     }
 
-    // Handle IMDB list-sourced catalogs
-    if (catDef.path === '_imdblist_' && catDef.imdbListId) {
+    // Handle IMDB list-sourced catalogs (lists and charts)
+    if (catDef.path === '_imdblist_') {
       const listId = catDef.imdbListId;
+      const imdbUrl = catDef.imdbUrl;
       const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
       let ttIds = [];
-      try {
-        const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
-        const resp = await axios.get(csvUrl, {
-          headers: { 'Accept': 'text/csv,text/plain,*/*', 'User-Agent': UA },
-          timeout: 20000, validateStatus: (s) => s >= 200 && s < 400,
-        });
-        const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
-        if (!ct.includes('text/html')) {
-          const rows = String(resp.data).split('\n');
-          const header = rows[0] ? rows[0].split(',').map(h => h.replace(/"/g,'').trim().toLowerCase()) : [];
-          const constIdx = header.findIndex(h => h === 'const');
-          const typeIdx  = header.findIndex(h => h === 'title type');
-          if (constIdx !== -1) {
-            for (let i = 1; i < rows.length; i++) {
-              const cols = rows[i].split(',');
-              const ttId = String(cols[constIdx] || '').replace(/"/g,'').trim();
-              const ttype = typeIdx !== -1 ? String(cols[typeIdx] || '').replace(/"/g,'').trim().toLowerCase() : '';
-              if (ttId && ttId.startsWith('tt')) {
-                if (!ttype || ttype === 'movie' || ttype === 'tvepisode' || ttype === 'tvseries' || ttype === 'tvmovie') {
-                  ttIds.push(ttId);
-                }
+
+      // Try CSV export for regular lists
+      if (listId) {
+        try {
+          const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
+          const resp = await axios.get(csvUrl, {
+            headers: { 'Accept': 'text/csv,text/plain,*/*', 'User-Agent': UA },
+            timeout: 20000, validateStatus: (s) => s >= 200 && s < 400,
+          });
+          const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
+          if (!ct.includes('text/html')) {
+            const rows = String(resp.data).split('\n');
+            const header = rows[0] ? rows[0].split(',').map(h => h.replace(/"/g,'').trim().toLowerCase()) : [];
+            const constIdx = header.findIndex(h => h === 'const');
+            if (constIdx !== -1) {
+              for (let i = 1; i < rows.length; i++) {
+                const cols = rows[i].split(',');
+                const ttId = String(cols[constIdx] || '').replace(/"/g,'').trim();
+                if (ttId && ttId.startsWith('tt')) ttIds.push(ttId);
               }
             }
           }
+        } catch(e) { /* fallback */ }
+      }
+
+      // Chart URL scrape or list scrape fallback
+      if (!ttIds.length) {
+        const scrapeUrl = imdbUrl || (listId ? 'https://www.imdb.com/list/' + listId + '/' : null);
+        if (scrapeUrl) {
+          try {
+            const resp = await axios.get(scrapeUrl, {
+              headers: { 'Accept': 'text/html,*/*', 'User-Agent': UA },
+              timeout: 20000, validateStatus: (s) => s >= 200 && s < 400,
+            });
+            const html = String(resp.data || '');
+            const hrefMatches = [...html.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
+            ttIds = [...new Set(hrefMatches)];
+          } catch(e) { /* skip */ }
         }
-      } catch(e) { /* fallback */ }
+      }
 
       const pageItems = ttIds.slice(skip, skip + 20);
       const metas = [];
@@ -612,57 +627,95 @@ app.get('/api/imdb-list', async function(req, res) {
   }
 });
 
-// ─── IMDB LIST CATALOG IMPORT ─────────────────────────────────────────────────
+// ─── IMDB LIST/CHART CATALOG IMPORT ──────────────────────────────────────────
 app.get('/api/imdb-catalog', async function(req, res) {
   let { url: listUrl, apiKey } = req.query;
   if (!listUrl || !apiKey) return res.status(400).json({ error: 'url and apiKey required' });
 
-  const listIdMatch = String(listUrl).match(/ls\d+/);
-  if (!listIdMatch) return res.status(400).json({ error: 'Could not parse IMDB list ID from URL' });
-  const listId = listIdMatch[0];
-
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+  const urlStr = String(listUrl).trim();
+
+  // Detect if this is a chart URL (e.g. /chart/top/, /chart/toptv/, /chart/boxoffice/, /chart/moviemeter/, /chart/tvmeter/)
+  const isChart = /imdb\.com\/chart\//.test(urlStr);
+  const listIdMatch = urlStr.match(/ls\d+/);
+
+  if (!isChart && !listIdMatch) {
+    return res.status(400).json({ error: 'Could not parse IMDB list ID or chart URL' });
+  }
 
   try {
-    // Try CSV export first
     let ttIds = [];
     let listName = '';
-    try {
-      const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
-      const resp = await axios.get(csvUrl, {
-        headers: { 'Accept': 'text/csv,text/plain,*/*', 'User-Agent': UA },
-        timeout: 20000, validateStatus: (s) => s >= 200 && s < 400,
-      });
-      const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
-      if (!ct.includes('text/html')) {
-        const text = String(resp.data || '');
-        const rows = text.split('\n');
-        const header = rows[0] ? rows[0].split(',').map(h => h.replace(/"/g,'').trim().toLowerCase()) : [];
-        const constIdx = header.findIndex(h => h === 'const');
-        if (constIdx !== -1) {
-          for (let i = 1; i < rows.length; i++) {
-            const cols = rows[i].split(',');
-            const ttId = String(cols[constIdx] || '').replace(/"/g,'').trim();
-            if (ttId && ttId.startsWith('tt')) ttIds.push(ttId);
-          }
-        }
-      }
-    } catch(e) { /* try scrape fallback */ }
 
-    if (!ttIds.length) {
-      const pageUrl = 'https://www.imdb.com/list/' + listId + '/';
-      const resp = await axios.get(pageUrl, {
-        headers: { 'Accept': 'text/html,*/*', 'User-Agent': UA },
+    if (isChart) {
+      // For IMDB charts, scrape the chart page
+      const chartPath = urlStr.match(/\/chart\/[a-z]+\/?/)?.[0] || '/chart/top/';
+      const chartUrl = 'https://www.imdb.com' + chartPath;
+      const resp = await axios.get(chartUrl, {
+        headers: { 'Accept': 'text/html,*/*', 'Accept-Language': 'en-US,en;q=0.9', 'User-Agent': UA },
         timeout: 20000, validateStatus: (s) => s >= 200 && s < 400,
       });
       const html = String(resp.data || '');
-      const hrefMatches = [...html.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
-      ttIds = [...new Set(hrefMatches)];
-      const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-      if (titleMatch) listName = titleMatch[1].replace(/ - IMDb.*/, '').trim();
+      // Extract chart name
+      const titleMatch = html.match(/<h1[^>]*>([^<]+)<\/h1>/);
+      if (titleMatch) listName = titleMatch[1].trim();
+      // Extract tt IDs from chart
+      const matches = [...html.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
+      ttIds = [...new Set(matches)];
+      // Also try JSON-LD
+      const jsonLdMatch = html.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/);
+      if (jsonLdMatch) {
+        try {
+          const jld = JSON.parse(jsonLdMatch[1]);
+          const items = (jld.itemListElement || []);
+          for (const item of items) {
+            const u = (item.url || '') + (item.item && item.item.url || '');
+            const m = u.match(/tt\d+/);
+            if (m) ttIds.push(m[0]);
+          }
+          ttIds = [...new Set(ttIds)];
+        } catch(e) { /* ignore */ }
+      }
+    } else {
+      const listId = listIdMatch[0];
+      // Try CSV export first
+      try {
+        const csvUrl = 'https://www.imdb.com/list/' + listId + '/export';
+        const resp = await axios.get(csvUrl, {
+          headers: { 'Accept': 'text/csv,text/plain,*/*', 'User-Agent': UA },
+          timeout: 20000, validateStatus: (s) => s >= 200 && s < 400,
+        });
+        const ct = String(resp.headers && resp.headers['content-type'] || '').toLowerCase();
+        if (!ct.includes('text/html')) {
+          const text = String(resp.data || '');
+          const rows = text.split('\n');
+          const header = rows[0] ? rows[0].split(',').map(h => h.replace(/"/g,'').trim().toLowerCase()) : [];
+          const constIdx = header.findIndex(h => h === 'const');
+          if (constIdx !== -1) {
+            for (let i = 1; i < rows.length; i++) {
+              const cols = rows[i].split(',');
+              const ttId = String(cols[constIdx] || '').replace(/"/g,'').trim();
+              if (ttId && ttId.startsWith('tt')) ttIds.push(ttId);
+            }
+          }
+        }
+      } catch(e) { /* try scrape fallback */ }
+
+      if (!ttIds.length) {
+        const pageUrl = 'https://www.imdb.com/list/' + listId + '/';
+        const resp = await axios.get(pageUrl, {
+          headers: { 'Accept': 'text/html,*/*', 'User-Agent': UA },
+          timeout: 20000, validateStatus: (s) => s >= 200 && s < 400,
+        });
+        const html = String(resp.data || '');
+        const hrefMatches = [...html.matchAll(/\/title\/(tt\d+)\//g)].map(m => m[1]);
+        ttIds = [...new Set(hrefMatches)];
+        const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+        if (titleMatch) listName = titleMatch[1].replace(/ - IMDb.*/, '').trim();
+      }
     }
 
-    ttIds = [...new Set(ttIds)].filter(Boolean).slice(0, 50);
+    ttIds = [...new Set(ttIds)].filter(Boolean).slice(0, 100);
     if (!ttIds.length) return res.json({ metas: [], count: 0, name: listName });
 
     const metas = [];
@@ -676,7 +729,7 @@ app.get('/api/imdb-catalog', async function(req, res) {
       } catch(e) { /* skip */ }
     }
 
-    res.json({ metas, count: ttIds.length, name: listName, listId });
+    res.json({ metas, count: ttIds.length, name: listName, listId: listIdMatch ? listIdMatch[0] : null, isChart });
   } catch(e) {
     console.error('[imdb-catalog]', e.message);
     res.status(500).json({ error: e.message });
@@ -1036,7 +1089,7 @@ function configurePage() {
       to   { opacity: 1; transform: translateY(0); }
     }
 
-    /* ── Hero background ── */
+    /* ── Hero background — skewed poster wall ── */
     .hero-bg {
       position: absolute;
       inset: 0;
@@ -1044,12 +1097,18 @@ function configurePage() {
       pointer-events: none;
       z-index: 0;
     }
-    .hero-bg-track {
+    .hero-bg-row {
       display: flex;
       gap: 0;
-      height: 100%;
-      animation: bgScroll 60s linear infinite;
+      height: 52%;
+      animation: bgScroll 55s linear infinite;
       will-change: transform;
+    }
+    .hero-bg-row.row2 {
+      height: 52%;
+      animation-direction: reverse;
+      animation-duration: 70s;
+      margin-top: -4%;
     }
     @keyframes bgScroll {
       from { transform: translateX(0); }
@@ -1059,26 +1118,28 @@ function configurePage() {
       position: relative;
       flex-shrink: 0;
       height: 100%;
-      width: 320px;
+      width: 160px;
+      padding: 0 4px;
+      transform: skewX(-10deg);
     }
     .hero-bg-item img {
       width: 100%;
       height: 100%;
       object-fit: cover;
-      transform: skewX(-8deg) scaleX(1.1);
-      transform-origin: center center;
+      border-radius: 10px;
       opacity: 0;
-      transition: opacity 1s ease;
+      transition: opacity 1.2s ease;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
     }
-    .hero-bg-item img.loaded { opacity: 1; }
+    .hero-bg-item img.loaded { opacity: 0.72; }
     .hero-bg-overlay {
       position: absolute;
       inset: 0;
       background: linear-gradient(
         to bottom,
-        rgba(8,8,8,0.55) 0%,
-        rgba(8,8,8,0.35) 40%,
-        rgba(8,8,8,0.75) 80%,
+        rgba(8,8,8,0.45) 0%,
+        rgba(8,8,8,0.15) 35%,
+        rgba(8,8,8,0.15) 65%,
         rgba(8,8,8,0.98) 100%
       );
       z-index: 1;
@@ -1089,7 +1150,7 @@ function configurePage() {
       position: relative;
       overflow: hidden;
       border-radius: 18px;
-      min-height: 340px;
+      min-height: 420px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -1531,8 +1592,20 @@ function configurePage() {
     .custom-catalog-item-name { font-size: 0.86rem; font-weight: 600; color: var(--text); }
     .custom-catalog-item-sub  { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; font-family: 'DM Mono', monospace; }
 
+    /* cc two-step workflow */
+    .cc-step { display: none; }
+    .cc-step.active { display: block; }
+
+    /* Custom catalog drag-reorder */
+    .custom-catalog-item {
+      cursor: grab;
+    }
+    .custom-catalog-item.dragging { opacity: 0.35; }
+    .custom-catalog-item.drag-over-cat { border-color: var(--gold); background: var(--gold-dim); }
+    .cat-drag-handle { color: var(--text-mute); font-size: 0.9rem; cursor: grab; padding: 4px 6px 4px 0; flex-shrink: 0; }
+
     /* Add catalog tabs */
-    .add-cat-tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+    .add-cat-tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 14px; overflow-x: auto; }
     .add-cat-tab {
       flex: 1; padding: 8px 6px; font-size: 0.72rem; font-weight: 600;
       text-align: center; cursor: pointer; color: var(--text-mute); background: transparent;
@@ -1817,27 +1890,57 @@ function configurePage() {
     "}",
     "",
 
-    // ── Hero background loader ──
-    "async function loadHeroBackgrounds() {",
-    "  var apiKey = document.getElementById('apiKey').value.trim();",
-    "  if (!apiKey) {",
-    "    // Try to load without key - just show static gradient",
-    "    return;",
+    // ── Hero background loader — uses hardcoded popular posters, no API key needed ──
+    "var HERO_POSTERS = [",
+    "  '/pB8BM7pdSp6B6Ih7QZ4DrQ3PmJK.jpg','/hOSeglBprJKjt0e6bSDkBJKk4cn.jpg','/qNBAXBIQlnOThrVvA6mA2B5ggkl.jpg','/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg',",
+    "  '/gPbM0MK8CP8A174rmUwGsADNYKD.jpg','/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg','/lZ8NkZQoKjhsIxcnuKHqVs7J49.jpg','/uXDfjJbdP4ijW5hWSBrPu1LjPD.jpg',",
+    "  '/kqjL17yufvn9OVLyXYpvtyrFfak.jpg','/rktDFPbfHfUbArZ6OOOKsXcv0Bm.jpg','/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg','/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg',",
+    "  '/vZloFAK7NmvMGKE7VkF5UHaz0I.jpg','/AkE13D8b8wWODSMScSYkjKlVF7z.jpg','/ggFHVNu6YYI5L9pCfOacjizRGt.jpg','/t6HIqrRAclMCA60NsSmeqe9RmNV.jpg',",
+    "  '/jpurJ9jAcLCYjgHHfYF32m3zJYm.jpg','/vxnx4svEVHkLyPGEW6r8QDxPeMF.jpg','/kve20tXygoszhtaLAQ5sqc3q3Ca.jpg','/rSPw7tgCH9c6NqICZef4kZjFOQ5.jpg',",
+    "  '/pFlaoHTZeyNkG83vxsAJiGzfSsa.jpg','/udDclJoHjfjb8Ekgsd4FDteOkCU.jpg','/jAHkz9HZf6pLc3gMQ6rPqmUO8dl.jpg','/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg',",
+    "  '/fOy2Jurz9k6RnJnMbD0eMPKEezr.jpg','/sRLC052ionqa9y2y4RKNqmGXAYR.jpg','/1XS1oqL89opfnbLl8WnZY1O1uJx.jpg','/rktDFPbfHfUbArZ6OOOKsXcv0Bm.jpg',",
+    "  '/5Wy0XBrh7z3nVYHcOSanwp4FHIX.jpg','/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg','/pHkKbud4Dn0D0vBKMJBN8CCGJ6S.jpg','/z1p34vh7dEOnLDmyCrlUVLuoDzd.jpg'",
+    "];",
+    "var TMDB_IMG_MD_CLIENT = 'https://image.tmdb.org/t/p/w342';",
+    "function loadHeroBackgrounds() {",
+    "  var row1 = document.getElementById('hero-bg-row1');",
+    "  var row2 = document.getElementById('hero-bg-row2');",
+    "  if (!row1 || !row2) return;",
+    "  // Split posters into two rows, duplicated for infinite scroll",
+    "  var half = Math.floor(HERO_POSTERS.length / 2);",
+    "  var set1 = HERO_POSTERS.slice(0, half);",
+    "  var set2 = HERO_POSTERS.slice(half);",
+    "  function makeItems(arr) {",
+    "    return arr.concat(arr).map(function(p) {",
+    "      return '<div class=\"hero-bg-item\"><img src=\"' + TMDB_IMG_MD_CLIENT + p + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\" loading=\"lazy\"/></div>';",
+    "    }).join('');",
     "  }",
+    "  row1.innerHTML = makeItems(set1);",
+    "  row2.innerHTML = makeItems(set2);",
+    "  // If user has an API key saved, also try to fetch real trending posters",
+    "  var savedKey = '';",
+    "  try { savedKey = (document.getElementById('apiKey')||{}).value || ''; } catch(e) {}",
+    "  if (savedKey) refreshHeroWithApiKey(savedKey);",
+    "}",
+    "async function refreshHeroWithApiKey(apiKey) {",
     "  try {",
     "    var r = await fetch('/api/hero-backdrops?apiKey=' + encodeURIComponent(apiKey));",
     "    var d = await r.json();",
-    "    if (!d.backdrops || !d.backdrops.length) return;",
-    "    renderHeroBackgrounds(d.backdrops);",
-    "  } catch(e) { /* silent fail */ }",
-    "}",
-    "function renderHeroBackgrounds(backdrops) {",
-    "  var track = document.getElementById('hero-bg-track');",
-    "  if (!track) return;",
-    "  var items = backdrops.concat(backdrops); // duplicate for infinite scroll",
-    "  track.innerHTML = items.map(function(b) {",
-    "    return '<div class=\"hero-bg-item\"><img src=\"' + b.backdrop + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\" loading=\"lazy\"/></div>';",
-    "  }).join('');",
+    "    if (!d.backdrops || d.backdrops.length < 8) return;",
+    "    var row1 = document.getElementById('hero-bg-row1');",
+    "    var row2 = document.getElementById('hero-bg-row2');",
+    "    if (!row1 || !row2) return;",
+    "    var all = d.backdrops;",
+    "    var half = Math.ceil(all.length / 2);",
+    "    function makeFromBackdrops(arr) {",
+    "      return arr.concat(arr).map(function(b) {",
+    "        var src = b.poster || b.backdrop;",
+    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\" loading=\"lazy\"/></div>';",
+    "      }).join('');",
+    "    }",
+    "    row1.innerHTML = makeFromBackdrops(all.slice(0, half));",
+    "    row2.innerHTML = makeFromBackdrops(all.slice(half));",
+    "  } catch(e) { /* silent fail, hardcoded stays */ }",
     "}",
     "",
 
@@ -1854,7 +1957,7 @@ function configurePage() {
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    state.apiKey = key;",
-    "    loadHeroBackgrounds();",
+    "    refreshHeroWithApiKey(key);",
     "    renderDefaultCatalogs();",
     "    goTo(2);",
     "  } catch(e) {",
@@ -1862,6 +1965,9 @@ function configurePage() {
     "    input.placeholder = 'Invalid key — try again';",
     "  } finally { btn.innerHTML = 'Continue &rarr;'; btn.disabled = false; }",
     "}",
+    "",
+    "// Init hero on page load",
+    "loadHeroBackgrounds();",
     "",
 
     "function flashError(el) { el.classList.add('error'); el.focus(); setTimeout(function(){ el.classList.remove('error'); },2000); }",
@@ -1946,28 +2052,42 @@ function configurePage() {
     "}",
     "",
 
-    // ── Add catalog tab switching ──
+    // ── Add catalog tab switching (step 2) ──
     "function switchAddCatTab(tab) {",
-    "  ['tmdb','mdblist','imdb'].forEach(function(t) {",
+    "  ['tmdb-builder','tmdb-pick','mdblist','imdb'].forEach(function(t) {",
     "    var btn = document.getElementById('add-cat-tab-'+t);",
     "    var panel = document.getElementById('add-cat-panel-'+t);",
     "    if (btn) btn.classList.toggle('active', t===tab);",
     "    if (panel) panel.classList.toggle('active', t===tab);",
     "  });",
-    "  if (tab==='tmdb') loadGenresForCustom();",
+    "  if (tab==='tmdb-builder') loadGenresForCustom();",
     "}",
     "",
-
     "function toggleCustomCatalogForm() {",
     "  var form = document.getElementById('custom-catalog-form');",
     "  form.classList.toggle('open');",
     "  if (form.classList.contains('open')) {",
-    "    switchAddCatTab('tmdb');",
-    "    loadGenresForCustom();",
+    "    document.getElementById('cc-step-name').classList.add('active');",
+    "    document.getElementById('cc-step-source').classList.remove('active');",
+    "    document.getElementById('cc-new-name').value = '';",
+    "    document.getElementById('cc-new-type').value = 'movie';",
     "  }",
     "}",
+    "function ccGoStep2() {",
+    "  var name = document.getElementById('cc-new-name').value.trim();",
+    "  if (!name) { var n=document.getElementById('cc-new-name'); n.classList.add('error'); setTimeout(function(){ n.classList.remove('error'); },1500); return; }",
+    "  document.getElementById('cc-step2-name-display').textContent = name + ' (' + document.getElementById('cc-new-type').value + ')';",
+    "  document.getElementById('cc-step-name').classList.remove('active');",
+    "  document.getElementById('cc-step-source').classList.add('active');",
+    "  switchAddCatTab('tmdb-builder');",
+    "}",
+    "function ccBackStep1() {",
+    "  document.getElementById('cc-step-source').classList.remove('active');",
+    "  document.getElementById('cc-step-name').classList.add('active');",
+    "}",
+    "",
     "async function loadGenresForCustom() {",
-    "  var type = document.getElementById('cc-type').value;",
+    "  var type = document.getElementById('cc-new-type').value;",
     "  var tt = type==='series'?'tv':'movie';",
     "  if (genreCache[tt]) { populateGenreSelect(genreCache[tt]); return; }",
     "  try {",
@@ -1982,32 +2102,54 @@ function configurePage() {
     "  sel.innerHTML='<option value=\"\">Any Genre</option>'+genres.map(function(g){ return '<option value=\"'+g.id+'\">'+esc(g.name)+'</option>'; }).join('');",
     "}",
     "function addCustomCatalog() {",
-    "  var name=document.getElementById('cc-name').value.trim();",
-    "  var type=document.getElementById('cc-type').value;",
+    "  var name=document.getElementById('cc-new-name').value.trim();",
+    "  var type=document.getElementById('cc-new-type').value;",
     "  var genre=document.getElementById('cc-genre').value;",
     "  var sort=document.getElementById('cc-sort').value;",
-    "  if (!name) { var n=document.getElementById('cc-name'); n.classList.add('error'); setTimeout(function(){ n.classList.remove('error'); },1500); return; }",
+    "  if (!name) return;",
     "  var tt=type==='series'?'tv':'movie';",
     "  var params={sort_by:sort};",
     "  if (genre) params.with_genres=genre;",
     "  state.customCatalogs.push({id:'custom.'+Date.now(), name:name, type:type, path:'/discover/'+tt, params:params, enabled:true});",
-    "  document.getElementById('cc-name').value=''; document.getElementById('cc-genre').value=''; document.getElementById('cc-sort').value='popularity.desc';",
     "  document.getElementById('custom-catalog-form').classList.remove('open');",
     "  renderCustomCatalogsList();",
     "}",
     "function removeCustomCatalog(id) { state.customCatalogs=state.customCatalogs.filter(function(c){ return c.id!==id; }); renderCustomCatalogsList(); }",
+    "function moveCustomCatalog(fromIdx, toIdx) {",
+    "  if (fromIdx===toIdx) return;",
+    "  var moved=state.customCatalogs.splice(fromIdx,1)[0];",
+    "  state.customCatalogs.splice(toIdx,0,moved);",
+    "  renderCustomCatalogsList();",
+    "}",
     "function renderCustomCatalogsList() {",
     "  var el=document.getElementById('custom-catalogs-list');",
     "  if (!state.customCatalogs.length) { el.innerHTML='<div class=\"empty-state\">No custom catalogs yet.</div>'; return; }",
     "  var sortLabels={'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'};",
-    "  el.innerHTML=state.customCatalogs.map(function(c){",
-    "    var sl='';",
+    "  el.innerHTML=state.customCatalogs.map(function(c,idx){",
     "    var sub='';",
     "    if (c.path==='_mdblist_') sub='MDBList \u00b7 '+c.type;",
-    "    else if (c.path==='_imdblist_') sub='IMDB List \u00b7 '+c.type;",
-    "    else { sl=(c.params&&sortLabels[c.params.sort_by])||''; var gp=c.params&&c.params.with_genres?' \u00b7 Genre '+c.params.with_genres:''; sub=c.type+' \u00b7 '+sl+gp; }",
-    "    return '<div class=\"custom-catalog-item\"><div class=\"custom-catalog-item-info\"><div class=\"custom-catalog-item-name\">'+esc(c.name)+'</div><div class=\"custom-catalog-item-sub\">'+sub+'</div></div><button class=\"btn btn-danger btn-sm\" onclick=\"removeCustomCatalog(\\'' + c.id + '\\')\">\u00d7 Remove</button></div>';",
+    "    else if (c.path==='_imdblist_') sub='IMDB \u00b7 '+c.type;",
+    "    else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; var gp=c.params&&c.params.with_genres?' \u00b7 Genre '+c.params.with_genres:''; sub='TMDB \u00b7 '+c.type+' \u00b7 '+sl+gp; }",
+    "    return '<div class=\"custom-catalog-item\" data-catidx=\"'+idx+'\" draggable=\"true\">'+",
+    "      '<span class=\"cat-drag-handle\" title=\"Drag to reorder\">\u2261</span>'+",
+    "      '<div class=\"custom-catalog-item-info\">'+",
+    "        '<div class=\"custom-catalog-item-name\">'+esc(c.name)+'</div>'+",
+    "        '<div class=\"custom-catalog-item-sub\">'+sub+'</div>'+",
+    "      '</div>'+",
+    "      '<button class=\"btn btn-danger btn-sm\" onclick=\"removeCustomCatalog(\\'' + c.id + '\\')\">\u00d7</button>'+",
+    "    '</div>';",
     "  }).join('');",
+    "  initCatalogDragSort();",
+    "}",
+    "function initCatalogDragSort() {",
+    "  var items = document.querySelectorAll('.custom-catalog-item');",
+    "  var dragIdx = null;",
+    "  items.forEach(function(item) {",
+    "    item.addEventListener('dragstart', function(e) { dragIdx=parseInt(item.dataset.catidx); item.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; });",
+    "    item.addEventListener('dragend', function() { item.classList.remove('dragging'); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); });",
+    "    item.addEventListener('dragover', function(e) { e.preventDefault(); document.querySelectorAll('.custom-catalog-item').forEach(function(i){ i.classList.remove('drag-over-cat'); }); item.classList.add('drag-over-cat'); });",
+    "    item.addEventListener('drop', function(e) { e.preventDefault(); item.classList.remove('drag-over-cat'); var toIdx=parseInt(item.dataset.catidx); if(dragIdx!==null&&dragIdx!==toIdx) moveCustomCatalog(dragIdx,toIdx); dragIdx=null; });",
+    "  });",
     "}",
     "",
 
@@ -2029,7 +2171,7 @@ function configurePage() {
     "    if (d.error) throw new Error(d.error);",
     "    if (!d.metas || !d.metas.length) throw new Error('No movies or shows found in this list.');",
     "    mdbCatalogPreviewData = { url: url, metas: d.metas, name: d.name, count: d.count };",
-    "    if (d.name) document.getElementById('mdb-cat-name').value = d.name;",
+    "    if (d.name && !document.getElementById('cc-new-name').value.trim()) document.getElementById('cc-new-name').value = d.name;",
     "    var movieCount = d.metas.filter(function(m){ return m.type === 'movie'; }).length;",
     "    document.getElementById('mdb-cat-type').value = movieCount >= d.metas.length / 2 ? 'movie' : 'series';",
     "    var thumbs = d.metas.slice(0, 8).map(function(m) {",
@@ -2047,15 +2189,15 @@ function configurePage() {
     "}",
     "function addMdbCatalog() {",
     "  if (!mdbCatalogPreviewData) return;",
-    "  var name = document.getElementById('mdb-cat-name').value.trim() || 'MDBList';",
+    "  var name = document.getElementById('cc-new-name').value.trim() || 'MDBList';",
     "  var type = document.getElementById('mdb-cat-type').value;",
     "  var url  = mdbCatalogPreviewData.url;",
     "  state.customCatalogs.push({ id: 'mdblist.' + Date.now(), name: name, type: type, path: '_mdblist_', mdblistUrl: url, enabled: true });",
     "  document.getElementById('mdb-cat-url').value = '';",
     "  document.getElementById('mdb-cat-preview').style.display = 'none';",
-    "  document.getElementById('mdb-cat-status').textContent = '\u2713 Added \"' + name + '\"';",
-    "  document.getElementById('mdb-cat-status').style.color = 'var(--gold)';",
+    "  document.getElementById('mdb-cat-status').textContent = '';",
     "  mdbCatalogPreviewData = null;",
+    "  document.getElementById('custom-catalog-form').classList.remove('open');",
     "  renderCustomCatalogsList();",
     "}",
     "",
@@ -2078,7 +2220,7 @@ function configurePage() {
     "    if (d.error) throw new Error(d.error);",
     "    if (!d.metas || !d.metas.length) throw new Error('No items found in this IMDB list.');",
     "    imdbCatalogPreviewData = { listId: d.listId, url: url, metas: d.metas, name: d.name, count: d.count };",
-    "    if (d.name) document.getElementById('imdb-cat-name').value = d.name;",
+    "    if (d.name && !document.getElementById('cc-new-name').value.trim()) document.getElementById('cc-new-name').value = d.name;",
     "    var movieCount = d.metas.filter(function(m){ return m.type === 'movie'; }).length;",
     "    document.getElementById('imdb-cat-type').value = movieCount >= d.metas.length / 2 ? 'movie' : 'series';",
     "    var thumbs = d.metas.slice(0, 8).map(function(m) {",
@@ -2095,14 +2237,15 @@ function configurePage() {
     "}",
     "function addImdbCatalog() {",
     "  if (!imdbCatalogPreviewData) return;",
-    "  var name = document.getElementById('imdb-cat-name').value.trim() || 'IMDB List';",
+    "  var name = document.getElementById('cc-new-name').value.trim() || imdbCatalogPreviewData.name || 'IMDB';",
     "  var type = document.getElementById('imdb-cat-type').value;",
-    "  state.customCatalogs.push({ id: 'imdblist.' + Date.now(), name: name, type: type, path: '_imdblist_', imdbListId: imdbCatalogPreviewData.listId, enabled: true });",
+    "  state.customCatalogs.push({ id: 'imdblist.' + Date.now(), name: name, type: type, path: '_imdblist_', imdbListId: imdbCatalogPreviewData.listId, imdbUrl: imdbCatalogPreviewData.url, enabled: true });",
     "  document.getElementById('imdb-cat-url').value = '';",
     "  document.getElementById('imdb-cat-preview').style.display = 'none';",
     "  document.getElementById('imdb-cat-status').textContent = '\u2713 Added \"' + name + '\"';",
     "  document.getElementById('imdb-cat-status').style.color = 'var(--gold)';",
     "  imdbCatalogPreviewData = null;",
+    "  document.getElementById('custom-catalog-form').classList.remove('open');",
     "  renderCustomCatalogsList();",
     "}",
     "",
@@ -2115,7 +2258,7 @@ function configurePage() {
     "  tmdbCatSearchTimer = setTimeout(function(){ doTmdbCatSearch(q); }, 350);",
     "}",
     "async function doTmdbCatSearch(q) {",
-    "  var type = document.getElementById('cc-type').value;",
+    "  var type = document.getElementById('cc-new-type').value;",
     "  var box = document.getElementById('tmdb-cat-results');",
     "  box.innerHTML = '<div class=\"loading-state\" style=\"padding:0.8rem 0\"><div class=\"spinner-light\"></div> Searching...</div>';",
     "  try {",
@@ -2130,17 +2273,13 @@ function configurePage() {
     "  } catch(e) { box.innerHTML='<p style=\"font-size:0.78rem;color:var(--text-mute);padding:4px 0\">Search error.</p>'; }",
     "}",
     "function selectTmdbCatalogItem(tmdbId, name, type) {",
-    "  var catName = document.getElementById('cc-name');",
+    "  var catName = document.getElementById('cc-new-name');",
     "  if (!catName.value) catName.value = name;",
     "  var tt = type==='series'?'tv':'movie';",
-    "  var params = { sort_by: document.getElementById('cc-sort').value };",
-    "  var genre = document.getElementById('cc-genre').value;",
-    "  if (genre) params.with_genres = genre;",
-    "  // Build a discover catalog pre-filtered — or a direct single-show catalog",
-    "  // For a single show, we just filter by with_keywords equivalent; use a tmdb ID filter via the API path",
-    "  // Actually, store as a special path for single-show override",
-    "  state.customCatalogs.push({ id: 'tmdb_single.'+Date.now(), name: catName.value || name, type: type, path: '/discover/'+tt, params: Object.assign({}, params, {with_people: '', with_companies: ''}), enabled: true });",
-    "  document.getElementById('cc-name').value = '';",
+    "  var params = { sort_by: 'popularity.desc' };",
+    "  var genre = document.getElementById('cc-genre'); if(genre&&genre.value) params.with_genres=genre.value;",
+    "  state.customCatalogs.push({ id: 'tmdb_pick.'+Date.now(), name: catName.value || name, type: type, path: '/discover/'+tt, params: params, enabled: true });",
+    "  document.getElementById('cc-new-name').value = '';",
     "  document.getElementById('tmdb-cat-results').innerHTML = '';",
     "  document.getElementById('cc-search').value = '';",
     "  document.getElementById('custom-catalog-form').classList.remove('open');",
@@ -2595,7 +2734,8 @@ function configurePage() {
   <div class="page active" id="page-1">
     <div class="hero-wrap">
       <div class="hero-bg">
-        <div class="hero-bg-track" id="hero-bg-track"></div>
+        <div class="hero-bg-row" id="hero-bg-row1"></div>
+        <div class="hero-bg-row row2" id="hero-bg-row2"></div>
         <div class="hero-bg-overlay"></div>
       </div>
       <div class="hero">
@@ -2705,7 +2845,7 @@ function configurePage() {
 
       <div class="catalog-group" id="catalog-group-movie">
         <div class="catalog-group-header" onclick="toggleCatalogGroup('movie')">
-          <span class="catalog-section-label">Movies</span>
+          <span class="catalog-section-label">TMDB Movies</span>
           <span class="catalog-group-chevron">&#9660;</span>
         </div>
         <div class="catalog-group-body">
@@ -2715,7 +2855,7 @@ function configurePage() {
 
       <div class="catalog-group" id="catalog-group-series">
         <div class="catalog-group-header" onclick="toggleCatalogGroup('series')">
-          <span class="catalog-section-label">Series</span>
+          <span class="catalog-section-label">TMDB Series</span>
           <span class="catalog-group-chevron">&#9660;</span>
         </div>
         <div class="catalog-group-body">
@@ -2733,71 +2873,88 @@ function configurePage() {
         <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">+ Add</button>
       </div>
 
+      <!-- Step 1: Name the catalog -->
       <div class="custom-catalog-form" id="custom-catalog-form">
-        <div class="add-cat-tabs">
-          <button class="add-cat-tab active" id="add-cat-tab-tmdb" onclick="switchAddCatTab('tmdb')">TMDB Discover</button>
-          <button class="add-cat-tab" id="add-cat-tab-mdblist" onclick="switchAddCatTab('mdblist')">MDBList</button>
-          <button class="add-cat-tab" id="add-cat-tab-imdb" onclick="switchAddCatTab('imdb')">IMDB List</button>
-        </div>
-
-        <!-- TMDB Discover panel -->
-        <div class="add-cat-panel active" id="add-cat-panel-tmdb">
+        <div id="cc-step-name" class="cc-step active">
+          <div style="font-size:0.8rem;font-weight:600;color:var(--text-dim);margin-bottom:10px">New Catalog — Step 1 of 2</div>
           <div class="form-row">
-            <div class="field" style="margin-bottom:0"><label>Catalog Name</label><input type="text" id="cc-name" placeholder="e.g. Sci-Fi Classics"/></div>
-            <div class="field" style="margin-bottom:0"><label>Type</label><select id="cc-type" onchange="loadGenresForCustom();debounceTmdbCatSearch(document.getElementById('cc-search').value)"><option value="movie">Movie</option><option value="series">Series</option></select></div>
+            <div class="field" style="margin-bottom:0"><label>Catalog Name</label><input type="text" id="cc-new-name" placeholder="e.g. Sci-Fi Classics" onkeydown="if(event.key==='Enter') ccGoStep2()"/></div>
+            <div class="field" style="margin-bottom:0"><label>Type</label><select id="cc-new-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
           </div>
-          <div class="form-row" style="margin-top:10px">
-            <div class="field" style="margin-bottom:0"><label>Genre</label><select id="cc-genre"><option value="">Any Genre</option></select></div>
-            <div class="field" style="margin-bottom:0"><label>Sort By</label><select id="cc-sort"><option value="popularity.desc">Most Popular</option><option value="vote_average.desc">Highest Rated</option><option value="release_date.desc">Newest First</option><option value="revenue.desc">Highest Revenue</option></select></div>
-          </div>
-          <div style="margin-top:10px">
-            <label style="margin-bottom:6px">Search TMDB (optional — refine by actor, keyword, etc.)</label>
-            <input type="text" id="cc-search" placeholder="Search TMDB for movies or shows..." oninput="debounceTmdbCatSearch(this.value)"/>
-            <div id="tmdb-cat-results" style="margin-top:4px"></div>
-          </div>
-          <div style="display:flex;gap:8px;margin-top:14px">
-            <button class="btn btn-primary btn-sm" onclick="addCustomCatalog()">Add Catalog</button>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn btn-primary btn-sm" onclick="ccGoStep2()">Next &rarr;</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button>
           </div>
         </div>
 
-        <!-- MDBList panel -->
-        <div class="add-cat-panel" id="add-cat-panel-mdblist">
-          <div style="display:flex;gap:8px;margin-bottom:8px">
-            <input type="text" id="mdb-cat-url" placeholder="https://mdblist.com/lists/username/listname" style="flex:1;font-size:0.85rem"/>
-            <button class="btn btn-ghost btn-sm" id="mdb-cat-btn" onclick="previewMdbCatalog()" style="white-space:nowrap">Preview</button>
+        <!-- Step 2: Choose source -->
+        <div id="cc-step-source" class="cc-step">
+          <div style="font-size:0.8rem;font-weight:600;color:var(--text-dim);margin-bottom:2px">New Catalog — Step 2 of 2</div>
+          <div style="font-size:0.75rem;color:var(--text-mute);margin-bottom:12px">Name: <span id="cc-step2-name-display" style="color:var(--gold)"></span> &nbsp;·&nbsp; <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:0.7rem" onclick="ccBackStep1()">← Edit</button></div>
+          <div class="add-cat-tabs">
+            <button class="add-cat-tab active" id="add-cat-tab-tmdb-builder" onclick="switchAddCatTab('tmdb-builder')">TMDB Builder</button>
+            <button class="add-cat-tab" id="add-cat-tab-tmdb-pick" onclick="switchAddCatTab('tmdb-pick')">Pick from TMDB</button>
+            <button class="add-cat-tab" id="add-cat-tab-mdblist" onclick="switchAddCatTab('mdblist')">MDBList</button>
+            <button class="add-cat-tab" id="add-cat-tab-imdb" onclick="switchAddCatTab('imdb')">IMDB</button>
           </div>
-          <div id="mdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
-          <div id="mdb-cat-preview" style="display:none">
-            <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
-              <div class="field" style="margin-bottom:0;flex:1;min-width:160px"><label>Catalog Name</label><input type="text" id="mdb-cat-name" placeholder="My MDBList"/></div>
-              <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="mdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
-              <button class="btn btn-primary btn-sm" onclick="addMdbCatalog()">Add</button>
-            </div>
-            <div id="mdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7"></div>
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button>
-          </div>
-        </div>
 
-        <!-- IMDB List panel -->
-        <div class="add-cat-panel" id="add-cat-panel-imdb">
-          <div style="display:flex;gap:8px;margin-bottom:8px">
-            <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/" style="flex:1;font-size:0.85rem"/>
-            <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
-          </div>
-          <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
-          <div id="imdb-cat-preview" style="display:none">
-            <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
-              <div class="field" style="margin-bottom:0;flex:1;min-width:160px"><label>Catalog Name</label><input type="text" id="imdb-cat-name" placeholder="My IMDB List"/></div>
-              <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="imdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
-              <button class="btn btn-primary btn-sm" onclick="addImdbCatalog()">Add</button>
+          <!-- TMDB Builder panel -->
+          <div class="add-cat-panel active" id="add-cat-panel-tmdb-builder">
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Build a dynamic catalog from TMDB Discover with genre and sort filters.</div>
+            <div class="form-row">
+              <div class="field" style="margin-bottom:0"><label>Genre</label><select id="cc-genre"><option value="">Any Genre</option></select></div>
+              <div class="field" style="margin-bottom:0"><label>Sort By</label><select id="cc-sort"><option value="popularity.desc">Most Popular</option><option value="vote_average.desc">Highest Rated</option><option value="release_date.desc">Newest First</option><option value="revenue.desc">Highest Revenue</option></select></div>
             </div>
-            <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7"></div>
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <button class="btn btn-primary btn-sm" onclick="addCustomCatalog()">Add Catalog</button>
+              <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button>
+            </div>
           </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button>
+
+          <!-- TMDB Pick panel (pick a specific movie/show from TMDB) -->
+          <div class="add-cat-panel" id="add-cat-panel-tmdb-pick">
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Search TMDB to create a catalog pre-populated with similar titles.</div>
+            <input type="text" id="cc-search" placeholder="Search TMDB for a movie or show..." oninput="debounceTmdbCatSearch(this.value)"/>
+            <div id="tmdb-cat-results" style="margin-top:6px"></div>
+            <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
+          </div>
+
+          <!-- MDBList panel -->
+          <div class="add-cat-panel" id="add-cat-panel-mdblist">
+            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ MDBList import is experimental — some lists may not resolve correctly.</div>
+            <div style="display:flex;gap:8px;margin-bottom:8px">
+              <input type="text" id="mdb-cat-url" placeholder="https://mdblist.com/lists/username/listname" style="flex:1;font-size:0.85rem"/>
+              <button class="btn btn-ghost btn-sm" id="mdb-cat-btn" onclick="previewMdbCatalog()" style="white-space:nowrap">Preview</button>
+            </div>
+            <div id="mdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
+            <div id="mdb-cat-preview" style="display:none">
+              <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
+                <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="mdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
+                <button class="btn btn-primary btn-sm" onclick="addMdbCatalog()">Add</button>
+              </div>
+              <div id="mdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7"></div>
+            </div>
+            <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
+          </div>
+
+          <!-- IMDB panel -->
+          <div class="add-cat-panel" id="add-cat-panel-imdb">
+            <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">⚠ IMDB import is experimental — IMDB frequently blocks automated access.</div>
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Paste an IMDB list URL or a chart URL (e.g. Top 250, Box Office).</div>
+            <div style="display:flex;gap:8px;margin-bottom:4px">
+              <input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/ or /chart/top/" style="flex:1;font-size:0.85rem"/>
+              <button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button>
+            </div>
+            <div style="font-size:0.68rem;color:var(--text-mute);margin-bottom:8px">Charts: /chart/top/ · /chart/moviemeter/ · /chart/toptv/ · /chart/tvmeter/ · /chart/boxoffice/</div>
+            <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
+            <div id="imdb-cat-preview" style="display:none">
+              <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
+                <div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="imdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div>
+                <button class="btn btn-primary btn-sm" onclick="addImdbCatalog()">Add</button>
+              </div>
+              <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7"></div>
+            </div>
+            <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
           </div>
         </div>
       </div>
