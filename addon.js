@@ -1083,13 +1083,20 @@ app.get('/:config/poster/:listId.jpg', async function(req, res) {
 
   // Canvas-based poster generation
   let createCanvas, loadImage;
+  let canvasAvailable = true;
   try {
     ({ createCanvas, loadImage } = require('canvas'));
   } catch(e) {
-    // canvas not installed — fallback to default TMDB poster
+    canvasAvailable = false;
+  }
+
+  if (!canvasAvailable) {
+    // canvas not installed — log clearly and fall back
+    console.warn('[poster] canvas module not available. Install it with: npm install canvas');
+    console.warn('[poster] Falling back to TMDB poster for list:', list.listId, '(mode:', spec.mode + ')');
     const series = await getSeries(list.tmdbId, cfg.tmdbApiKey).catch(()=>null);
     if (series && series.poster_path) return res.redirect(TMDB_IMG_MD + series.poster_path);
-    return res.status(500).send('canvas module not available');
+    return res.status(500).send('canvas module not available — install with: npm install canvas');
   }
 
   const W = 342, H = 513;
@@ -2614,8 +2621,14 @@ function configurePage(existingConfig) {
     "function addBestOfCatalog() {",
     "  if (!window._bestofPickSelection || !window._bestofPickSelection.size) return;",
     "  var listIds=Array.from(window._bestofPickSelection);",
-    "  var labels=listIds.map(function(id){ var l=state.customSeasons.find(function(x){return x.listId===id;}); return l?l.label||'Best Of':''; }).filter(Boolean);",
-    "  var name=labels.slice(0,2).join(' + ')+(labels.length>2?' + more':'');",
+    "  // Use the catalog name the user entered in Step 1; fall back to auto-generated from labels",
+    "  var userEnteredName=(document.getElementById('cc-new-name')||{}).value;",
+    "  userEnteredName=userEnteredName?userEnteredName.trim():'';",
+    "  var name=userEnteredName;",
+    "  if (!name) {",
+    "    var labels=listIds.map(function(id){ var l=state.customSeasons.find(function(x){return x.listId===id;}); return l?l.label||'Best Of':''; }).filter(Boolean);",
+    "    name=labels.slice(0,2).join(' + ')+(labels.length>2?' + more':'');",
+    "  }",
     "  var newCat={id:'bestofcat.'+Date.now(),name:name,type:'series',path:'_bestof_',bestofListIds:listIds,enabled:true};",
     "  state.customCatalogs.push(newCat);",
     "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
@@ -3164,12 +3177,22 @@ function configurePage(existingConfig) {
     "function updateModalCount() { document.getElementById('modal-sel-count').textContent=modalData.selected.size; }",
     "function addSelectedEpisodes() {",
     "  var list=getList(modalData.listId); if(!list){ closeModal(); return; }",
-    "  var keys=Array.from(modalData.selected);",
-    "  var episodes=keys.map(function(k){ var p=k.split(':').map(Number); return modalData.allEpisodes.find(function(ep){ return ep.season===p[0]&&ep.episode===p[1]; }); }).filter(Boolean);",
-    "  var existingKeys=new Set(list.episodes.map(function(e){ return e.season+':'+e.episode; }));",
-    "  var kept=list.episodes.filter(function(e){ return keys.indexOf(e.season+':'+e.episode)!==-1; });",
-    "  var newEps=episodes.filter(function(e){ return !existingKeys.has(e.season+':'+e.episode); });",
-    "  list.episodes=kept.concat(newEps);",
+    "  // Build the set of all visible episode keys in the modal",
+    "  var visibleKeys=new Set(modalData.allEpisodes.map(function(e){ return e.season+':'+e.episode; }));",
+    "  // Keep existing episodes that were NOT shown in this modal session (untouched)",
+    "  var untouched=list.episodes.filter(function(e){ return !visibleKeys.has(e.season+':'+e.episode); });",
+    "  // From visible episodes, keep those the user left selected (preserve existing data like stills)",
+    "  var prevVisibleSelected=list.episodes.filter(function(e){",
+    "    return visibleKeys.has(e.season+':'+e.episode)&&modalData.selected.has(e.season+':'+e.episode);",
+    "  });",
+    "  var prevSelectedKeys=new Set(prevVisibleSelected.map(function(e){ return e.season+':'+e.episode; }));",
+    "  // Add newly selected episodes (not previously in the list)",
+    "  var newlyAdded=Array.from(modalData.selected).map(function(k){",
+    "    if (prevSelectedKeys.has(k)) return null;",
+    "    var p=k.split(':').map(Number);",
+    "    return modalData.allEpisodes.find(function(ep){ return ep.season===p[0]&&ep.episode===p[1]; });",
+    "  }).filter(Boolean);",
+    "  list.episodes=untouched.concat(prevVisibleSelected).concat(newlyAdded);",
     "  closeModal(); renderListEpisodes(modalData.listId); updateEpCount(modalData.listId);",
     "}",
     "function closeModal(){ document.getElementById('modal-backdrop').classList.remove('open'); document.body.style.overflow=''; }",
@@ -3226,6 +3249,10 @@ function configurePage(existingConfig) {
     "  var editUrl=window.location.origin+'/'+encoded+'/configure';",
     "  document.getElementById('manifest-url').value=manifestUrl;",
     "  document.getElementById('edit-url').value=editUrl;",
+    "  // Warn if canvas-dependent poster modes are used (banner/logo require canvas npm module on server)",
+    "  var needsCanvas=state.customSeasons.some(function(l){ var m=l.posterMode||'default'; return m==='banner'||m==='logo'; });",
+    "  var canvasWarn=document.getElementById('canvas-warn');",
+    "  if(canvasWarn) canvasWarn.style.display=needsCanvas?'block':'none';",
     "  var listCount=state.customSeasons.length;",
     "  var showCount=new Set(state.customSeasons.map(function(l){ return l.tmdbId; })).size;",
     "  var enabledDefaultCount=DEFAULT_CATALOGS.filter(function(d){ var ov=state.catalogEnabled[d.id]; return ov!==undefined?ov:d.enabled; }).length;",
@@ -3523,6 +3550,7 @@ function configurePage(existingConfig) {
       </div>
       <div id="ep-parade" class="ep-parade" style="display:none"></div>
       <div id="install-summary"></div>
+      <div id="canvas-warn" style="display:none;background:rgba(240,192,64,0.08);border:1px solid rgba(240,192,64,0.3);border-radius:10px;padding:12px 16px;margin-bottom:14px;font-size:0.78rem;color:var(--gold);line-height:1.6"><strong>&#9888; Canvas module required</strong><br/>You have lists using Banner or Logo poster styles. These are generated server-side and require the <code style="background:rgba(0,0,0,0.3);padding:2px 5px;border-radius:4px">canvas</code> npm module. If your posters show as default TMDB images after install, run:<br/><code style="background:rgba(0,0,0,0.3);padding:3px 8px;border-radius:4px;display:inline-block;margin-top:6px">npm install canvas</code><br/>then restart the server. Alternatively, switch to <strong>Custom URL</strong> poster mode.</div>
       <button class="btn-install" onclick="openStremio()">Open in Stremio</button>
       <div class="or-divider">&mdash; or copy the manifest URL &mdash;</div>
       <div class="copy-row">
@@ -3571,6 +3599,17 @@ ${clientJS}
 }
 
 const PORT = process.env.PORT || 7000;
+
+// Check for optional canvas module at startup
+try {
+  require('canvas');
+  console.log('[GoodTaste] canvas module found — Banner/Logo poster styles will work.');
+} catch(e) {
+  console.warn('[GoodTaste] WARNING: canvas module not installed.');
+  console.warn('[GoodTaste] Banner and Logo poster styles require canvas. Install with: npm install canvas');
+  console.warn('[GoodTaste] Without canvas, those poster styles will fall back to the default TMDB poster.');
+}
+
 app.listen(PORT, function() {
   console.log('GoodTaste addon running on port ' + PORT);
   console.log('Configure: http://localhost:' + PORT + '/configure');
