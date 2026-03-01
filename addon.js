@@ -622,20 +622,27 @@ app.get('/api/tmdb-search', async function(req, res) {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── HERO BACKDROPS (configure start page only) ──────────────────────────────
+// Uses the GOODTASTE_HERO_API_KEY environment variable — never the user's key.
+// Set this in your Render (or other host) environment variables.
+const HERO_API_KEY = process.env.GOODTASTE_HERO_API_KEY || null;
+
 app.get('/api/hero-backdrops', async function(req, res) {
-  const { apiKey } = req.query;
-  if (!apiKey) return res.json({ backdrops: [] });
+  // Only use the dedicated hero API key — never accept one from the query string
+  const heroKey = HERO_API_KEY;
+  if (!heroKey) return res.json({ backdrops: [] });
   try {
     const [movies, shows] = await Promise.all([
-      tmdb('/trending/movie/week', apiKey),
-      tmdb('/trending/tv/week', apiKey),
+      tmdb('/trending/movie/week', heroKey),
+      tmdb('/trending/tv/week',   heroKey),
     ]);
-    const movieBackdrops = (movies.results || []).slice(0, 10)
-      .filter(m => m.backdrop_path)
-      .map(m => ({ type: 'movie', name: m.title || m.original_title, backdrop: TMDB_IMG_LG + m.backdrop_path, poster: m.poster_path ? TMDB_IMG_MD + m.poster_path : null }));
-    const showBackdrops = (shows.results || []).slice(0, 10)
-      .filter(s => s.backdrop_path)
-      .map(s => ({ type: 'series', name: s.name || s.original_name, backdrop: TMDB_IMG_LG + s.backdrop_path, poster: s.poster_path ? TMDB_IMG_MD + s.poster_path : null }));
+    // 15 per row = 30 total across both rows
+    const movieBackdrops = (movies.results || []).slice(0, 15)
+      .filter(m => m.poster_path)
+      .map(m => ({ type: 'movie', name: m.title || m.original_title, poster: TMDB_IMG_MD + m.poster_path }));
+    const showBackdrops = (shows.results || []).slice(0, 15)
+      .filter(s => s.poster_path)
+      .map(s => ({ type: 'series', name: s.name || s.original_name, poster: TMDB_IMG_MD + s.poster_path }));
     res.json({ backdrops: [...movieBackdrops, ...showBackdrops] });
   } catch (e) { res.status(500).json({ error: e.message, backdrops: [] }); }
 });
@@ -1069,136 +1076,22 @@ app.get('/:config/poster/:listId.jpg', async function(req, res) {
 
   const spec = list.posterSpec;
 
-  if (!spec || spec.mode === 'default' || !spec.mode) {
-    try {
-      const series = await getSeries(list.tmdbId, cfg.tmdbApiKey);
-      if (!series.poster_path) return res.status(404).send('No poster');
-      return res.redirect(TMDB_IMG_MD + series.poster_path);
-    } catch(e) { return res.status(500).send('Error'); }
+  // url mode: redirect to the custom URL
+  if (spec && spec.mode === 'url' && spec.url) {
+    return res.redirect(spec.url);
   }
 
-  if (spec.mode === 'url') {
-    return res.redirect(spec.url || '');
+  // legacy banner/logo modes (canvas removed) — fall through to default TMDB poster
+  if (spec && (spec.mode === 'banner' || spec.mode === 'logo')) {
+    console.log('[poster] Legacy', spec.mode, 'mode for list', listId, '— falling back to TMDB poster (canvas modes removed)');
   }
 
-  // Canvas-based poster generation
-  let createCanvas, loadImage;
-  let canvasAvailable = true;
+  // default: redirect to TMDB poster
   try {
-    ({ createCanvas, loadImage } = require('canvas'));
-  } catch(e) {
-    canvasAvailable = false;
-  }
-
-  if (!canvasAvailable) {
-    // canvas not installed — log clearly and fall back
-    console.warn('[poster] canvas module not available. Install it with: npm install canvas');
-    console.warn('[poster] Falling back to TMDB poster for list:', list.listId, '(mode:', spec.mode + ')');
-    const series = await getSeries(list.tmdbId, cfg.tmdbApiKey).catch(()=>null);
-    if (series && series.poster_path) return res.redirect(TMDB_IMG_MD + series.poster_path);
-    return res.status(500).send('canvas module not available — install with: npm install canvas');
-  }
-
-  const W = 342, H = 513;
-  const canvas = createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-
-  if (spec.mode === 'banner') {
-    try {
-      const series = await getSeries(list.tmdbId, cfg.tmdbApiKey);
-      if (!series.poster_path) return res.status(404).send('No poster');
-      const imgResp = await axios.get(TMDB_IMG_MD + series.poster_path, { responseType: 'arraybuffer', timeout: 15000, headers: { 'Referer': 'https://www.themoviedb.org/' } });
-      const img = await loadImage(Buffer.from(imgResp.data));
-      ctx.drawImage(img, 0, 0, W, H);
-      const barH = Math.round(H * 0.14);
-      const pos = spec.pos || 'bottom';
-      const barY = pos === 'top' ? 0 : H - barH;
-      const barColor = spec.barColor || '#000000';
-      const opacity = spec.opacity != null ? spec.opacity : 0.75;
-      const textColor = spec.textColor || '#ffffff';
-      const r=parseInt(barColor.slice(1,3),16), g=parseInt(barColor.slice(3,5),16), b=parseInt(barColor.slice(5,7),16);
-      ctx.fillStyle=`rgba(${r},${g},${b},${opacity})`; ctx.fillRect(0,barY,W,barH);
-      const label=(list.label||'Best Of');
-      const fontSize=Math.round(barH*0.32);
-      ctx.fillStyle=textColor; ctx.font=`600 ${fontSize}px sans-serif`;
-      ctx.textAlign='center'; ctx.textBaseline='middle';
-      const maxWidth=W-24; const words=label.split(' ');
-      const lines=[]; let line='';
-      for(const w of words){const test=(line?line+' ':'')+w;if(ctx.measureText(test).width>maxWidth&&line){lines.push(line);line=w;}else line=test;}
-      if(line) lines.push(line);
-      const lineH=fontSize*1.2; const totalH=lines.length*lineH;
-      const startY=barY+(barH-totalH)/2+lineH/2;
-      lines.forEach((l,j)=>ctx.fillText(l,W/2,startY+j*lineH));
-      res.set('Content-Type','image/jpeg'); res.set('Cache-Control','public, max-age=86400');
-      canvas.createJPEGStream({quality:0.9}).pipe(res);
-    } catch(e) { console.error('[poster/banner]',e.message); res.status(500).send('Error'); }
-    return;
-  }
-
-  if (spec.mode === 'logo') {
-    try {
-      const bgColor=spec.bgColor||'#111111', textColor=spec.textColor||'#ffffff';
-      ctx.fillStyle=bgColor; ctx.fillRect(0,0,W,H);
-      const grad=ctx.createRadialGradient(W/2,H*0.35,10,W/2,H*0.35,W*0.7);
-      grad.addColorStop(0,'rgba(255,255,255,0.07)'); grad.addColorStop(1,'rgba(0,0,0,0)');
-      ctx.fillStyle=grad; ctx.fillRect(0,0,W,H);
-      let logoDrawn=false;
-      try {
-        const imgData = await tmdb('/tv/' + list.tmdbId + '/images', cfg.tmdbApiKey, { include_image_language: 'en,null' });
-        const logos=(imgData.logos||[]).filter(l=>l.file_path).sort((a,b)=>(b.vote_average||0)-(a.vote_average||0));
-        if (logos[0]) {
-          const logoResp=await axios.get('https://image.tmdb.org/t/p/w500'+logos[0].file_path,{responseType:'arraybuffer',timeout:15000,headers:{'Referer':'https://www.themoviedb.org/'}});
-          const logoImg=await loadImage(Buffer.from(logoResp.data));
-          const lW=W-60,lH=Math.round(H*0.25);
-          const scale=Math.min(lW/logoImg.width,lH/logoImg.height);
-          const dW=logoImg.width*scale,dH=logoImg.height*scale;
-          ctx.drawImage(logoImg,(W-dW)/2,(H*0.28-dH/2),dW,dH);
-          logoDrawn=true;
-        }
-      } catch(e) { /* fall through to text */ }
-      if (!logoDrawn) {
-        ctx.fillStyle=textColor; ctx.font=`bold ${Math.round(W*0.09)}px sans-serif`;
-        ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(list.tmdbName||'',W/2,H*0.32);
-      }
-      ctx.strokeStyle='rgba(255,255,255,0.15)'; ctx.lineWidth=1;
-      ctx.beginPath(); ctx.moveTo(40,H*0.58); ctx.lineTo(W-40,H*0.58); ctx.stroke();
-      const label=list.label||'Best Of';
-      ctx.fillStyle=textColor; ctx.textAlign='center'; ctx.textBaseline='middle';
-      const fontSize=Math.round(W*0.065);
-      ctx.font=`600 ${fontSize}px sans-serif`;
-      const maxWidth=W-48; const words=label.split(' ');
-      const lines=[]; let line='';
-      for(const w of words){const test=(line?line+' ':'')+w;if(ctx.measureText(test).width>maxWidth&&line){lines.push(line);line=w;}else line=test;}
-      if(line) lines.push(line);
-      const lineH=fontSize*1.35; const totalH=lines.length*lineH;
-      const startY=H*0.72-totalH/2+lineH/2;
-      lines.forEach((l,j)=>ctx.fillText(l,W/2,startY+j*lineH));
-      res.set('Content-Type','image/jpeg'); res.set('Cache-Control','public, max-age=86400');
-      canvas.createJPEGStream({quality:0.9}).pipe(res);
-    } catch(e) { console.error('[poster/logo]',e.message); res.status(500).send('Error'); }
-    return;
-  }
-
-  res.status(400).send('Unknown poster mode');
-});
-
-// ─── SERIES LOGO ENDPOINT (for poster customization) ─────────────────────────
-app.get('/api/series-logo', async function(req, res) {
-  const { tmdbId, apiKey } = req.query;
-  if (!tmdbId || !apiKey) return res.status(400).json({ error: 'tmdbId and apiKey required' });
-  try {
-    const data = await tmdb('/tv/' + tmdbId + '/images', apiKey, { include_image_language: 'en,null' });
-    const logos = (data.logos || []).filter(l => l.file_path);
-    const best = logos.sort((a, b) => (b.vote_average || 0) - (a.vote_average || 0))[0];
-    if (best) {
-      return res.json({ logoUrl: 'https://image.tmdb.org/t/p/w500' + best.file_path });
-    }
-    // Fallback: try series backdrop as logo source
-    const seriesData = await tmdb('/tv/' + tmdbId, apiKey);
-    res.json({ logoUrl: null, backdropUrl: seriesData.backdrop_path ? 'https://image.tmdb.org/t/p/w1280' + seriesData.backdrop_path : null });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const series = await getSeries(list.tmdbId, cfg.tmdbApiKey);
+    if (!series.poster_path) return res.status(404).send('No poster');
+    return res.redirect(TMDB_IMG_MD + series.poster_path);
+  } catch(e) { return res.status(500).send('Error'); }
 });
 
 // ─── META ENDPOINTS ───────────────────────────────────────────────────────────
@@ -1600,9 +1493,9 @@ function configurePage(existingConfig) {
     }
     .hero-features {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr 1fr 1fr;
       gap: 8px;
-      max-width: 580px;
+      max-width: 680px;
       margin: 0 auto;
       text-align: left;
     }
@@ -1639,7 +1532,8 @@ function configurePage(existingConfig) {
       border-radius: 3px;
       vertical-align: middle;
     }
-    @media (max-width: 480px) { .hero-features { grid-template-columns: 1fr; } }
+    @media (max-width: 600px) { .hero-features { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 420px) { .hero-features { grid-template-columns: 1fr; } }
 
     .edit-mode-banner {
       background: rgba(240,192,64,0.08);
@@ -1817,20 +1711,7 @@ function configurePage(existingConfig) {
     .show-rename-prefix { max-width: 70px; font-size: 1.1rem; text-align: center; padding: 9px 10px; }
     .show-rename-label { flex: 1; }
 
-    .poster-customizer { border: 1px solid var(--border); border-radius: 10px; background: var(--bg); padding: 12px 14px; margin-bottom: 14px; }
-    .poster-customizer-label { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-mute); margin-bottom: 8px; }
-    .poster-mode-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 10px; }
-    .poster-mode-tab { padding: 5px 10px; font-size: 0.72rem; font-weight: 600; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--text-mute); cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all var(--transition); }
-    .poster-mode-tab.active { border-color: var(--gold); color: var(--gold); background: var(--gold-dim); }
-    .poster-mode-tab:hover:not(.active) { border-color: var(--border2); color: var(--text-dim); }
-    .poster-mode-panel { display: none; }
-    .poster-mode-panel.active { display: block; }
-    .poster-options-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
-    .poster-opt-field { display: flex; flex-direction: column; gap: 4px; }
-    .poster-opt-field label { font-size: 0.68rem; color: var(--text-mute); white-space: nowrap; }
-    .poster-opt-field input[type=color] { width: 36px; height: 28px; border: 1px solid var(--border); border-radius: 5px; background: transparent; cursor: pointer; padding: 2px; }
-    .poster-opt-field input[type=range] { width: 90px; }
-    .poster-opt-field select { font-size: 0.75rem; padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
+    /* poster-customizer CSS removed — only Custom URL mode remains */
 
     .add-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); }
     .add-tab { flex: 1; padding: 9px 8px; font-size: 0.73rem; font-weight: 600; text-align: center; cursor: pointer; color: var(--text-mute); background: transparent; border: none; font-family: 'DM Sans', sans-serif; transition: all var(--transition); border-bottom: 2px solid transparent; letter-spacing: 0.03em; }
@@ -2009,7 +1890,17 @@ function configurePage(existingConfig) {
     "  state.apiKey = cfg.tmdbApiKey || '';",
     "  state.topN = cfg.topN || 20;",
     "  state.showAutoSeason = !!cfg.showAutoSeason;",
-    "  state.customSeasons = cfg.customSeasons || [];",
+    "  state.customSeasons = (cfg.customSeasons || []).map(function(list) {",
+    "    // Derive posterMode from saved posterSpec for the UI",
+    "    var mode = 'default';",
+    "    var spec = list.posterSpec;",
+    "    if (spec && spec.mode === 'url' && spec.url) { mode = 'url'; }",
+    "    return Object.assign({}, list, {",
+    "      posterMode: mode,",
+    "      posterUrl: (spec && spec.mode === 'url' && spec.url) ? spec.url : null,",
+    "      tmdbPoster: list.tmdbPoster || null,",
+    "    });",
+    "  });",
     "  state.catalogEnabled = cfg.catalogEnabled || {};",
     "  state.catalogNames = cfg.catalogNames || {};",
     "  state.customCatalogs = cfg.customCatalogs || [];",
@@ -2024,7 +1915,6 @@ function configurePage(existingConfig) {
     "  if (szeroChk) szeroChk.checked = state.showAutoSeason;",
     "  // If we have an API key, load the hero and render catalogs but stay on page 1",
     "  if (state.apiKey) {",
-    "    refreshHeroWithApiKey(state.apiKey);",
     "    renderDefaultCatalogs();",
     "    renderCustomSeasonsList();",
     "    goTo(1);",
@@ -2101,44 +1991,39 @@ function configurePage(existingConfig) {
     "  var row2 = document.getElementById('hero-bg-row2');",
     "  if (!row1 || !row2) return;",
     "  try {",
-    "    var r = await fetch('/api/static-backdrops');",
+    "    // Uses dedicated GOODTASTE_HERO_API_KEY on server — no user key needed",
+    "    var r = await fetch('/api/hero-backdrops');",
     "    var d = await r.json();",
-    "    var posters = d.posters || [];",
-    "    if (!posters.length) return;",
-    "    var half = Math.ceil(posters.length / 2);",
-    "    var set1 = posters.slice(0, half);",
-    "    var set2 = posters.slice(half);",
-    "    function makeItems(arr) {",
-    "      return arr.concat(arr).map(function(src) {",
+    "    var all = d.backdrops || [];",
+    "    if (!all.length) {",
+    "      // Fallback to proxied static posters if no hero key configured",
+    "      var r2 = await fetch('/api/static-backdrops');",
+    "      var d2 = await r2.json();",
+    "      var posters = d2.posters || [];",
+    "      if (!posters.length) return;",
+    "      var half = Math.ceil(posters.length / 2);",
+    "      function makeStaticItems(arr) {",
+    "        return arr.concat(arr).map(function(src) {",
+    "          return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
+    "        }).join('');",
+    "      }",
+    "      row1.innerHTML = makeStaticItems(posters.slice(0, half));",
+    "      row2.innerHTML = makeStaticItems(posters.slice(half));",
+    "      return;",
+    "    }",
+    "    // Split 30 backdrops: 15 per row",
+    "    function makeBackdropItems(arr) {",
+    "      return arr.concat(arr).map(function(b) {",
+    "        var src = b.poster;",
     "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
     "      }).join('');",
     "    }",
-    "    row1.innerHTML = makeItems(set1);",
-    "    row2.innerHTML = makeItems(set2);",
+    "    row1.innerHTML = makeBackdropItems(all.slice(0, 15));",
+    "    row2.innerHTML = makeBackdropItems(all.slice(15, 30));",
     "  } catch(e) { /* silent fail */ }",
     "}",
     "",
-    "async function refreshHeroWithApiKey(apiKey) {",
-    "  try {",
-    "    var r = await fetch('/api/hero-backdrops?apiKey=' + encodeURIComponent(apiKey));",
-    "    var d = await r.json();",
-    "    if (!d.backdrops || d.backdrops.length < 4) return;",
-    "    var row1 = document.getElementById('hero-bg-row1');",
-    "    var row2 = document.getElementById('hero-bg-row2');",
-    "    if (!row1 || !row2) return;",
-    "    var all = d.backdrops;",
-    "    var half = Math.ceil(all.length / 2);",
-    "    function makeFromBackdrops(arr) {",
-    "      return arr.concat(arr).map(function(b) {",
-    "        // Use poster (portrait) for the skewed wall — better aspect ratio",
-    "        var src = b.poster || b.backdrop;",
-    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
-    "      }).join('');",
-    "    }",
-    "    row1.innerHTML = makeFromBackdrops(all.slice(0, half));",
-    "    row2.innerHTML = makeFromBackdrops(all.slice(half));",
-    "  } catch(e) { /* silent fail, static stays */ }",
-    "}",
+    "// refreshHeroWithApiKey removed — hero images now use dedicated GOODTASTE_HERO_API_KEY env var",
     "",
 
     // ── API key validation ──
@@ -2154,7 +2039,6 @@ function configurePage(existingConfig) {
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    state.apiKey = key;",
-    "    refreshHeroWithApiKey(key);",
     "    renderDefaultCatalogs();",
     "    goTo(2);",
     "  } catch(e) {",
@@ -2856,44 +2740,21 @@ function configurePage(existingConfig) {
     "      '<div class=\"show-ep-body\">'+",
     "        '<div style=\"padding:14px 16px 0;\">'+",
     "          '<div class=\"show-rename-row\">'+'<input class=\"show-rename-prefix\" type=\"text\" value=\"'+esc(list.prefix||'\u2728')+'\" placeholder=\"\u2728\" oninput=\"updateListMeta(\\'' + tid + '\\',\\'prefix\\',this.value)\" title=\"Prefix emoji\"/>'+'<input class=\"show-rename-label\" type=\"text\" value=\"'+esc(list.label||'Best Of')+'\" placeholder=\"List name\" oninput=\"updateListMeta(\\'' + tid + '\\',\\'label\\',this.value)\"/>'+'<button class=\"btn btn-danger btn-sm\" onclick=\"removeList(\\'' + tid + '\\')\" title=\"Delete\">\u00d7</button></div>'+",
-    "          '<div class=\"poster-customizer\">'+",
-    "            '<div class=\"poster-customizer-label\">Poster Style</div>'+",
-    "            '<div class=\"poster-mode-tabs\">'+",
-    "              '<button class=\"poster-mode-tab'+(posterMode==='default'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'default\\')\">Default</button>'+",
-    "              '<button class=\"poster-mode-tab'+(posterMode==='banner'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'banner\\')\">Banner</button>'+",
-    "              '<button class=\"poster-mode-tab'+(posterMode==='logo'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'logo\\')\">Logo</button>'+",
-    "              '<button class=\"poster-mode-tab'+(posterMode==='url'?' active':'')+'\" onclick=\"setPosterMode(\\'' + tid + '\\',\\'url\\')\">Custom URL</button>'+",
-    "            '</div>'+",
-    "            '<div class=\"poster-mode-panel'+(posterMode==='default'?' active':'')+'\" id=\"pmp-default-'+tid+'\">'+",
-    "              '<div style=\"font-size:0.72rem;color:var(--text-mute)\">Uses the original TMDB series poster.</div>'+",
-    "            '</div>'+",
-    "            '<div class=\"poster-mode-panel'+(posterMode==='banner'?' active':'')+'\" id=\"pmp-banner-'+tid+'\">'+",
-    "              '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:8px\">Overlay a title banner on the series poster.</div>'+",
-    "              '<div class=\"poster-options-row\">'+",
-    "                '<div class=\"poster-opt-field\"><label>Position</label><select onchange=\"updateBannerOption(\\'' + tid + '\\')\"><option value=\"top\"'+(bannerPos==='top'?' selected':'')+'>Top</option><option value=\"bottom\"'+(bannerPos==='bottom'?' selected':'')+'>Bottom</option></select></div>'+",
-    "                '<div class=\"poster-opt-field\"><label>Bar Color</label><input type=\"color\" value=\"'+bannerColor+'\" onchange=\"updateBannerOption(\\'' + tid + '\\')\" id=\"bcolor-'+tid+'\"/></div>'+",
-    "                '<div class=\"poster-opt-field\"><label>Opacity '+Math.round(bannerOpacity*100)+'%</label><input type=\"range\" min=\"0\" max=\"1\" step=\"0.05\" value=\"'+bannerOpacity+'\" oninput=\"updateBannerOpacityLabel(\\'' + tid + '\\',this);updateBannerOption(\\'' + tid + '\\')\"/></div>'+",
-    "                '<div class=\"poster-opt-field\"><label>Text Color</label><input type=\"color\" value=\"'+bannerTextColor+'\" onchange=\"updateBannerOption(\\'' + tid + '\\')\" id=\"btcolor-'+tid+'\"/></div>'+",
-    "              '</div>'+",
-    "              '<button class=\"btn btn-primary btn-sm\" style=\"margin-top:8px\" onclick=\"generateBannerPoster(\\'' + tid + '\\')\">\u270f Generate Poster</button>'+",
-    "              '<span id=\"banner-status-'+tid+'\" style=\"font-size:0.72rem;color:var(--text-mute);margin-left:8px\"></span>'+",
-    "            '</div>'+",
-    "            '<div class=\"poster-mode-panel'+(posterMode==='logo'?' active':'')+'\" id=\"pmp-logo-'+tid+'\">'+",
-    "              '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:8px\">Series logo on a dark background with your list title below.</div>'+",
-    "              '<div class=\"poster-options-row\">'+",
-    "                '<div class=\"poster-opt-field\"><label>Background</label><input type=\"color\" value=\"'+(list.logoBgColor||'#111111')+'\" onchange=\"updateListMeta(\\'' + tid + '\\',\\'logoBgColor\\',this.value)\" /></div>'+",
-    "                '<div class=\"poster-opt-field\"><label>Text Color</label><input type=\"color\" value=\"'+(list.logoTextColor||'#ffffff')+'\" onchange=\"updateListMeta(\\'' + tid + '\\',\\'logoTextColor\\',this.value)\" /></div>'+",
-    "              '</div>'+",
-    "              '<button class=\"btn btn-primary btn-sm\" style=\"margin-top:8px\" onclick=\"generateLogoPoster(\\'' + tid + '\\')\">\u270f Generate Poster</button>'+",
-    "              '<span id=\"logo-status-'+tid+'\" style=\"font-size:0.72rem;color:var(--text-mute);margin-left:8px\"></span>'+",
-    "            '</div>'+",
-    "            '<div class=\"poster-mode-panel'+(posterMode==='url'?' active':'')+'\" id=\"pmp-url-'+tid+'\">'+",
-    "              '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:6px\">Paste any direct image URL to use as the poster.</div>'+",
-    "              '<div style=\"display:flex;gap:6px\"><input type=\"text\" id=\"custom-poster-url-'+tid+'\" placeholder=\"https://example.com/poster.jpg\" value=\"'+esc(customPosterUrl)+'\" style=\"flex:1;font-size:0.8rem\"/><button class=\"btn btn-primary btn-sm\" onclick=\"applyCustomPosterUrl(\\'' + tid + '\\')\">\u2713 Apply</button></div>'+",
-    "            '</div>'+",
+    "          '<div style=\"display:flex;align-items:center;gap:8px;margin-bottom:10px\">'+",
+    "            '<span style=\"font-size:0.7rem;color:var(--text-mute)\">Poster</span>'+",
+    "            (effectivePoster ? '<img src=\"'+effectivePoster+'\" style=\"width:24px;height:36px;object-fit:cover;border-radius:3px;flex-shrink:0\"/>' : '')+",
+    "            '<button class=\"btn btn-ghost btn-sm\" style=\"padding:4px 10px;font-size:0.72rem\" onclick=\"togglePosterUrlEditor(\\''+tid+'\\')\">&#9998; Custom URL</button>'+",
+    "            (list.posterSpec&&list.posterSpec.mode==='url'&&list.posterSpec.url ? '<span style=\"font-size:0.68rem;color:var(--gold)\">&#10003; Custom</span>' : '')+",
     "          '</div>'+",
-    "        '</div>'+",
-    "        '<div class=\"add-tabs\">'+'<button class=\"add-tab active\" id=\"add-tab-picker-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'picker\\')\">Browse</button>'+'<button class=\"add-tab\" id=\"add-tab-imdb-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'imdb\\')\">IMDB List</button>'+'<button class=\"add-tab\" id=\"add-tab-paste-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'paste\\')\">Paste</button></div>'+",
+    "          '<div id=\"poster-url-editor-'+tid+'\" style=\"display:none;margin-bottom:12px\">'+",
+    "            '<div style=\"display:flex;gap:6px;align-items:center\">'+",
+    "              '<input type=\"text\" id=\"custom-poster-url-'+tid+'\" placeholder=\"https://example.com/poster.jpg\" value=\"'+esc(customPosterUrl)+'\" style=\"flex:1;font-size:0.8rem\"/>'+",
+    "              '<button class=\"btn btn-primary btn-sm\" onclick=\"applyCustomPosterUrl(\\''+tid+'\\')\">&check;</button>'+",
+    "              '<button class=\"btn btn-ghost btn-sm\" onclick=\"clearCustomPosterUrl(\\''+tid+'\\')\">&times;</button>'+",
+    "            '</div>'+",
+    "            '<div style=\"font-size:0.68rem;color:var(--text-mute);margin-top:4px\">Paste a direct image URL to override the default TMDB poster.</div>'+",
+    "          '</div>'+",
+"        '<div class=\"add-tabs\">'+'<button class=\"add-tab active\" id=\"add-tab-picker-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'picker\\')\">Browse</button>'+'<button class=\"add-tab\" id=\"add-tab-imdb-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'imdb\\')\">IMDB List</button>'+'<button class=\"add-tab\" id=\"add-tab-paste-'+tid+'\" onclick=\"switchAddTab(\\'' + tid + '\\',\\'paste\\')\">Paste</button></div>'+",
     "        '<div class=\"add-panel active\" id=\"add-panel-picker-'+tid+'\">'+'<button class=\"btn btn-ghost btn-sm\" style=\"width:100%\" onclick=\"openModal(\\'' + tid + '\\')\">&#8984; Browse &amp; select episodes\u2026</button></div>'+",
     "        '<div class=\"add-panel\" id=\"add-panel-imdb-'+tid+'\">'+'<div class=\"import-row\"><input type=\"text\" id=\"imdb-url-'+tid+'\" placeholder=\"https://www.imdb.com/list/ls086682535/\" onkeydown=\"if(event.key===\\'Enter\\') importImdbList(\\'' + tid + '\\')\"/><button class=\"btn btn-ghost btn-sm\" id=\"imdb-btn-'+tid+'\" onclick=\"importImdbList(\\'' + tid + '\\')\">\u2193 Import</button></div><div class=\"import-status\" id=\"imdb-status-'+tid+'\"></div></div>'+",
     "        '<div class=\"add-panel\" id=\"add-panel-paste-'+tid+'\">'+'<p class=\"paste-hint\">Accepts S01E01, s1e1, 1x01 formats. One per line or space-separated.</p>'+'<textarea id=\"paste-input-'+tid+'\" placeholder=\"S01E01\\nS01E05\\nS02E03\"></textarea>'+'<div class=\"paste-actions\"><button class=\"btn btn-primary btn-sm\" onclick=\"applyPaste(\\'' + tid + '\\')\">\u2713 Add Episodes</button><span class=\"paste-status\" id=\"paste-status-'+tid+'\"></span></div></div>'+",
@@ -2907,84 +2768,35 @@ function configurePage(existingConfig) {
     "function setPosterMode(listId, mode) {",
     "  var list=getList(listId); if(!list) return;",
     "  list.posterMode=mode;",
-    "  ['default','banner','logo','url'].forEach(function(m){",
-    "    var tab=document.querySelector('#show-'+listId+' .poster-mode-tab[onclick*=\"\\''+m+'\\'\"]');",
-    "    var panel=document.getElementById('pmp-'+m+'-'+listId);",
-    "    if(tab) tab.classList.toggle('active',m===mode);",
-    "    if(panel) panel.classList.toggle('active',m===mode);",
-    "  });",
-    "  if(mode==='default'){",
-    "    list.posterUrl=null;",
-    "    list.posterSpec=null;",
-    "    updateShowPosterThumb(listId);",
+    "  if(mode==='default'){ list.posterUrl=null; list.posterSpec=null; updateShowPosterThumb(listId); }",
+    "}",
+    "",
+
+    "",
+
+    "",
+
+    "",
+
+    "",
+    "function togglePosterUrlEditor(listId) {",
+    "  var el=document.getElementById('poster-url-editor-'+listId);",
+    "  if(!el) return;",
+    "  el.style.display=el.style.display==='none'?'block':'none';",
+    "  if(el.style.display==='block'){",
+    "    var inp=document.getElementById('custom-poster-url-'+listId);",
+    "    if(inp) inp.focus();",
     "  }",
     "}",
-    "",
-    "function updateBannerOpacityLabel(listId, input) {",
+    "function clearCustomPosterUrl(listId) {",
     "  var list=getList(listId); if(!list) return;",
-    "  list.bannerOpacity=parseFloat(input.value);",
-    "  var label=input.parentElement&&input.parentElement.querySelector('label');",
-    "  if(label) label.textContent='Opacity '+Math.round(list.bannerOpacity*100)+'%';",
+    "  list.posterUrl=null; list.posterSpec=null; list.posterMode='default';",
+    "  var inp=document.getElementById('custom-poster-url-'+listId);",
+    "  if(inp) inp.value='';",
+    "  var ed=document.getElementById('poster-url-editor-'+listId);",
+    "  if(ed) ed.style.display='none';",
+    "  updateShowPosterThumb(listId);",
     "}",
-    "",
-    "function updateBannerOption(listId) {",
-    "  var list=getList(listId); if(!list) return;",
-    "  var panel=document.getElementById('pmp-banner-'+listId); if(!panel) return;",
-    "  var sel=panel.querySelector('select'); if(sel) list.bannerPos=sel.value;",
-    "  var bcolor=document.getElementById('bcolor-'+listId); if(bcolor) list.bannerColor=bcolor.value;",
-    "  var btcolor=document.getElementById('btcolor-'+listId); if(btcolor) list.bannerTextColor=btcolor.value;",
-    "}",
-    "",
-    "async function generateBannerPoster(listId) {",
-    "  var list=getList(listId); if(!list) return;",
-    "  updateBannerOption(listId);",
-    "  var statusEl=document.getElementById('banner-status-'+listId);",
-    "  if(statusEl) statusEl.textContent='Generating\u2026';",
-    "  var basePoster=list.tmdbPoster||null;",
-    "  if(!basePoster){if(statusEl)statusEl.textContent='No poster available.';return;}",
-    "  var label=(list.label||'Best Of');",
-    "  var pos=list.bannerPos||'bottom';",
-    "  var barColor=list.bannerColor||'#000000';",
-    "  var opacity=list.bannerOpacity!=null?list.bannerOpacity:0.75;",
-    "  var textColor=list.bannerTextColor||'#ffffff';",
-    "  // Store posterSpec (compact) — server generates the actual poster URL",
-    "  list.posterSpec={mode:'banner',pos:pos,barColor:barColor,opacity:opacity,textColor:textColor};",
-    "  list.posterMode='banner';",
-    "  // Also try to generate a client-side preview",
-    "  try {",
-    "    var dataUrl=await drawBannerPoster(basePoster,label,pos,barColor,opacity,textColor);",
-    "    list.posterUrl=dataUrl; // preview only, not stored in final config",
-    "    updateShowPosterThumb(listId);",
-    "    if(statusEl)statusEl.textContent='\u2713 Applied';",
-    "    setTimeout(function(){if(statusEl)statusEl.textContent='';},2500);",
-    "  } catch(e) {",
-    "    // Preview failed (CORS etc.) but posterSpec is still saved — server will render it",
-    "    if(statusEl)statusEl.textContent='\u2713 Saved (preview unavailable)';",
-    "    setTimeout(function(){if(statusEl)statusEl.textContent='';},3000);",
-    "  }",
-    "}",
-    "",
-    "async function generateLogoPoster(listId) {",
-    "  var list=getList(listId); if(!list) return;",
-    "  var statusEl=document.getElementById('logo-status-'+listId);",
-    "  if(statusEl) statusEl.textContent='Fetching logo\u2026';",
-    "  try {",
-    "    var r=await fetch('/api/series-logo?tmdbId='+list.tmdbId+'&apiKey='+encodeURIComponent(state.apiKey));",
-    "    var d=await r.json();",
-    "    var bgColor=list.logoBgColor||'#111111';",
-    "    var textColor=list.logoTextColor||'#ffffff';",
-    "    var label=(list.label||'Best Of');",
-    "    // Store posterSpec (compact) — server generates the actual poster URL",
-    "    list.posterSpec={mode:'logo',bgColor:bgColor,textColor:textColor};",
-    "    list.posterMode='logo';",
-    "    var dataUrl=await drawLogoPoster(d.logoUrl||null,label,bgColor,textColor,list.tmdbName);",
-    "    list.posterUrl=dataUrl; // preview only",
-    "    updateShowPosterThumb(listId);",
-    "    if(statusEl)statusEl.textContent='\u2713 Applied';",
-    "    setTimeout(function(){if(statusEl)statusEl.textContent='';},2500);",
-    "  } catch(e) { if(statusEl)statusEl.textContent='Error: '+e.message; }",
-    "}",
-    "",
     "function applyCustomPosterUrl(listId) {",
     "  var list=getList(listId); if(!list) return;",
     "  var inp=document.getElementById('custom-poster-url-'+listId); if(!inp) return;",
@@ -2992,6 +2804,8 @@ function configurePage(existingConfig) {
     "  list.posterUrl=url||null;",
     "  list.posterSpec=url?{mode:'url',url:url}:null;",
     "  list.posterMode=url?'url':'default';",
+    "  var ed=document.getElementById('poster-url-editor-'+listId);",
+    "  if(ed) ed.style.display='none';",
     "  updateShowPosterThumb(listId);",
     "}",
     "",
@@ -3005,118 +2819,6 @@ function configurePage(existingConfig) {
     "    if(ph.tagName==='IMG'){ph.src=effectivePoster;}",
     "    else{var img=document.createElement('img');img.className='show-poster';img.src=effectivePoster;img.alt='';img.loading='lazy';ph.parentNode.replaceChild(img,ph);}",
     "  }",
-    "}",
-    "",
-    "function loadImageAsDataUrl(src) {",
-    "  return new Promise(function(resolve,reject){",
-    "    var img=new Image();",
-    "    img.crossOrigin='anonymous';",
-    "    img.onload=function(){resolve(img);};",
-    "    img.onerror=function(){reject(new Error('Failed to load image: '+src));};",
-    "    img.src=src;",
-    "  });",
-    "}",
-    "",
-    "async function drawBannerPoster(posterSrc,label,position,barColor,opacity,textColor) {",
-    "  // Proxy through our server to avoid CORS blocking on canvas.drawImage",
-    "  var proxySrc = posterSrc;",
-    "  if (posterSrc && posterSrc.includes('image.tmdb.org')) {",
-    "    var pathMatch = posterSrc.match(/\\/p\\/[^/]+(\\/[^?#]+)/);",
-    "    if (pathMatch) proxySrc = '/api/proxy-img?path=' + encodeURIComponent(pathMatch[1]);",
-    "  }",
-    "  var img=await loadImageAsDataUrl(proxySrc);",
-    "  var W=342,H=513;",
-    "  var canvas=document.createElement('canvas');",
-    "  canvas.width=W; canvas.height=H;",
-    "  var ctx=canvas.getContext('2d');",
-    "  ctx.drawImage(img,0,0,W,H);",
-    "  var barH=Math.round(H*0.14);",
-    "  var barY=position==='top'?0:H-barH;",
-    "  // Parse barColor hex to rgba",
-    "  var r=parseInt(barColor.slice(1,3),16),g=parseInt(barColor.slice(3,5),16),b=parseInt(barColor.slice(5,7),16);",
-    "  ctx.fillStyle='rgba('+r+','+g+','+b+','+opacity+')';",
-    "  ctx.fillRect(0,barY,W,barH);",
-    "  // Draw text",
-    "  var fontSize=Math.round(barH*0.32);",
-    "  ctx.fillStyle=textColor;",
-    "  ctx.font='600 '+fontSize+'px system-ui,sans-serif';",
-    "  ctx.textAlign='center';",
-    "  ctx.textBaseline='middle';",
-    "  // Word wrap if needed",
-    "  var maxWidth=W-24;",
-    "  var words=label.split(' ');",
-    "  var lines=[]; var line='';",
-    "  for(var i=0;i<words.length;i++){",
-    "    var test=(line?line+' ':'')+words[i];",
-    "    if(ctx.measureText(test).width>maxWidth&&line){lines.push(line);line=words[i];}",
-    "    else line=test;",
-    "  }",
-    "  if(line) lines.push(line);",
-    "  var lineH=fontSize*1.2;",
-    "  var totalTextH=lines.length*lineH;",
-    "  var startY=barY+(barH-totalTextH)/2+lineH/2;",
-    "  for(var j=0;j<lines.length;j++){ctx.fillText(lines[j],W/2,startY+j*lineH);}",
-    "  return canvas.toDataURL('image/jpeg',0.92);",
-    "}",
-    "",
-    "async function drawLogoPoster(logoSrc,label,bgColor,textColor,seriesName) {",
-    "  var W=342,H=513;",
-    "  var canvas=document.createElement('canvas');",
-    "  canvas.width=W; canvas.height=H;",
-    "  var ctx=canvas.getContext('2d');",
-    "  // Background",
-    "  ctx.fillStyle=bgColor;",
-    "  ctx.fillRect(0,0,W,H);",
-    "  // Subtle gradient overlay",
-    "  var grad=ctx.createRadialGradient(W/2,H*0.35,10,W/2,H*0.35,W*0.7);",
-    "  grad.addColorStop(0,'rgba(255,255,255,0.07)');",
-    "  grad.addColorStop(1,'rgba(0,0,0,0)');",
-    "  ctx.fillStyle=grad;",
-    "  ctx.fillRect(0,0,W,H);",
-    "  // Logo image centered in upper 60%",
-    "  if(logoSrc){",
-    "    try{",
-    "      var logoImg=await loadImageAsDataUrl(logoSrc);",
-    "      var lW=W-60,lH=Math.round(H*0.25);",
-    "      var scale=Math.min(lW/logoImg.naturalWidth,lH/logoImg.naturalHeight);",
-    "      var dW=logoImg.naturalWidth*scale,dH=logoImg.naturalHeight*scale;",
-    "      ctx.drawImage(logoImg,(W-dW)/2,(H*0.28-dH/2),dW,dH);",
-    "    }catch(e){",
-    "      // fallback: draw series name as big text",
-    "      ctx.fillStyle=textColor;",
-    "      ctx.font='bold '+Math.round(W*0.09)+'px system-ui,sans-serif';",
-    "      ctx.textAlign='center';ctx.textBaseline='middle';",
-    "      ctx.fillText(seriesName,W/2,H*0.32);",
-    "    }",
-    "  } else {",
-    "    ctx.fillStyle=textColor;",
-    "    ctx.font='bold '+Math.round(W*0.09)+'px system-ui,sans-serif';",
-    "    ctx.textAlign='center';ctx.textBaseline='middle';",
-    "    ctx.fillText(seriesName,W/2,H*0.32);",
-    "  }",
-    "  // Divider line",
-    "  ctx.strokeStyle='rgba(255,255,255,0.15)';",
-    "  ctx.lineWidth=1;",
-    "  ctx.beginPath();ctx.moveTo(40,H*0.58);ctx.lineTo(W-40,H*0.58);ctx.stroke();",
-    "  // Label text",
-    "  ctx.fillStyle=textColor;",
-    "  ctx.textAlign='center';ctx.textBaseline='middle';",
-    "  var fontSize=Math.round(W*0.065);",
-    "  ctx.font='600 '+fontSize+'px system-ui,sans-serif';",
-    "  var maxWidth=W-48;",
-    "  var words=label.split(' ');",
-    "  var lines2=[]; var line2='';",
-    "  for(var i=0;i<words.length;i++){",
-    "    var test=(line2?line2+' ':'')+words[i];",
-    "    if(ctx.measureText(test).width>maxWidth&&line2){lines2.push(line2);line2=words[i];}",
-    "    else line2=test;",
-    "  }",
-    "  if(line2) lines2.push(line2);",
-    "  var lineH2=fontSize*1.35;",
-    "  var totalH=lines2.length*lineH2;",
-    "  var startY2=H*0.72-totalH/2+lineH2/2;",
-    "  for(var j=0;j<lines2.length;j++){ctx.fillText(lines2[j],W/2,startY2+j*lineH2);}",
-    "  return canvas.toDataURL('image/jpeg',0.92);",
     "}",
     "",
     "function initDragSort(listId) {",
@@ -3231,14 +2933,12 @@ function configurePage(existingConfig) {
     "    // The server will generate the poster on-demand and Stremio will cache it by URL.",
     "    var posterSpec=null;",
     "    var mode=list.posterMode||'default';",
-    "    if(mode==='banner'){",
-    "      posterSpec={mode:'banner',pos:list.bannerPos||'bottom',barColor:list.bannerColor||'#000000',opacity:list.bannerOpacity!=null?list.bannerOpacity:0.75,textColor:list.bannerTextColor||'#ffffff'};",
-    "    } else if(mode==='logo'){",
-    "      posterSpec={mode:'logo',bgColor:list.logoBgColor||'#111111',textColor:list.logoTextColor||'#ffffff'};",
-    "    } else if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){",
+    "    if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){",
     "      posterSpec={mode:'url',url:list.posterUrl};",
+    "    } else if(mode==='url'&&list.posterSpec&&list.posterSpec.url){",
+    "      posterSpec={mode:'url',url:list.posterSpec.url};",
     "    }",
-    "    return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
+    "    return { listId:list.listId, tmdbId:list.tmdbId, tmdbName:list.tmdbName||'', label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
     "  });",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
@@ -3250,9 +2950,7 @@ function configurePage(existingConfig) {
     "  document.getElementById('manifest-url').value=manifestUrl;",
     "  document.getElementById('edit-url').value=editUrl;",
     "  // Warn if canvas-dependent poster modes are used (banner/logo require canvas npm module on server)",
-    "  var needsCanvas=state.customSeasons.some(function(l){ var m=l.posterMode||'default'; return m==='banner'||m==='logo'; });",
-    "  var canvasWarn=document.getElementById('canvas-warn');",
-    "  if(canvasWarn) canvasWarn.style.display=needsCanvas?'block':'none';",
+    "  // canvas warning no longer needed (banner/logo modes removed)",
     "  var listCount=state.customSeasons.length;",
     "  var showCount=new Set(state.customSeasons.map(function(l){ return l.tmdbId; })).size;",
     "  var enabledDefaultCount=DEFAULT_CATALOGS.filter(function(d){ var ov=state.catalogEnabled[d.id]; return ov!==undefined?ov:d.enabled; }).length;",
@@ -3328,19 +3026,21 @@ function configurePage(existingConfig) {
       </div>
       <div class="hero">
         <div class="hero-logo">Good<span>Taste</span></div>
-        <div class="hero-tagline">The ultimate metadata &amp; curation addon</div>
+        <div class="hero-tagline">Stremio for people who care about what they watch</div>
         <div class="hero-features">
-          <div class="hero-feat"><strong>Full Metadata &amp; Search</strong>Rich posters, ratings, cast, trailers &mdash; all sourced from TMDB</div>
-          <div class="hero-feat"><strong>Curated Episode Lists</strong>Handpick episodes from any series and stream straight from your list</div>
-          <div class="hero-feat"><strong>Catalog Manager</strong>Create, import, and manage catalogs from TMDB, MDBList, or IMDB</div>
-          <div class="hero-feat"><strong>Season Zero <span class="beta-inline">Beta</span></strong>Auto-adds the top-rated episodes of every series to a Season 0</div>
+          <div class="hero-feat"><strong>&#127916; Rich Metadata</strong>Beautiful posters, ratings, cast &amp; trailers for every title &mdash; sourced fresh from TMDB</div>
+          <div class="hero-feat"><strong>&#10024; Curated Episode Lists</strong>Handpick your all-time favourite episodes from any series &mdash; they stream directly in Stremio</div>
+          <div class="hero-feat"><strong>&#127775; Custom Posters</strong>Give each curated list its own identity with a custom poster image via URL</div>
+          <div class="hero-feat"><strong>&#128218; Catalog Manager</strong>Build your own catalogs from TMDB Discover, MDBList, or IMDB &mdash; movies &amp; shows</div>
+          <div class="hero-feat"><strong>&#9889; Season Zero <span class="beta-inline">Beta</span></strong>Automatically surfaces the highest-rated episodes of any series in a dedicated Season 0</div>
+          <div class="hero-feat"><strong>&#128269; Universal Search</strong>Search every movie and series in TMDB without leaving Stremio</div>
         </div>
       </div>
     </div>
     <div class="card">
       <div class="card-eyebrow">Step 1 of 4</div>
       <div class="card-title">Connect to TMDB</div>
-      <div class="card-sub">Enter your free TMDB API key to get started. GoodTaste uses TMDB to fetch metadata, search shows, and resolve episodes.</div>
+      <div class="card-sub">GoodTaste runs on TMDB data &mdash; your free API key unlocks rich metadata, real-time search, and episode resolution. Takes 30 seconds to get one.</div>
       <div class="field">
         <label>TMDB API Key</label>
         <input type="password" id="apiKey" placeholder="Paste your key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter') validateApiKey()"/>
@@ -3354,8 +3054,8 @@ function configurePage(existingConfig) {
   <div class="page" id="page-2">
     <div class="card">
       <div class="card-eyebrow">Step 2 of 4</div>
-      <div class="card-title">Curated Episode Lists</div>
-      <div class="card-sub">Search for a TV show and build a curated episode list. Each list appears as its own entry in Stremio with a custom name.</div>
+      <div class="card-title">Your Curated Episode Lists</div>
+      <div class="card-sub">Search for any TV show and handpick your favourite episodes. Each list appears as its own series entry in Stremio, complete with a custom name, poster, and your exact episode order. Add as many shows and lists as you like.</div>
       <div class="field search-wrap">
         <span class="search-icon">&#128269;</span>
         <input type="text" id="series-search" placeholder="Search for a TV show..." oninput="debounceSearch(this.value)" autocomplete="off"/>
@@ -3389,8 +3089,8 @@ function configurePage(existingConfig) {
   <div class="page" id="page-3">
     <div class="card">
       <div class="card-eyebrow">Step 3 of 4</div>
-      <div class="card-title">Catalog Manager</div>
-      <div class="card-sub">Drag &#8801; to reorder. Tap a name to rename. Toggle to enable/disable. Custom catalogs live in the same list.</div>
+      <div class="card-title">Your Catalog Manager</div>
+      <div class="card-sub">Choose which default TMDB catalogs appear in Stremio, then build your own. Create custom movie &amp; series catalogs from TMDB Discover, import lists from MDBList or IMDB, or hand-pick exactly what goes in them. Drag &#8801; to reorder, tap any name to rename, toggle to hide.</div>
       <div id="all-catalogs-list" style="margin-bottom:1rem"></div>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem">
         <div style="font-size:0.7rem;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-mute)">Add Custom Catalog</div>
@@ -3546,11 +3246,10 @@ function configurePage(existingConfig) {
     <div class="card">
       <div class="install-hero">
         <div class="install-hero-title">You have <span>good taste.</span></div>
-        <div class="install-hero-sub">Add GoodTaste directly to Stremio or copy the manifest URL</div>
+        <div class="install-hero-sub">Your personalised GoodTaste addon is ready &mdash; add it to Stremio in one click or copy the link</div>
       </div>
       <div id="ep-parade" class="ep-parade" style="display:none"></div>
       <div id="install-summary"></div>
-      <div id="canvas-warn" style="display:none;background:rgba(240,192,64,0.08);border:1px solid rgba(240,192,64,0.3);border-radius:10px;padding:12px 16px;margin-bottom:14px;font-size:0.78rem;color:var(--gold);line-height:1.6"><strong>&#9888; Canvas module required</strong><br/>You have lists using Banner or Logo poster styles. These are generated server-side and require the <code style="background:rgba(0,0,0,0.3);padding:2px 5px;border-radius:4px">canvas</code> npm module. If your posters show as default TMDB images after install, run:<br/><code style="background:rgba(0,0,0,0.3);padding:3px 8px;border-radius:4px;display:inline-block;margin-top:6px">npm install canvas</code><br/>then restart the server. Alternatively, switch to <strong>Custom URL</strong> poster mode.</div>
       <button class="btn-install" onclick="openStremio()">Open in Stremio</button>
       <div class="or-divider">&mdash; or copy the manifest URL &mdash;</div>
       <div class="copy-row">
@@ -3599,6 +3298,14 @@ ${clientJS}
 }
 
 const PORT = process.env.PORT || 7000;
+
+// Log hero API key status at startup
+if (process.env.GOODTASTE_HERO_API_KEY) {
+  console.log('[GoodTaste] Hero API key configured — start page will use live TMDB trending posters.');
+} else {
+  console.log('[GoodTaste] No GOODTASTE_HERO_API_KEY set — start page will use static poster fallback.');
+  console.log('[GoodTaste] Set GOODTASTE_HERO_API_KEY in your environment to enable live trending images.');
+}
 
 // Check for optional canvas module at startup
 try {
