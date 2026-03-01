@@ -192,7 +192,19 @@ function buildManifest(config) {
         const c = customMap.get(id);
         // FIX: strip suffix from custom catalog names in manifest
         const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
-        allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+        // FIX: for _custom_items_ catalogs with mixed types, register for both movie and series
+        if (c.path === '_custom_items_' && c.items && c.items.length) {
+          const hasMovies = c.items.some(i => i.itemType === 'movie');
+          const hasSeries = c.items.some(i => i.itemType === 'series');
+          if (hasMovies && hasSeries) {
+            allCatalogs.push({ id: c.id, type: 'movie',  name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+            allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+          } else {
+            allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+          }
+        } else {
+          allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+        }
         seen.add('c:'+id);
       }
     }
@@ -206,7 +218,18 @@ function buildManifest(config) {
     customCatalogs.forEach(c => {
       if (!seen.has('c:'+c.id)) {
         const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
-        allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+        if (c.path === '_custom_items_' && c.items && c.items.length) {
+          const hasMovies = c.items.some(i => i.itemType === 'movie');
+          const hasSeries = c.items.some(i => i.itemType === 'series');
+          if (hasMovies && hasSeries) {
+            allCatalogs.push({ id: c.id, type: 'movie',  name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+            allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+          } else {
+            allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+          }
+        } else {
+          allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+        }
       }
     });
   } else {
@@ -217,7 +240,18 @@ function buildManifest(config) {
     });
     customCatalogs.forEach(c => {
       const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
-      allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+      if (c.path === '_custom_items_' && c.items && c.items.length) {
+        const hasMovies = c.items.some(i => i.itemType === 'movie');
+        const hasSeries = c.items.some(i => i.itemType === 'series');
+        if (hasMovies && hasSeries) {
+          allCatalogs.push({ id: c.id, type: 'movie',  name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+          allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+        } else {
+          allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+        }
+      } else {
+        allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
+      }
     });
   }
 
@@ -462,7 +496,9 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
 
     if (catDef.path === '_custom_items_') {
       const items = catDef.items || [];
-      const pageItems = items.slice(skip, skip + 20);
+      // Filter by the requested type (for mixed catalogs registered under both movie+series)
+      const filteredItems = items.filter(item => !item.itemType || item.itemType === type || (type === 'movie' && item.itemType === 'movie') || (type === 'series' && item.itemType === 'series'));
+      const pageItems = filteredItems.slice(skip, skip + 20);
       const metas = [];
       for (const item of pageItems) {
         try {
@@ -2428,7 +2464,19 @@ function configurePage(existingConfig, isShared) {
     "            + '</select></div>';",
     "        } else if (c.path === '_bestof_') {",
     "          var listCount = (c.bestofListIds||[]).length;",
-    "          editFields += '<div style=\"font-size:0.78rem;color:var(--text-mute);margin-bottom:6px\">Contains '+listCount+' curated list'+(listCount!==1?'s':'')+'. Recreate from Best Of Lists tab to change.</div>';",
+    "          editFields += '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:8px\">Contains '+listCount+' curated list'+(listCount!==1?'s':'')+'. Select lists below to update:</div>';",
+    "          editFields += '<div style=\"max-height:200px;overflow-y:auto;margin-bottom:8px\">';",
+    "          var allLists=state.customSeasons;",
+    "          if(allLists.length){",
+    "            editFields+=allLists.map(function(lst){",
+    "              var isIn=(c.bestofListIds||[]).indexOf(lst.listId)!==-1;",
+    "              var ph=lst.tmdbPoster?'<img src=\"'+esc(lst.tmdbPoster)+'\" style=\"width:24px;height:36px;object-fit:cover;border-radius:3px;flex-shrink:0\" loading=\"lazy\"/>':'<div style=\"width:24px;height:36px;background:var(--surface);border-radius:3px;flex-shrink:0\"></div>';",
+    "              return '<div style=\"display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;border:1.5px solid '+(isIn?'var(--gold)':'var(--border)')+';background:'+(isIn?'var(--gold-dim)':'transparent')+';margin-bottom:4px\" onclick=\"toggleBestofListInCat(\\''+c.id+'\\',\\''+lst.listId+'\\')\">'+ph+'<div style=\"flex:1;min-width:0;font-size:0.78rem;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis\">'+esc((lst.label||'Best Of')+' \u2014 '+lst.tmdbName)+'</div><div style=\"font-size:0.72rem;color:'+(isIn?'var(--gold)':'var(--text-mute)')+'\">'+(isIn?'&#10003;':'+ Add')+'</div></div>';",
+    "            }).join('');",
+    "          } else {",
+    "            editFields+='<div style=\"font-size:0.75rem;color:var(--text-mute);padding:6px\">No curated lists created yet.</div>';",
+    "          }",
+    "          editFields+='</div>';",
     "        }",
     "        editFields += '<div style=\"margin-top:8px;display:flex;gap:6px\"><select onclick=\"event.stopPropagation()\" onchange=\"updateCatField(\\''+c.id+'\\',\\'type\\',this.value)\" style=\"font-size:0.8rem;padding:6px 10px;width:auto\"><option value=\"movie\"'+(c.type==='movie'?' selected':'')+'>Movie</option><option value=\"series\"'+(c.type==='series'?' selected':'')+'>Series</option></select></div>';",
     "        html += '<div class=\"custom-catalog-editor\">'+editFields+'</div>';",
@@ -2451,6 +2499,16 @@ function configurePage(existingConfig, isShared) {
     "  renderUnifiedCatalogList();",
     "}",
     "function toggleCustomCatExpand(id) { var el=document.getElementById('ccat-'+id); if(el) el.classList.toggle('expanded'); }",
+    "function toggleBestofListInCat(catId, listId) {",
+    "  var c=state.customCatalogs.find(function(x){return x.id===catId;}); if(!c) return;",
+    "  if(!c.bestofListIds) c.bestofListIds=[];",
+    "  var idx=c.bestofListIds.indexOf(listId);",
+    "  if(idx!==-1) c.bestofListIds.splice(idx,1);",
+    "  else c.bestofListIds.push(listId);",
+    "  var wasExp=document.getElementById('ccat-'+catId)&&document.getElementById('ccat-'+catId).classList.contains('expanded');",
+    "  renderUnifiedCatalogList();",
+    "  if(wasExp){setTimeout(function(){var el=document.getElementById('ccat-'+catId);if(el)el.classList.add('expanded');},20);}",
+    "}",
     "function removeCatalogItem(catId, idx) {",
     "  var c=state.customCatalogs.find(function(x){return x.id===catId;});",
     "  if (!c||!c.items) return;",
@@ -3377,7 +3435,7 @@ function configurePage(existingConfig, isShared) {
     "    } else if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){",
     "      posterSpec={mode:'url',url:list.posterUrl};",
     "    }",
-    "    return { listId:list.listId, tmdbId:list.tmdbId, label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
+    "    return { listId:list.listId, tmdbId:list.tmdbId, tmdbName:list.tmdbName||'', label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
     "  });",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
@@ -3490,6 +3548,10 @@ function configurePage(existingConfig, isShared) {
     "      showToast(boost.name+' removed');",
     "      renderUnifiedCatalogList();",
     "      renderCustomSeasonsList();",
+    "      // Revert skip button if no boosts remain",
+    "      var anyApplied=document.querySelector('.boost-applied');",
+    "      var skipBtn=document.getElementById('boost-skip-btn');",
+    "      if(skipBtn&&!anyApplied){skipBtn.innerHTML='Skip &rarr;';skipBtn.className='btn btn-ghost';}",
     "      return;",
     "    }",
     "    // Enable requested default catalogs",
@@ -3520,6 +3582,9 @@ function configurePage(existingConfig, isShared) {
     "    showToast(boost.name+' applied \u2013 click again to remove');",
     "    renderCustomSeasonsList();",
     "    renderUnifiedCatalogList();",
+    "    // Update skip/continue button",
+    "    var skipBtn=document.getElementById('boost-skip-btn');",
+    "    if(skipBtn){skipBtn.innerHTML='Continue &rarr;';skipBtn.className='btn btn-primary';}",
     "    // Enrich thumbnails in background",
     "    enrichAllEpisodeThumbnails();",
     "  } catch(e){ showToast('Could not apply boost. Try again.'); }",
@@ -3536,7 +3601,7 @@ function configurePage(existingConfig, isShared) {
     "    var posterSpec=null;",
     "    var mode=list.posterMode||'default';",
     "    if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){ posterSpec={mode:'url',url:list.posterUrl}; }",
-    "    return { listId:list.listId, tmdbId:list.tmdbId, tmdbName:list.tmdbName, label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
+    "    return { listId:list.listId, tmdbId:list.tmdbId, tmdbName:list.tmdbName||'', label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
     "  });",
     "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
     "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
@@ -3554,9 +3619,9 @@ function configurePage(existingConfig, isShared) {
     "  showToast('Share link copied!');",
     "}",
     "",
-    // Init on page load
-    "loadHeroBackgrounds();",
+    // Init on page load — load existing config first so apiKey is available for hero backgrounds
     "loadExistingConfig();",
+    "if (!EXISTING_CONFIG) loadHeroBackgrounds();",
   ].join('\n');
 
   const editModeBanner = isShared && shareTitle
@@ -3636,7 +3701,7 @@ function configurePage(existingConfig, isShared) {
     </div>
     <div class="nav-row">
       <button class="btn btn-ghost" onclick="goTo(1)">&larr; Back</button>
-      <button class="btn btn-ghost" onclick="boostApplied=true;goTo(3)">Skip &rarr;</button>
+      <button class="btn btn-ghost" onclick="boostApplied=true;goTo(3)" id="boost-skip-btn">Skip &rarr;</button>
     </div>
   </div>
 
