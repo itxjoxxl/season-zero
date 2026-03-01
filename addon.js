@@ -762,48 +762,9 @@ app.get('/api/share-encode', function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── STATIC HERO BACKDROPS (no API key needed, proxied server-side) ──────────
-const STATIC_POSTER_PATHS = [
-  '/d5NXSklXo0qyIYkgV94XAgMIckC.jpg', // Breaking Bad
-  '/ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg', // The Wire
-  '/7uoiKOEjkDMJQ5ND7aFYnv7FPXH.jpg', // Sopranos
-  '/1XS1oqL89opfnbLl8WnZY1O1uJx.jpg', // Arrival
-  '/49WJfeN0moxb9IPfGn8AIqMGskD.jpg', // Succession
-  '/56v2KjBlU4XaOv9rVYEQypROD7P.jpg', // The Bear
-  '/2Xvj0HzOihoWvuCvbdAGtJWO1Qv.jpg', // Chernobyl
-  '/loRmRzQXZeqG78TqZuyvSlEQfZb.jpg', // Better Call Saul
-  '/5MkFUqGHsMpPJJRXeDkR9qdtqPd.jpg', // True Detective
-  '/q2VIiGicGCdCFoGNvuLOSbMVCOC.jpg', // Severance
-  '/9PFonBhy4cQy7Jz20NpMygczOkv.jpg', // Squid Game
-  '/dDlEmu3EZ0Pgg93K2SVNLCjCSvE.jpg', // The Last of Us (corrected)
-  '/xJHokMbljvjADYdit5fK5VQsXEG.jpg', // Andor (corrected)
-  '/3bhkrj58Vtu7enYsLori8pJkiuA.jpg', // The Godfather
-  '/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg', // Parasite (corrected)
-  '/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg', // Interstellar
-  '/qJ2tW6WMUDux911r6m7haRef0WH.jpg', // The Dark Knight (corrected)
-  '/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg', // Her
-  '/dQK9Wm7hRaT6hMTKW8Xp1ZBtg1n.jpg', // Pulp Fiction (use known good)
-  '/rktDFPbfHfUbArZ6OOOKsXcv0Bm.jpg', // Oppenheimer
-  '/tm8mxSsANB5rT6JTdNQX3T4jN1C.jpg', // No Country (corrected)
-  '/kqjL17yufvn9OVLyXYpvtyrFfak.jpg', // Blade Runner 2049
-  '/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg', // There Will Be Blood
-  '/fOy2Jurz9k6RnJnMbD0eMPKEezr.jpg', // Whiplash
-  '/A5fy4hGgU3aKqMqBuFSrAhfJhkd.jpg', // 1917 (corrected)
-  '/kb3X943WMIJYVg4SOAyK0pmWL5D.jpg', // 12 Years a Slave (corrected)
-  '/8tZYtuWezp8JbcsvHfd5hc7G0i8.jpg', // Mad Max: Fury Road (corrected)
-  '/jAHkz9HZf6pLc3gMQ6rPqmUO8dl.jpg', // Drive
-  '/pFlaoHTZeyNkG83vxsAJiGzfSsa.jpg', // 12 Years a Slave (using working hash)
-  '/z1p34vh7dEOnLDmyCrlUVLuoDzd.jpg', // Portrait of a Lady on Fire
-  '/AkE13D8b8wWODSMScSYkjKlVF7z.jpg', // Dune
-  '/jpurJ9jAcLCYjgHHfYF32m3zJYm.jpg', // Ex Machina
-  '/vxnx4svEVHkLyPGEW6r8QDxPeMF.jpg', // Midsommar
-];
-
-// Return list of static poster proxied URLs
+// Static backdrops removed — hero uses only colored placeholders until TMDB API posters load
 app.get('/api/static-backdrops', function(req, res) {
-  const origin = req.protocol + '://' + req.get('host');
-  const posters = STATIC_POSTER_PATHS.map(p => origin + '/api/proxy-img?path=' + encodeURIComponent(p));
-  res.json({ posters });
+  res.json({ posters: [] });
 });
 
 // Proxy a single TMDB image server-side (no API key needed, avoids hotlink blocking)
@@ -2188,7 +2149,8 @@ function configurePage(existingConfig, isShared) {
     "      d.episodes.forEach(function(ep) { epMap[ep.season + ':' + ep.episode] = ep; });",
     "      // Enrich each list for this show",
     "      byShow[tmdbId].forEach(function(list) {",
-    "        // Also update the poster if not stored",
+    "        // Also update the name and poster if not stored",
+    "        if (!list.tmdbName && d.show && d.show.name) list.tmdbName = d.show.name;",
     "        if (!list.tmdbPoster && d.show && d.show.poster) list.tmdbPoster = d.show.poster;",
     "        list.episodes = list.episodes.map(function(ep) {",
     "          var key = ep.season + ':' + ep.episode;",
@@ -2211,6 +2173,8 @@ function configurePage(existingConfig, isShared) {
     "      });",
     "    } catch(e) { /* skip show on error */ }",
     "  }",
+    "  // Re-render list cards to show enriched names and posters",
+    "  renderCustomSeasonsList();",
     "}",
     "",
 
@@ -2267,21 +2231,6 @@ function configurePage(existingConfig, isShared) {
     "      row2.innerHTML = makeFromPosters(d.row2 && d.row2.length ? d.row2 : d.row1);",
     "      return;",
     "    }",
-    "  } catch(e) { /* fall through to static */ }",
-    "  // Static fallback",
-    "  try {",
-    "    var r2 = await fetch('/api/static-backdrops');",
-    "    var d2 = await r2.json();",
-    "    var posters = d2.posters || [];",
-    "    if (!posters.length) return;",
-    "    var half = Math.ceil(posters.length / 2);",
-    "    function makeItems(arr) {",
-    "      return arr.concat(arr).map(function(src) {",
-    "        return '<div class=\"hero-bg-item\"><img src=\"' + src + '\" alt=\"\" onload=\"this.classList.add(\\'loaded\\')\"/></div>';",
-    "      }).join('');",
-    "    }",
-    "    row1.innerHTML = makeItems(posters.slice(0, half));",
-    "    row2.innerHTML = makeItems(posters.slice(half));",
     "  } catch(e) { /* silent fail — color boxes remain */ }",
     "}",
     "",
@@ -2375,7 +2324,35 @@ function configurePage(existingConfig, isShared) {
     "}",
     "function renderDefaultCatalogs() { renderUnifiedCatalogList(); }",
     "function renderCustomCatalogsList() { renderUnifiedCatalogList(); }",
+    "// Auto-sync: ensure each custom list has a corresponding bestof catalog entry",
+    "function syncListCatalogs() {",
+    "  state.customSeasons.forEach(function(list) {",
+    "    var catId = 'list.' + list.listId;",
+    "    var existing = state.customCatalogs.find(function(c){ return c.id === catId; });",
+    "    if (!existing) {",
+    "      var name = (list.label || 'Best Of') + (list.tmdbName ? ' \\u2014 ' + list.tmdbName : '');",
+    "      state.customCatalogs.push({ id: catId, name: name, type: 'series', path: '_bestof_', bestofListIds: [list.listId], enabled: true, _autoList: true });",
+    "      initUnifiedOrder(); state.unifiedOrder.push({ kind: 'custom', id: catId });",
+    "    } else {",
+    "      // Keep bestofListIds in sync",
+    "      existing.bestofListIds = [list.listId];",
+    "      // Update name if still auto-generated",
+    "      if (existing._autoList && existing.name === (existing._prevAutoName || '')) {",
+    "        existing.name = (list.label || 'Best Of') + (list.tmdbName ? ' \\u2014 ' + list.tmdbName : '');",
+    "      }",
+    "      existing._prevAutoName = (list.label || 'Best Of') + (list.tmdbName ? ' \\u2014 ' + list.tmdbName : '');",
+    "    }",
+    "  });",
+    "  // Remove auto-created catalogs for deleted lists",
+    "  var listIds = state.customSeasons.map(function(l){ return l.listId; });",
+    "  state.customCatalogs = state.customCatalogs.filter(function(c) {",
+    "    if (!c._autoList) return true;",
+    "    var lid = c.id.replace('list.', '');",
+    "    return listIds.indexOf(lid) !== -1;",
+    "  });",
+    "}",
     "function renderUnifiedCatalogList() {",
+    "  syncListCatalogs();",
     "  initUnifiedOrder();",
     "  DEFAULT_CATALOGS.forEach(function(c) {",
     "    if (!state.unifiedOrder.find(function(o){ return o.kind==='default'&&o.id===c.id; })) {",
@@ -2459,9 +2436,29 @@ function configurePage(existingConfig, isShared) {
     "          editFields += '<div style=\"margin-bottom:8px\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">IMDB List URL</label><input type=\"text\" value=\"'+esc(c.imdbUrl||'')+'\" oninput=\"updateCatField(\\''+c.id+'\\',\\'imdbUrl\\',this.value)\" placeholder=\"https://www.imdb.com/list/ls.../\" style=\"font-size:0.82rem\" onclick=\"event.stopPropagation()\"/></div>';",
     "        } else if (c.path && c.path.startsWith('/discover/')) {",
     "          var sortVal = (c.params && c.params.sort_by) || 'popularity.desc';",
-    "          editFields += '<div style=\"margin-bottom:8px\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Sort By</label><select onchange=\"updateCatParam(\\''+c.id+'\\',\\'sort_by\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\">'",
+    "          var genreVal = (c.params && c.params.with_genres) || '';",
+    "          var langVal = (c.params && c.params.with_original_language) || '';",
+    "          var minVotesVal = (c.params && c.params['vote_count.gte']) || '';",
+    "          var minRatingVal = (c.params && c.params['vote_average.gte']) || '';",
+    "          var networkVal = (c.params && c.params.with_networks) || '';",
+    "          editFields += '<div class=\"form-row\" style=\"margin-bottom:8px\">';",
+    "          editFields += '<div class=\"field\" style=\"margin-bottom:0;flex:1\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Sort By</label><select onchange=\"updateCatParam(\\''+c.id+'\\',\\'sort_by\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\">'",
     "            + ['popularity.desc','vote_average.desc','release_date.desc','revenue.desc'].map(function(s){return '<option value=\"'+s+'\"'+(sortVal===s?' selected':'')+'>'+({'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'}[s]||s)+'</option>';}).join('')",
     "            + '</select></div>';",
+    "          editFields += '<div class=\"field\" style=\"margin-bottom:0;flex:1\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Genre</label><select onchange=\"updateCatParam(\\''+c.id+'\\',\\'with_genres\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\" class=\"edit-genre-select\" data-catid=\"'+c.id+'\" data-val=\"'+esc(genreVal)+'\"><option value=\"\">Any</option></select></div>';",
+    "          editFields += '<div class=\"field\" style=\"margin-bottom:0;flex:1\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Language</label><select onchange=\"updateCatParam(\\''+c.id+'\\',\\'with_original_language\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\">'",
+    "            + [['','Any'],['en','English'],['ko','Korean'],['ja','Japanese'],['fr','French'],['es','Spanish'],['de','German'],['it','Italian'],['pt','Portuguese'],['zh','Chinese'],['hi','Hindi'],['ar','Arabic'],['ru','Russian'],['tr','Turkish'],['th','Thai']].map(function(l){return '<option value=\"'+l[0]+'\"'+(langVal===l[0]?' selected':'')+'>'+l[1]+'</option>';}).join('')",
+    "            + '</select></div>';",
+    "          editFields += '</div>';",
+    "          editFields += '<div class=\"form-row\" style=\"margin-bottom:8px\">';",
+    "          editFields += '<div class=\"field\" style=\"margin-bottom:0;flex:1\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Min Votes</label><input type=\"number\" value=\"'+esc(minVotesVal)+'\" placeholder=\"e.g. 100\" oninput=\"updateCatParam(\\''+c.id+'\\',\\'vote_count.gte\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\"/></div>';",
+    "          editFields += '<div class=\"field\" style=\"margin-bottom:0;flex:1\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Min Rating</label><input type=\"number\" value=\"'+esc(minRatingVal)+'\" placeholder=\"e.g. 7.5\" step=\"0.1\" min=\"0\" max=\"10\" oninput=\"updateCatParam(\\''+c.id+'\\',\\'vote_average.gte\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\"/></div>';",
+    "          if (c.type==='series') {",
+    "            editFields += '<div class=\"field\" style=\"margin-bottom:0;flex:1\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Network</label><select onchange=\"updateCatParam(\\''+c.id+'\\',\\'with_networks\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\">'",
+    "              + [['','Any'],['213','Netflix'],['1024','Amazon Prime'],['2739','Disney+'],['49','HBO'],['2552','Apple TV+'],['453','Hulu'],['67','Showtime'],['56','AMC'],['19','FX'],['77','Starz'],['318','Peacock'],['3353','Paramount+'],['4330','Max']].map(function(n){return '<option value=\"'+n[0]+'\"'+(networkVal===n[0]?' selected':'')+'>'+n[1]+'</option>';}).join('')",
+    "              + '</select></div>';",
+    "          }",
+    "          editFields += '</div>';",
     "        } else if (c.path === '_bestof_') {",
     "          var listCount = (c.bestofListIds||[]).length;",
     "          editFields += '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:8px\">Contains '+listCount+' curated list'+(listCount!==1?'s':'')+'. Select lists below to update:</div>';",
@@ -2498,7 +2495,22 @@ function configurePage(existingConfig, isShared) {
     "  state.unifiedOrder = state.unifiedOrder.filter(function(o){ return !(o.kind==='custom'&&o.id===id); });",
     "  renderUnifiedCatalogList();",
     "}",
-    "function toggleCustomCatExpand(id) { var el=document.getElementById('ccat-'+id); if(el) el.classList.toggle('expanded'); }",
+    "function toggleCustomCatExpand(id) {",
+    "  var el=document.getElementById('ccat-'+id); if(el) el.classList.toggle('expanded');",
+    "  // Load genres for discover edit selects when expanding",
+    "  if(el&&el.classList.contains('expanded')) {",
+    "    el.querySelectorAll('.edit-genre-select').forEach(function(sel){",
+    "      if(sel.options.length>1) return;",
+    "      var catId=sel.dataset.catid; var curVal=sel.dataset.val||'';",
+    "      var c=state.customCatalogs.find(function(x){return x.id===catId;});",
+    "      var tt=(c&&c.type==='series')?'tv':'movie';",
+    "      fetch('/api/genres?apiKey='+encodeURIComponent(state.apiKey)+'&type='+tt).then(function(r){return r.json();}).then(function(d){",
+    "        if(!d.genres) return;",
+    "        d.genres.forEach(function(g){ var opt=document.createElement('option'); opt.value=String(g.id); opt.textContent=g.name; if(String(g.id)===curVal) opt.selected=true; sel.appendChild(opt); });",
+    "      }).catch(function(){});",
+    "    });",
+    "  }",
+    "}",
     "function toggleBestofListInCat(catId, listId) {",
     "  var c=state.customCatalogs.find(function(x){return x.id===catId;}); if(!c) return;",
     "  if(!c.bestofListIds) c.bestofListIds=[];",
@@ -2631,14 +2643,14 @@ function configurePage(existingConfig, isShared) {
     "}",
     "",
     "function switchAddCatTab(tab) {",
-    "  ['items','tmdb-builder','mdblist','imdb','bestof'].forEach(function(t) {",
+    "  ['items','tmdb-builder','mdblist','imdb'].forEach(function(t) {",
     "    var btn=document.getElementById('add-cat-tab-'+t);",
     "    var panel=document.getElementById('add-cat-panel-'+t);",
     "    if (btn) btn.classList.toggle('active', t===tab);",
     "    if (panel) panel.classList.toggle('active', t===tab);",
     "  });",
     "  if (tab==='tmdb-builder') loadGenresForCustom();",
-    "  if (tab==='bestof') renderBestOfCatalogPicker();",
+    "  if (tab==='items') renderBestOfItemsPicker();",
     "}",
     "",
     "function toggleCustomCatalogForm() {",
@@ -2730,13 +2742,26 @@ function configurePage(existingConfig, isShared) {
     "function addItemsCatalog() {",
     "  var name=document.getElementById('cc-new-name').value.trim();",
     "  var type=document.getElementById('cc-new-type').value;",
+    "  var bestofIds=window._bestofPickSelection?Array.from(window._bestofPickSelection):[];",
+    "  var hasItems=newCatalogItems.length>0;",
+    "  var hasBestof=bestofIds.length>0;",
     "  if (!name) return;",
+    "  if (!hasItems && !hasBestof) return;",
     "  // FIX: strip trailing movie/series/show suffix from custom catalog name",
     "  var cleanName = name.replace(/\\s+(movies?|series|shows?)$/i, '').trim() || name;",
-    "  var newCat={id:'custom_items.'+Date.now(),name:cleanName,type:type,path:'_custom_items_',items:newCatalogItems.slice(),enabled:true};",
+    "  var newCat;",
+    "  if (hasItems && hasBestof) {",
+    "    // Combined catalog with both picked items and bestof lists",
+    "    newCat={id:'custom_items.'+Date.now(),name:cleanName,type:type,path:'_custom_items_',items:newCatalogItems.slice(),bestofListIds:bestofIds,enabled:true};",
+    "  } else if (hasBestof) {",
+    "    newCat={id:'bestofcat.'+Date.now(),name:cleanName,type:'series',path:'_bestof_',bestofListIds:bestofIds,enabled:true};",
+    "  } else {",
+    "    newCat={id:'custom_items.'+Date.now(),name:cleanName,type:type,path:'_custom_items_',items:newCatalogItems.slice(),enabled:true};",
+    "  }",
     "  state.customCatalogs.push(newCat);",
     "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
     "  newCatalogItems=[];",
+    "  window._bestofPickSelection=new Set();",
     "  // Close form and reset steps",
     "  var form=document.getElementById('custom-catalog-form');",
     "  form.classList.remove('open');",
@@ -2799,57 +2824,30 @@ function configurePage(existingConfig, isShared) {
     "  showToast('Catalog \\u201c'+cleanName+'\\u201d added');",
     "}",
     "",
-    "function renderBestOfCatalogPicker() {",
-    "  var el=document.getElementById('add-cat-panel-bestof'); if(!el) return;",
+    "function renderBestOfCatalogPicker() { renderBestOfItemsPicker(); }",
+    "function renderBestOfItemsPicker() {",
+    "  var container=document.getElementById('cc-bestof-inline');",
+    "  if(!container) return;",
+    "  var pickList=container.querySelector('.bestof-pick-list');",
+    "  if(!pickList) return;",
     "  var lists=state.customSeasons;",
-    "  if(!lists.length){el.querySelector('.bestof-pick-list').innerHTML='<div style=\"font-size:0.78rem;color:var(--text-mute);padding:8px 0\">No curated lists yet. Create some in the Lists step.</div>';return;}",
-    "  // Track which lists are selected for this new catalog (stored in a temp Set)",
+    "  if(!lists.length){pickList.innerHTML='<div style=\"font-size:0.78rem;color:var(--text-mute);padding:4px 0\">No curated lists yet. Create some in the Lists step.</div>';return;}",
     "  if (!window._bestofPickSelection) window._bestofPickSelection = new Set();",
-    "  el.querySelector('.bestof-pick-list').innerHTML=",
-    "    '<div style=\"font-size:0.72rem;color:var(--text-mute);margin-bottom:8px\">Select one or more lists to include in this catalog.</div>'+",
-    "    lists.map(function(list){",
-    "      var selected=window._bestofPickSelection.has(list.listId);",
-    "      var ph=list.posterUrl||list.tmdbPoster;",
-    "      var img=ph?'<img src=\"'+ph+'\" style=\"width:28px;height:42px;object-fit:cover;border-radius:4px;flex-shrink:0\" loading=\"lazy\"/>':'<div style=\"width:28px;height:42px;background:var(--surface);border-radius:4px;flex-shrink:0\"></div>';",
-    "      var name=esc((list.label||'Best Of')+' \u2014 '+list.tmdbName);",
-    "      return '<div class=\"cat-search-result'+(selected?' cat-search-added':'')+'\" style=\"cursor:pointer\" onclick=\"toggleBestOfPick(\\'' + list.listId + '\\')\">'",
-    "        +img+'<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.82rem;font-weight:600;color:var(--text)\">'+name+'</div><div style=\"font-size:0.7rem;color:var(--text-mute)\">'+list.episodes.length+' ep'+(list.episodes.length!==1?'s':'')+'</div></div>'",
-    "        +'<div style=\"font-size:0.75rem;color:'+(selected?'var(--gold)':'var(--text-mute)')+'\">'+(selected?'&#10003; Selected':'+ Select')+'</div></div>';",
-    "    }).join('')+",
-    "    '<div style=\"margin-top:10px;display:flex;gap:8px\">'+",
-    "    '<button class=\"btn btn-primary btn-sm\" onclick=\"addBestOfCatalog()\">\u2795 Add Selected</button>'+",
-    "    '<button class=\"btn btn-ghost btn-sm\" onclick=\"toggleCustomCatalogForm()\">Cancel</button>'+",
-    "    '</div>';",
+    "  pickList.innerHTML=lists.map(function(list){",
+    "    var selected=window._bestofPickSelection.has(list.listId);",
+    "    var ph=list.posterUrl||list.tmdbPoster;",
+    "    var img=ph?'<img src=\"'+ph+'\" style=\"width:28px;height:42px;object-fit:cover;border-radius:4px;flex-shrink:0\" loading=\"lazy\"/>':'<div style=\"width:28px;height:42px;background:var(--surface);border-radius:4px;flex-shrink:0\"></div>';",
+    "    var name=esc((list.label||'Best Of')+' \\u2014 '+list.tmdbName);",
+    "    return '<div class=\"cat-search-result'+(selected?' cat-search-added':'')+'\" style=\"cursor:pointer\" onclick=\"toggleBestOfPick(\\'' + list.listId + '\\')\">'",
+    "      +img+'<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.82rem;font-weight:600;color:var(--text)\">'+name+'</div><div style=\"font-size:0.7rem;color:var(--text-mute)\">'+list.episodes.length+' ep'+(list.episodes.length!==1?'s':'')+'</div></div>'",
+    "      +'<div style=\"font-size:0.75rem;color:'+(selected?'var(--gold)':'var(--text-mute)')+'\">'+(selected?'&#10003; Selected':'+ Select')+'</div></div>';",
+    "  }).join('');",
     "}",
     "function toggleBestOfPick(listId) {",
     "  if (!window._bestofPickSelection) window._bestofPickSelection = new Set();",
     "  if (window._bestofPickSelection.has(listId)) window._bestofPickSelection.delete(listId);",
     "  else window._bestofPickSelection.add(listId);",
-    "  renderBestOfCatalogPicker();",
-    "}",
-    "function addBestOfCatalog() {",
-    "  if (!window._bestofPickSelection || !window._bestofPickSelection.size) return;",
-    "  var listIds=Array.from(window._bestofPickSelection);",
-    "  var userEnteredName=(document.getElementById('cc-new-name')||{}).value;",
-    "  userEnteredName=userEnteredName?userEnteredName.trim():'';",
-    "  var name=userEnteredName;",
-    "  if (!name) {",
-    "    var labels=listIds.map(function(id){ var l=state.customSeasons.find(function(x){return x.listId===id;}); return l?l.label||'Best Of':''; }).filter(Boolean);",
-    "    name=labels.slice(0,2).join(' + ')+(labels.length>2?' + more':'');",
-    "  }",
-    "  var newCat={id:'bestofcat.'+Date.now(),name:name,type:'series',path:'_bestof_',bestofListIds:listIds,enabled:true};",
-    "  state.customCatalogs.push(newCat);",
-    "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
-    "  window._bestofPickSelection=new Set();",
-    "  // Close form and reset",
-    "  var form=document.getElementById('custom-catalog-form');",
-    "  form.classList.remove('open');",
-    "  document.getElementById('cc-step-name').classList.add('active');",
-    "  document.getElementById('cc-step-source').classList.remove('active');",
-    "  document.getElementById('cc-new-name').value='';",
-    "  renderBestOfCatalogPicker();",
-    "  renderUnifiedCatalogList();",
-    "  showToast('Catalog \\u201c'+name+'\\u201d added');",
+    "  renderBestOfItemsPicker();",
     "}",
     "",
     "var catItemSearchTimers={};",
@@ -3771,13 +3769,16 @@ function configurePage(existingConfig, isShared) {
             <button class="add-cat-tab" id="add-cat-tab-tmdb-builder" onclick="switchAddCatTab('tmdb-builder')">TMDB Discover</button>
             <button class="add-cat-tab" id="add-cat-tab-mdblist" onclick="switchAddCatTab('mdblist')">MDBList</button>
             <button class="add-cat-tab" id="add-cat-tab-imdb" onclick="switchAddCatTab('imdb')">IMDB</button>
-            <button class="add-cat-tab" id="add-cat-tab-bestof" onclick="switchAddCatTab('bestof')">Best Of Lists</button>
           </div>
           <div class="add-cat-panel active" id="add-cat-panel-items">
-            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Search TMDB to hand-pick specific movies or shows.</div>
+            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:8px">Search TMDB to hand-pick specific movies or shows, or include your curated Best Of lists below.</div>
             <input type="text" id="cc-items-search" placeholder="Search for a movie or show..." oninput="debounceItemsSearch(this.value)" autocomplete="off"/>
             <div id="cc-items-results" style="margin-top:6px;max-height:220px;overflow-y:auto"></div>
             <div id="cc-items-picked" style="margin-top:10px"></div>
+            <div id="cc-bestof-inline" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+              <div style="font-size:0.72rem;font-weight:600;letter-spacing:0.07em;text-transform:uppercase;color:var(--text-mute);margin-bottom:8px">Include Curated Lists</div>
+              <div class="bestof-pick-list" style="max-height:200px;overflow-y:auto"></div>
+            </div>
             <div style="display:flex;gap:8px;margin-top:12px">
               <button class="btn btn-primary btn-sm" onclick="addItemsCatalog()">Create Catalog</button>
               <button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button>
@@ -3881,10 +3882,6 @@ function configurePage(existingConfig, isShared) {
               <div id="imdb-cat-thumbs" style="display:flex;gap:6px;overflow:hidden;opacity:0.7"></div>
             </div>
             <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
-          </div>
-          <div class="add-cat-panel" id="add-cat-panel-bestof">
-            <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Add one of your curated Best Of lists as a standalone catalog in Stremio.</div>
-            <div class="bestof-pick-list" style="max-height:280px;overflow-y:auto"></div>
           </div>
         </div>
       </div>
