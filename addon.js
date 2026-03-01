@@ -424,8 +424,10 @@ app.get('/:config/configure', (req, res) => res.send(configurePage(req.params.co
 
 
 // ─── BEST OF CATALOG ─────────────────────────────────────────────────────────
-app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
-  const cfg    = parseConfig(req.params.config);
+// ─── CATALOG HANDLER FUNCTIONS ───────────────────────────────────────────────
+// Extracted so both /:config/ and /s/:id/:keyToken/ routes can call them directly.
+
+async function handleBestofCatalog(cfg, req, res) {
   const apiKey = cfg.tmdbApiKey;
   if (!apiKey) return res.json({ metas: [] });
   const customSeasons = cfg.customSeasons || [];
@@ -440,18 +442,15 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
         const series  = seriesCache[list.tmdbId];
         const prefix  = list.prefix ? list.prefix.trim() + ' ' : '';
         const label   = list.label  || 'Curated';
-        // FIX: always use live series.name (never undefined) for display
         const showName = series.name || series.original_name || list.tmdbName || 'Unknown';
         const epCount = (list.episodes || []).length;
-        // Resolve poster: posterSpec means server-generated → use /api/poster endpoint (Stremio caches by URL)
-        // Fallback to TMDB default poster
         let posterUrl;
         const spec = list.posterSpec;
         if (spec && spec.mode && spec.mode !== 'default') {
           if (spec.mode === 'url' && spec.url) {
             posterUrl = spec.url;
           } else {
-            posterUrl = req.protocol + '://' + req.get('host') + '/' + req.params.config + '/poster/' + list.listId + '.jpg';
+            posterUrl = req.protocol + '://' + req.get('host') + req.baseConfigPath + '/poster/' + list.listId + '.jpg';
           }
         } else {
           posterUrl = series.poster_path ? TMDB_IMG_MD + series.poster_path : null;
@@ -474,11 +473,16 @@ app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
     console.error('[bestof catalog]', e.message);
     res.json({ metas: [] });
   }
+}
+
+app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
+  req.baseConfigPath = '/' + req.params.config;
+  handleBestofCatalog(parseConfig(req.params.config), req, res);
 });
 
 // ─── CATALOG ENDPOINT ────────────────────────────────────────────────────────
-app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
-  const cfg    = parseConfig(req.params.config);
+async function catalogHandler(req, res) {
+  const cfg    = req.resolvedCfg || parseConfig(req.params.config);
   const type   = req.params.type;
   const id     = req.params.id;
   const apiKey = cfg.tmdbApiKey;
@@ -601,7 +605,7 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
           let posterUrl;
           if (spec && spec.mode && spec.mode !== 'default') {
             if (spec.mode === 'url' && spec.url) posterUrl = spec.url;
-            else posterUrl = req.protocol + '://' + req.get('host') + '/' + req.params.config + '/poster/' + list.listId + '.jpg';
+            else posterUrl = req.protocol + '://' + req.get('host') + (req.baseConfigPath || ('/' + req.params.config)) + '/poster/' + list.listId + '.jpg';
           } else {
             posterUrl = series.poster_path ? TMDB_IMG_MD + series.poster_path : null;
           }
@@ -653,7 +657,7 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
             let posterUrl;
             if (spec && spec.mode && spec.mode !== 'default') {
               if (spec.mode === 'url' && spec.url) posterUrl = spec.url;
-              else posterUrl = req.protocol + '://' + req.get('host') + '/' + req.params.config + '/poster/' + list.listId + '.jpg';
+              else posterUrl = req.protocol + '://' + req.get('host') + (req.baseConfigPath || ('/' + req.params.config)) + '/poster/' + list.listId + '.jpg';
             } else {
               posterUrl = series.poster_path ? TMDB_IMG_MD + series.poster_path : null;
             }
@@ -753,7 +757,8 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
     console.error('[catalog]', e.message);
     res.json({ metas: [] });
   }
-});
+}
+app.get('/:config/catalog/:type/:id/:extras?.json', catalogHandler);
 
 // ─── API HELPER ROUTES ────────────────────────────────────────────────────────
 app.get('/api/search', async function(req, res) {
@@ -944,45 +949,40 @@ app.post('/api/save-config', express.json(), async function(req, res) {
 });
 
 // ─── SHORT URL ROUTES (/s/:id/:keyToken/...) ─────────────────────────────────
-// :keyToken is a compressed base64 of {tmdbApiKey, topN, showAutoSeason}
-// It is provided by the client and never stored server-side.
+// Resolves config from store + decodes key token, then calls the same named
+// handler functions used by /:config/ routes. No redirects, no re-dispatch.
 
 async function resolveShortRequest(id, keyToken) {
   const stored = await loadConfig(id);
   if (!stored) return null;
   const keyData = decodeKeyToken(keyToken || '');
-  // Merge key back into config for this request only — never persisted
   return Object.assign({}, stored, keyData);
 }
 
-app.get('/s/:id/:keyToken/manifest.json', async function(req, res) {
+async function injectShortConfig(req, res, next) {
   const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
-  if (!cfg) return res.status(404).json({ error: 'Config not found' });
-  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
-  res.json(buildManifest(b64));
-});
+  if (!cfg) {
+    if (req.path.includes('/catalog/')) return res.json({ metas: [] });
+    if (req.path.includes('/meta/')) return res.json({ meta: null });
+    if (req.path.includes('/episodeVideos/')) return res.json({ videos: [] });
+    return res.status(404).send('Config not found');
+  }
+  req.resolvedCfg = cfg;
+  req.baseConfigPath = '/s/' + req.params.id + '/' + req.params.keyToken;
+  req.params.config = Buffer.from(JSON.stringify(cfg)).toString('base64');
+  next();
+}
 
-app.get('/s/:id/:keyToken/configure', async function(req, res) {
-  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
-  if (!cfg) return res.redirect('/configure');
-  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
-  res.send(configurePage(b64));
-});
+app.get('/s/:id/:keyToken/manifest.json', injectShortConfig, (req, res) => res.json(buildManifest(req.params.config)));
+app.get('/s/:id/:keyToken/configure',     injectShortConfig, (req, res) => res.send(configurePage(req.params.config)));
 
-app.get('/s/:id/:keyToken/catalog/:type/:catid/:extras?.json', async function(req, res) {
-  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
-  if (!cfg) return res.json({ metas: [] });
-  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
-  const extras = req.params.extras ? '/' + req.params.extras : '';
-  return res.redirect('/' + b64 + '/catalog/' + req.params.type + '/' + req.params.catid + extras + '.json');
-});
+app.get('/s/:id/:keyToken/catalog/series/tmdb.bestof.json',          injectShortConfig, (req, res) => handleBestofCatalog(req.resolvedCfg, req, res));
+app.get('/s/:id/:keyToken/catalog/:type/:id/:extras?.json',           injectShortConfig, catalogHandler);
+app.get('/s/:id/:keyToken/meta/movie/:id.json',                       injectShortConfig, metaMovieHandler);
+app.get('/s/:id/:keyToken/meta/series/:id.json',                      injectShortConfig, metaSeriesHandler);
+app.get('/s/:id/:keyToken/episodeVideos/series/:id.json',             injectShortConfig, episodeVideosHandler);
+app.get('/s/:id/:keyToken/poster/:listId.jpg',                        injectShortConfig, posterHandler);
 
-app.get('/s/:id/:keyToken/meta/:type/:metaid.json', async function(req, res) {
-  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
-  if (!cfg) return res.json({ meta: null });
-  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
-  return res.redirect('/' + b64 + '/meta/' + req.params.type + '/' + req.params.metaid + '.json');
-});
 
 // ─── SHARED CONFIG (key-free, for sharing) ───────────────────────────────────
 app.get('/shared/:id/configure', async function(req, res) {
@@ -1366,8 +1366,8 @@ app.get('/api/mdblist-catalog', async function(req, res) {
   }
 });
 
-app.get('/:config/poster/:listId.jpg', async function(req, res) {
-  const cfg = parseConfig(req.params.config);
+async function posterHandler(req, res) {
+  const cfg = req.resolvedCfg || parseConfig(req.params.config);
   const listId = req.params.listId;
   const customSeasons = cfg.customSeasons || [];
   const list = customSeasons.find(l => l.listId === listId);
@@ -1487,7 +1487,8 @@ app.get('/:config/poster/:listId.jpg', async function(req, res) {
   }
 
   res.status(400).send('Unknown poster mode');
-});
+}
+app.get('/:config/poster/:listId.jpg', posterHandler);
 
 // ─── SERIES LOGO ENDPOINT (for poster customization) ─────────────────────────
 app.get('/api/series-logo', async function(req, res) {
@@ -1509,8 +1510,8 @@ app.get('/api/series-logo', async function(req, res) {
 });
 
 // ─── META ENDPOINTS ───────────────────────────────────────────────────────────
-app.get('/:config/meta/movie/:id.json', async function(req, res) {
-  const cfg = parseConfig(req.params.config);
+async function metaMovieHandler(req, res) {
+  const cfg = req.resolvedCfg || parseConfig(req.params.config);
   const id  = req.params.id;
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
   if (!id.startsWith('tmdb:')) return res.json({ meta: null });
@@ -1538,10 +1539,11 @@ app.get('/:config/meta/movie/:id.json', async function(req, res) {
     console.error('[movie meta]', e.message);
     res.status(500).json({ err: e.message });
   }
-});
+}
+app.get('/:config/meta/movie/:id.json', metaMovieHandler);
 
-app.get('/:config/meta/series/:id.json', async function(req, res) {
-  const cfg = parseConfig(req.params.config);
+async function metaSeriesHandler(req, res) {
+  const cfg = req.resolvedCfg || parseConfig(req.params.config);
   const id  = req.params.id;
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
 
@@ -1573,7 +1575,7 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
         if (spec.mode === 'url' && spec.url) {
           posterUrl = spec.url;
         } else {
-          posterUrl = req.protocol + '://' + req.get('host') + '/' + req.params.config + '/poster/' + list.listId + '.jpg';
+          posterUrl = req.protocol + '://' + req.get('host') + (req.baseConfigPath || ('/' + req.params.config)) + '/poster/' + list.listId + '.jpg';
         }
       } else {
         posterUrl = series.poster_path ? TMDB_IMG_MD + series.poster_path : null;
@@ -1665,11 +1667,12 @@ app.get('/:config/meta/series/:id.json', async function(req, res) {
     console.error('[series meta]', e.message);
     res.status(500).json({ err: e.message });
   }
-});
+}
+app.get('/:config/meta/series/:id.json', metaSeriesHandler);
 
 // ─── EPISODE VIDEOS ───────────────────────────────────────────────────────────
-app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
-  const cfg    = parseConfig(req.params.config);
+async function episodeVideosHandler(req, res) {
+  const cfg    = req.resolvedCfg || parseConfig(req.params.config);
   const id     = req.params.id;
   if (!cfg.tmdbApiKey) return res.json({ videos: [] });
   const parts = id.split(':');
@@ -1697,7 +1700,8 @@ app.get('/:config/episodeVideos/series/:id.json', async function(req, res) {
     console.error('[episodeVideos]', e.message);
     res.json({ videos: [] });
   }
-});
+}
+app.get('/:config/episodeVideos/series/:id.json', episodeVideosHandler);
 
 // ─── CONFIGURE PAGE ───────────────────────────────────────────────────────────
 function configurePage(existingConfig, isShared) {
