@@ -653,13 +653,12 @@ app.get('/api/hero-backdrops', async function(req, res) {
   } catch (e) { res.status(500).json({ error: e.message, backdrops: [] }); }
 });
 
-// ─── START PAGE IMAGES: uses dedicated GOODTASTE_HERO_API_KEY env var ──────────
-// This key is only used for the config start page hero background (30 images, 15/row).
-// Set GOODTASTE_HERO_API_KEY in your Render environment variables.
+// ─── START PAGE IMAGES: uses GOODTASTE_HERO_API_KEY env var OR user apiKey param ──
+// Prefers dedicated env key; if absent, accepts an apiKey query param from the client.
+// Falls back to static proxied images if neither is available.
 app.get('/api/start-hero', async function(req, res) {
-  const heroKey = process.env.GOODTASTE_HERO_API_KEY;
+  const heroKey = process.env.GOODTASTE_HERO_API_KEY || req.query.apiKey || null;
   if (!heroKey) {
-    // Fall back to static proxied images if no dedicated key set
     return res.json({ posters: [], useFallback: true });
   }
   try {
@@ -1735,6 +1734,7 @@ function configurePage(existingConfig, isShared) {
     .boost-previews { display:flex; gap:6px; margin-bottom:12px; min-height:36px; }
     .boost-preview-poster { width:42px; height:63px; border-radius:5px; object-fit:cover; flex-shrink:0; }
     .boost-btn { width:100%; }
+    .boost-btn.boost-applied { background: rgba(240,192,64,0.12); color: var(--gold); border: 1px solid rgba(240,192,64,0.3); }
 
     .edit-mode-banner {
       background: rgba(240,192,64,0.08);
@@ -2053,7 +2053,7 @@ function configurePage(existingConfig, isShared) {
     .summary-value.accent { color: var(--gold); }
 
     .ep-parade { display: flex; gap: 6px; overflow: hidden; margin: 1.5rem 0; mask-image: linear-gradient(to right, transparent, black 10%, black 90%, transparent); -webkit-mask-image: linear-gradient(to right, transparent, black 10%, black 90%, transparent); }
-    .ep-parade-track { display: flex; gap: 6px; animation: scroll 20s linear infinite; flex-shrink: 0; }
+    .ep-parade-track { display: flex; gap: 6px; animation: scroll 30s linear infinite; flex-shrink: 0; }
     @keyframes scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
     .parade-thumb { width: 80px; height: 45px; border-radius: 6px; object-fit: cover; flex-shrink: 0; opacity: 0.7; }
     .parade-thumb.no-img { background: var(--surface2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 1.2rem; }
@@ -2118,14 +2118,19 @@ function configurePage(existingConfig, isShared) {
     "  if (topNInp) topNInp.value = state.topN;",
     "  var szeroChk = document.getElementById('showAutoSeason');",
     "  if (szeroChk) szeroChk.checked = state.showAutoSeason;",
-    "  // If we have an API key, load the hero and render catalogs but stay on page 1",
+    "  // Always render lists and catalogs so shared config shows them",
+    "  renderDefaultCatalogs();",
+    "  renderCustomSeasonsList();",
+    "  // If we have an API key, stay on page 1 and enrich",
     "  if (state.apiKey) {",
-    "    renderDefaultCatalogs();",
-    "    renderCustomSeasonsList();",
     "    goTo(1);",
     "    // Enrich episodes with thumbnails in the background",
     "    enrichAllEpisodeThumbnails();",
+    "    // Refresh hero with real TMDB posters using user key",
+    "    refreshHeroWithApiKey(state.apiKey);",
     "  }",
+    "  // Always load boost gallery so it's ready (for edit/share mode)",
+    "  loadBoostGallery();",
     "}",
     "",
     "// After loading existing config, fetch episode stills for all shows so thumbnails display",
@@ -2185,20 +2190,36 @@ function configurePage(existingConfig, isShared) {
     "    else if (num<n) el.classList.add('done');",
     "  });",
     "  if (n===TOTAL_PAGES) buildInstallPage();",
-    "  if (n===2 && !isEditMode && !boostApplied) loadBoostGallery();",
+    "  if (n===2) loadBoostGallery();",
+    "  if (n===3) renderCustomSeasonsList();",
+    "  if (n===4) { renderUnifiedCatalogList(); renderBestOfCatalogPicker(); }",
     "  window.scrollTo({top:0,behavior:'smooth'});",
     "}",
     "",
 
-    // ── Hero background — uses dedicated GOODTASTE_HERO_API_KEY if set ──
-    // Loads from /api/start-hero which uses the dedicated server env key.
-    // Falls back to static proxied images. Never overridden by user API key.
+    // ── Hero background — uses dedicated GOODTASTE_HERO_API_KEY if set, otherwise user key ──
+    // Loads from /api/start-hero. Falls back to static proxied images then colored boxes.
     "async function loadHeroBackgrounds() {",
     "  var row1 = document.getElementById('hero-bg-row1');",
     "  var row2 = document.getElementById('hero-bg-row2');",
     "  if (!row1 || !row2) return;",
+    "  // Show colored placeholder boxes immediately",
+    "  function showColorBoxes() {",
+    "    var colors1=['#1a1a2e','#16213e','#0f3460','#533483','#2b2d42','#1e1e2e','#1b262c','#0a3d62'];",
+    "    var colors2=['#2c3e50','#1a1a2e','#4a235a','#0d2137','#1b1b2f','#162032','#1e2d40','#2a1a3e'];",
+    "    function makeBoxRow(colors) {",
+    "      return colors.concat(colors).map(function(c){",
+    "        return '<div class=\"hero-bg-item\"><div style=\"width:100%;height:100%;background:'+c+';border-radius:8px;opacity:0.7\"></div></div>';",
+    "      }).join('');",
+    "    }",
+    "    row1.innerHTML = makeBoxRow(colors1);",
+    "    row2.innerHTML = makeBoxRow(colors2);",
+    "  }",
+    "  showColorBoxes();",
+    "  // Try to load real posters — use user API key if available",
+    "  var apiKeyParam = state.apiKey ? '&apiKey=' + encodeURIComponent(state.apiKey) : '';",
     "  try {",
-    "    var r = await fetch('/api/start-hero');",
+    "    var r = await fetch('/api/start-hero?_t=' + Date.now() + apiKeyParam);",
     "    var d = await r.json();",
     "    if (!d.useFallback && d.row1 && d.row1.length >= 4) {",
     "      function makeFromPosters(arr) {",
@@ -2208,7 +2229,7 @@ function configurePage(existingConfig, isShared) {
     "      }",
     "      row1.innerHTML = makeFromPosters(d.row1);",
     "      row2.innerHTML = makeFromPosters(d.row2 && d.row2.length ? d.row2 : d.row1);",
-    "      return; // dedicated key worked, don't fall through to static",
+    "      return;",
     "    }",
     "  } catch(e) { /* fall through to static */ }",
     "  // Static fallback",
@@ -2225,14 +2246,13 @@ function configurePage(existingConfig, isShared) {
     "    }",
     "    row1.innerHTML = makeItems(posters.slice(0, half));",
     "    row2.innerHTML = makeItems(posters.slice(half));",
-    "  } catch(e) { /* silent fail */ }",
+    "  } catch(e) { /* silent fail — color boxes remain */ }",
     "}",
     "",
-    // refreshHeroWithApiKey now only refreshes for user preview on later pages (NOT page 1)
+    // refreshHeroWithApiKey: now called after API key is validated to reload hero with real posters
     "async function refreshHeroWithApiKey(apiKey) {",
-    "  // Only refresh if the dedicated hero key is NOT set (no env key = use user key for hero)",
-    "  // But we don't know from client side — so we do nothing here; hero is set by loadHeroBackgrounds",
-    "  // This function is kept for backward compat but hero is now managed by loadHeroBackgrounds()",
+    "  state.apiKey = apiKey;",
+    "  await loadHeroBackgrounds();",
     "}",
     "",
 
@@ -2249,6 +2269,7 @@ function configurePage(existingConfig, isShared) {
     "    var d = await r.json();",
     "    if (d.error) throw new Error(d.error);",
     "    state.apiKey = key;",
+    "    refreshHeroWithApiKey(key);",
     "    renderDefaultCatalogs();",
     "    goTo(2);",
     "  } catch(e) {",
@@ -2361,13 +2382,14 @@ function configurePage(existingConfig, isShared) {
     "      else if (c.path==='_custom_items_') sub='Custom Items &middot; '+c.type+' &middot; '+(c.items&&c.items.length||0)+' item'+((!c.items||c.items.length!==1)?'s':'');",
     "      else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; sub='TMDB Discover &middot; '+c.type+' &middot; '+sl; }",
     "      var isItems = c.path==='_custom_items_';",
+    "      var isBoost = !!c._boostId;",
     "      var html = '<div class=\"catalog-row catalog-row-custom\" id=\"ccat-'+c.id+'\" data-uidx=\"'+idx+'\" data-uid=\"'+entry.kind+':'+entry.id+'\" draggable=\"true\">'",
     "        + '<span class=\"catalog-drag-handle\">&#8801;</span>'",
     "        + '<div class=\"catalog-row-info\">'",
     "          + '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(c.name)+'\" oninput=\"updateCustomCatName(\\''+c.id+'\\',this.value)\" onclick=\"event.stopPropagation()\" title=\"Tap to rename\"/>'",
     "          + '<div class=\"catalog-row-type\">'+sub+'</div>'",
     "        + '</div>'",
-    "        + (isItems ? '<button class=\"btn btn-ghost btn-sm\" style=\"padding:5px 8px;flex-shrink:0\" onclick=\"event.stopPropagation();toggleCustomCatExpand(\\''+c.id+'\\')\" title=\"Edit items\">&#9998;</button>' : '')",
+    "        + '<button class=\"btn btn-ghost btn-sm\" style=\"padding:5px 8px;flex-shrink:0\" onclick=\"event.stopPropagation();toggleCustomCatExpand(\\''+c.id+'\\')\" title=\"Edit\">&#9998;</button>'",
     "        + '<button class=\"btn btn-danger btn-sm\" style=\"flex-shrink:0\" onclick=\"event.stopPropagation();removeCustomCatalog(\\''+c.id+'\\')\">&times;</button>';",
     "      if (isItems) {",
     "        var items = c.items || [];",
@@ -2390,6 +2412,26 @@ function configurePage(existingConfig, isShared) {
     "            + '<div id=\"catitems-results-'+c.id+'\" style=\"margin-top:4px;max-height:200px;overflow-y:auto\"></div>'",
     "          + '</div>'",
     "          + '</div>';",
+    "      } else {",
+    "        // Edit panel for TMDB-discover, MDBList, IMDB, bestof catalogs",
+    "        var editFields = '';",
+    "        editFields += '<div style=\"font-size:0.72rem;color:var(--text-dim);font-weight:600;margin-bottom:8px\">Edit Catalog</div>';",
+    "        editFields += '<div style=\"margin-bottom:8px\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Catalog Name</label><input type=\"text\" value=\"'+esc(c.name)+'\" oninput=\"updateCustomCatName(\\''+c.id+'\\',this.value)\" style=\"font-size:0.82rem\" onclick=\"event.stopPropagation()\"/></div>';",
+    "        if (c.path === '_mdblist_') {",
+    "          editFields += '<div style=\"margin-bottom:8px\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">MDBList URL</label><input type=\"text\" value=\"'+esc(c.mdblistUrl||'')+'\" oninput=\"updateCatField(\\''+c.id+'\\',\\'mdblistUrl\\',this.value)\" placeholder=\"https://mdblist.com/lists/...\" style=\"font-size:0.82rem\" onclick=\"event.stopPropagation()\"/></div>';",
+    "        } else if (c.path === '_imdblist_') {",
+    "          editFields += '<div style=\"margin-bottom:8px\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">IMDB List URL</label><input type=\"text\" value=\"'+esc(c.imdbUrl||'')+'\" oninput=\"updateCatField(\\''+c.id+'\\',\\'imdbUrl\\',this.value)\" placeholder=\"https://www.imdb.com/list/ls.../\" style=\"font-size:0.82rem\" onclick=\"event.stopPropagation()\"/></div>';",
+    "        } else if (c.path && c.path.startsWith('/discover/')) {",
+    "          var sortVal = (c.params && c.params.sort_by) || 'popularity.desc';",
+    "          editFields += '<div style=\"margin-bottom:8px\"><label style=\"font-size:0.65rem;color:var(--text-mute);text-transform:uppercase;letter-spacing:0.07em\">Sort By</label><select onchange=\"updateCatParam(\\''+c.id+'\\',\\'sort_by\\',this.value)\" onclick=\"event.stopPropagation()\" style=\"font-size:0.82rem\">'",
+    "            + ['popularity.desc','vote_average.desc','release_date.desc','revenue.desc'].map(function(s){return '<option value=\"'+s+'\"'+(sortVal===s?' selected':'')+'>'+({'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'}[s]||s)+'</option>';}).join('')",
+    "            + '</select></div>';",
+    "        } else if (c.path === '_bestof_') {",
+    "          var listCount = (c.bestofListIds||[]).length;",
+    "          editFields += '<div style=\"font-size:0.78rem;color:var(--text-mute);margin-bottom:6px\">Contains '+listCount+' curated list'+(listCount!==1?'s':'')+'. Recreate from Best Of Lists tab to change.</div>';",
+    "        }",
+    "        editFields += '<div style=\"margin-top:8px;display:flex;gap:6px\"><select onclick=\"event.stopPropagation()\" onchange=\"updateCatField(\\''+c.id+'\\',\\'type\\',this.value)\" style=\"font-size:0.8rem;padding:6px 10px;width:auto\"><option value=\"movie\"'+(c.type==='movie'?' selected':'')+'>Movie</option><option value=\"series\"'+(c.type==='series'?' selected':'')+'>Series</option></select></div>';",
+    "        html += '<div class=\"custom-catalog-editor\">'+editFields+'</div>';",
     "      }",
     "      html += '</div>';",
     "      return html;",
@@ -2401,6 +2443,8 @@ function configurePage(existingConfig, isShared) {
     "function setCatalogEnabled(id, val) { state.catalogEnabled[id]=val; }",
     "function setCatalogName(id, val) { state.catalogNames[id]=val; }",
     "function updateCustomCatName(id, val) { var c=state.customCatalogs.find(function(x){return x.id===id;}); if(c) c.name=val; }",
+    "function updateCatField(id, field, val) { var c=state.customCatalogs.find(function(x){return x.id===id;}); if(c) c[field]=val; }",
+    "function updateCatParam(id, param, val) { var c=state.customCatalogs.find(function(x){return x.id===id;}); if(c){ if(!c.params) c.params={}; c.params[param]=val; } }",
     "function removeCustomCatalog(id) {",
     "  state.customCatalogs = state.customCatalogs.filter(function(c){ return c.id!==id; });",
     "  state.unifiedOrder = state.unifiedOrder.filter(function(o){ return !(o.kind==='custom'&&o.id===id); });",
@@ -2715,7 +2759,8 @@ function configurePage(existingConfig, isShared) {
     "        +'<div style=\"font-size:0.75rem;color:'+(selected?'var(--gold)':'var(--text-mute)')+'\">'+(selected?'&#10003; Selected':'+ Select')+'</div></div>';",
     "    }).join('')+",
     "    '<div style=\"margin-top:10px;display:flex;gap:8px\">'+",
-    "    '<button class=\"btn btn-primary btn-sm\" onclick=\"addBestOfCatalog()\">\u2795 Add Selected to Catalog</button>'+",
+    "    '<button class=\"btn btn-primary btn-sm\" onclick=\"addBestOfCatalog()\">\u2795 Add Selected</button>'+",
+    "    '<button class=\"btn btn-ghost btn-sm\" onclick=\"toggleCustomCatalogForm()\">Cancel</button>'+",
     "    '</div>';",
     "}",
     "function toggleBestOfPick(listId) {",
@@ -2922,7 +2967,7 @@ function configurePage(existingConfig, isShared) {
     "function updateListMeta(listId, field, value) {",
     "  var list=getList(listId); if (list) list[field]=value;",
     "  var nameEl=document.getElementById('show-name-display-'+listId);",
-    "  if (nameEl&&list) nameEl.textContent=(list.prefix?list.prefix.trim()+' ':'')+' '+(list.label||'Best Of')+' '+list.tmdbName;",
+    "  if (nameEl&&list) nameEl.textContent=(list.prefix?list.prefix.trim()+' ':'')+''+(list.label||'Best Of')+' '+list.tmdbName;",
     "}",
     "",
     "function removeList(listId) {",
@@ -2967,7 +3012,7 @@ function configurePage(existingConfig, isShared) {
     "    var tid=list.listId;",
     "    var effectivePoster=list.posterUrl||list.tmdbPoster||null;",
     "    var ph=effectivePoster?'<img class=\"show-poster\" src=\"'+effectivePoster+'\" alt=\"\" loading=\"lazy\"/>':'<div class=\"show-poster\" style=\"display:flex;align-items:center;justify-content:center;color:var(--text-mute)\">&#128250;</div>';",
-    "    var displayName=(list.prefix?list.prefix.trim()+' ':'')+' '+(list.label||'Best Of')+' '+list.tmdbName;",
+    "    var displayName=(list.prefix?list.prefix.trim()+' ':'')+''+(list.label||'Best Of')+' '+list.tmdbName;",
     "    var hasCnt=list.episodes.length>0;",
     "    var posterMode=list.posterMode||'default';",
     "    var customPosterUrl=(list.posterSpec&&list.posterSpec.mode==='url'?list.posterSpec.url:'')||list.posterUrl||'';",
@@ -3426,37 +3471,55 @@ function configurePage(existingConfig, isShared) {
     "}",
     "",
     "async function applyBoost(boostId) {",
+    "  var btn = document.querySelector('#boost-'+boostId+' .boost-btn');",
+    "  var wasApplied = btn && btn.classList.contains('boost-applied');",
     "  try {",
     "    var r=await fetch('/api/boosts/'+encodeURIComponent(boostId));",
     "    var d=await r.json();",
     "    var boost=d.boost; if(!boost) return;",
+    "    if (wasApplied) {",
+    "      // Toggle off — remove this boost's contributions",
+    "      // Remove custom catalogs added by this boost (track by boostId tag)",
+    "      state.customCatalogs = state.customCatalogs.filter(function(c){ return c._boostId !== boostId; });",
+    "      state.unifiedOrder = state.unifiedOrder.filter(function(o){",
+    "        if (o.kind !== 'custom') return true;",
+    "        return !!state.customCatalogs.find(function(c){ return c.id === o.id; });",
+    "      });",
+    "      state.customSeasons = state.customSeasons.filter(function(s){ return s._boostId !== boostId; });",
+    "      if (btn) { btn.classList.remove('boost-applied'); btn.innerHTML = '&#9889; Apply Boost'; }",
+    "      showToast(boost.name+' removed');",
+    "      renderUnifiedCatalogList();",
+    "      renderCustomSeasonsList();",
+    "      return;",
+    "    }",
     "    // Enable requested default catalogs",
     "    if(boost.enableCatalogs) {",
     "      boost.enableCatalogs.forEach(function(id){ state.catalogEnabled[id]=true; });",
     "    }",
-    "    // Add custom catalogs",
+    "    // Add custom catalogs (tagged with boostId so they can be removed)",
     "    if(boost.customCatalogs) {",
     "      boost.customCatalogs.forEach(function(cat){",
-    "        var newCat=Object.assign({},cat,{id:'boost.'+Date.now()+'.'+Math.random().toString(36).slice(2),enabled:true});",
+    "        var newCat=Object.assign({},cat,{id:'boost.'+Date.now()+'.'+Math.random().toString(36).slice(2),enabled:true,_boostId:boostId});",
     "        state.customCatalogs.push(newCat);",
     "        initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
     "      });",
     "    }",
-    "    // Add best-of episode lists",
+    "    // Add best-of episode lists (tagged with boostId so they can be removed)",
     "    if(boost.customSeasons) {",
     "      boost.customSeasons.forEach(function(s){",
     "        var listId=uid();",
     "        state.customSeasons.push({",
     "          listId:listId, tmdbId:String(s.tmdbId), tmdbName:s.tmdbName||'', tmdbPoster:null,",
     "          label:s.label||'Best Of', prefix:s.prefix||'✦', posterUrl:null, posterSpec:null, posterMode:'default',",
-    "          episodes:s.episodes||[]",
+    "          episodes:s.episodes||[], _boostId:boostId",
     "        });",
     "      });",
     "    }",
     "    boostApplied=true;",
-    "    showToast(boost.name+' boost applied \u2013 customize below');",
-    "    goTo(3); // go to Lists page",
+    "    if (btn) { btn.classList.add('boost-applied'); btn.innerHTML = '&#10003; Applied &mdash; click to remove'; }",
+    "    showToast(boost.name+' applied \u2013 click again to remove');",
     "    renderCustomSeasonsList();",
+    "    renderUnifiedCatalogList();",
     "    // Enrich thumbnails in background",
     "    enrichAllEpisodeThumbnails();",
     "  } catch(e){ showToast('Could not apply boost. Try again.'); }",
@@ -3735,7 +3798,7 @@ function configurePage(existingConfig, isShared) {
           </div>
           <div class="add-cat-panel" id="add-cat-panel-mdblist">
             <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">&#9888; MDBList import is experimental. List must be Public.</div>
-            <div style="display:flex;gap:8px;margin-bottom:8px"><input type="text" id="mdb-cat-url" placeholder="https://mdblist.com/lists/username/listname" style="flex:1;font-size:0.85rem"/><button class="btn btn-ghost btn-sm" id="mdb-cat-btn" onclick="previewMdbCatalog()" style="white-space:nowrap">Preview</button></div>
+            <div style="display:flex;gap:8px;margin-bottom:8px"><input type="text" id="mdb-cat-url" placeholder="https://mdblist.com/lists/username/listname" style="flex:1;font-size:0.85rem"/><button class="btn btn-ghost btn-sm" id="mdb-cat-btn" onclick="previewMdbCatalog()" style="white-space:nowrap">Import</button></div>
             <div id="mdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
             <div id="mdb-cat-preview" style="display:none">
               <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end"><div class="field" style="margin-bottom:0;min-width:120px"><label>Type</label><select id="mdb-cat-type"><option value="movie">Movie</option><option value="series">Series</option></select></div><button class="btn btn-primary btn-sm" onclick="addMdbCatalog()">Add</button></div>
@@ -3745,7 +3808,7 @@ function configurePage(existingConfig, isShared) {
           </div>
           <div class="add-cat-panel" id="add-cat-panel-imdb">
             <div style="font-size:0.73rem;color:rgba(240,192,64,0.7);background:rgba(240,192,64,0.06);border:1px solid rgba(240,192,64,0.15);border-radius:8px;padding:8px 10px;margin-bottom:10px">&#9888; IMDB import is experimental.</div>
-            <div style="display:flex;gap:8px;margin-bottom:4px"><input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/ or /chart/top/" style="flex:1;font-size:0.85rem"/><button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Preview</button></div>
+            <div style="display:flex;gap:8px;margin-bottom:4px"><input type="text" id="imdb-cat-url" placeholder="https://www.imdb.com/list/ls086682535/ or /chart/top/" style="flex:1;font-size:0.85rem"/><button class="btn btn-ghost btn-sm" id="imdb-cat-btn" onclick="previewImdbCatalog()" style="white-space:nowrap">Import</button></div>
             <div style="font-size:0.68rem;color:var(--text-mute);margin-bottom:8px">Charts: /chart/top/ &middot; /chart/moviemeter/ &middot; /chart/toptv/ &middot; /chart/boxoffice/</div>
             <div id="imdb-cat-status" style="font-size:0.73rem;color:var(--text-mute);min-height:18px;margin-bottom:8px"></div>
             <div id="imdb-cat-preview" style="display:none">
@@ -3757,7 +3820,6 @@ function configurePage(existingConfig, isShared) {
           <div class="add-cat-panel" id="add-cat-panel-bestof">
             <div style="font-size:0.73rem;color:var(--text-mute);margin-bottom:10px">Add one of your curated Best Of lists as a standalone catalog in Stremio.</div>
             <div class="bestof-pick-list" style="max-height:280px;overflow-y:auto"></div>
-            <div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="toggleCustomCatalogForm()">Cancel</button></div>
           </div>
         </div>
       </div>
