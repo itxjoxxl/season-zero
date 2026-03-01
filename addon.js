@@ -257,7 +257,7 @@ function buildBestOfVideos(bestOfEps, imdbId, tmdbId) {
       season: 1, episode: rank,
       overview: ratingLine + (ep.overview || ''),
       thumbnail: ep.still || null,
-      released: ep.air_date ? ep.air_date : undefined,
+      released: ep.air_date ? new Date(ep.air_date) : null,
     };
   });
 }
@@ -403,11 +403,7 @@ function buildManifest(config) {
     description: 'Curated episode lists, full TMDB metadata, catalogs, and search.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
     catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
-    resources: [
-      { name: 'catalog',       types: ['movie', 'series'], idPrefixes: ['tmdb:', 'bestof:'] },
-      { name: 'meta',          types: ['movie', 'series'], idPrefixes: ['tmdb:', 'bestof:', 'tt'] },
-      { name: 'episodeVideos', types: ['series'],          idPrefixes: ['tmdb:', 'bestof:', 'tt'] },
-    ],
+    resources:   ['catalog', 'meta', 'episodeVideos'],
     types:       ['movie', 'series'],
     idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
     behaviorHints: { configurable: true, configurationRequired: !cfg.tmdbApiKey },
@@ -1643,8 +1639,8 @@ async function metaSeriesHandler(req, res) {
             title: ep.name || 'Episode ' + ep.episode_number,
             season: s, episode: ep.episode_number,
             overview: ep.overview || '',
-            thumbnail: ep.still_path ? TMDB_IMG_SM + ep.still_path : undefined,
-            released: ep.air_date || undefined,
+            thumbnail: ep.still_path ? TMDB_IMG_SM + ep.still_path : null,
+            released: ep.air_date ? new Date(ep.air_date) : null,
             rating: ep.vote_average ? ep.vote_average.toFixed(1) : null,
           });
         }
@@ -1653,23 +1649,21 @@ async function metaSeriesHandler(req, res) {
 
     if (cfg.showAutoSeason !== false) {
       const bestOfEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
-      if (bestOfEps.length > 0) {
-        bestOfEps.forEach((ep, i) => {
-          const rank = i + 1;
-          const sLabel = String(ep.season).padStart(2, '0');
-          const eLabel = String(ep.episode).padStart(2, '0');
-          const ratingLine = ep.vote_average > 0
-            ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
-          videos.push({
-            id: 'tmdb:' + tmdbId + ':0:' + rank,
-            title: '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
-            season: 0, episode: rank,
-            overview: ratingLine + (ep.overview || ''),
-            thumbnail: ep.still || undefined,
-            released: ep.air_date || undefined,
-          });
+      bestOfEps.forEach((ep, i) => {
+        const rank = i + 1;
+        const sLabel = String(ep.season).padStart(2, '0');
+        const eLabel = String(ep.episode).padStart(2, '0');
+        const ratingLine = ep.vote_average > 0
+          ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
+        videos.push({
+          id: 'tmdb:' + tmdbId + ':0:' + rank,
+          title: '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
+          season: 0, episode: rank,
+          overview: ratingLine + (ep.overview || ''),
+          thumbnail: ep.still || null,
+          released: ep.air_date ? new Date(ep.air_date) : null,
         });
-      }
+      });
     }
 
     const startYear   = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
@@ -1698,56 +1692,30 @@ async function episodeVideosHandler(req, res) {
   const cfg    = req.resolvedCfg || parseConfig(req.params.config);
   const id     = req.params.id;
   if (!cfg.tmdbApiKey) return res.json({ videos: [] });
-
-  // Handle tt-prefixed IDs (IMDb format): tt1234567:season:episode
-  // These come from bestof lists — just return the id as-is for passthrough
-  if (/^tt\d+:\d+:\d+$/.test(id)) {
-    const parts = id.split(':');
-    return res.json({ videos: [{ id, season: parseInt(parts[1]), episode: parseInt(parts[2]) }] });
-  }
-
   const parts = id.split(':');
   if (parts[0] !== 'tmdb' || parts.length < 4) return res.json({ videos: [] });
   const tmdbId     = parts[1];
   const season     = parseInt(parts[2]);
   const episodeNum = parseInt(parts[3]);
-
-  // Season 0: auto-best-of — map rank back to real episode ID
-  if (season === 0) {
-    try {
-      const series = await getSeries(tmdbId, cfg.tmdbApiKey);
-      const imdbId = series.external_ids && series.external_ids.imdb_id || null;
-      const topN   = parseInt(cfg.topN) || 20;
-      const topEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
-      const target = topEps[episodeNum - 1];
-      if (!target) return res.json({ videos: [] });
-      const realId = imdbId
-        ? imdbId + ':' + target.season + ':' + target.episode
-        : 'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode;
-      return res.json({ videos: [{
-        id:        realId,
-        title:     target.name, season: target.season, episode: target.episode,
-        thumbnail: target.still || undefined, overview: target.overview,
-      }]});
-    } catch (e) {
-      console.error('[episodeVideos season 0]', e.message);
-      return res.json({ videos: [] });
-    }
-  }
-
-  // Real season/episode: bestof list or direct — return passthrough video entry
-  // This lets clients like Omni resolve the actual stream via other addons
+  if (season !== 0) return res.json({ videos: [] });
   try {
     const series = await getSeries(tmdbId, cfg.tmdbApiKey);
     const imdbId = series.external_ids && series.external_ids.imdb_id || null;
-    // Return the canonical ID (prefer IMDb) so stream addons can resolve it
-    const canonId = imdbId
-      ? imdbId + ':' + season + ':' + episodeNum
-      : id;
-    return res.json({ videos: [{ id: canonId, season, episode: episodeNum }] });
+    const topN   = parseInt(cfg.topN) || 20;
+    const topEps = await getTopEpisodes(tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1, topN);
+    const target = topEps[episodeNum - 1];
+    if (!target) return res.json({ videos: [] });
+    const realId = imdbId
+      ? imdbId + ':' + target.season + ':' + target.episode
+      : 'tmdb:' + tmdbId + ':' + target.season + ':' + target.episode;
+    res.json({ videos: [{
+      id:        realId,
+      title:     target.name, season: target.season, episode: target.episode,
+      thumbnail: target.still, overview: target.overview,
+    }]});
   } catch (e) {
     console.error('[episodeVideos]', e.message);
-    return res.json({ videos: [] });
+    res.json({ videos: [] });
   }
 }
 app.get('/:config/episodeVideos/series/:id.json', episodeVideosHandler);
