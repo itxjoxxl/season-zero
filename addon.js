@@ -960,7 +960,7 @@ async function resolveShortRequest(id, keyToken) {
 }
 
 async function injectShortConfig(req, res, next) {
-  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
+  const cfg = await resolveShortRequest(req.params.sid, req.params.keyToken);
   if (!cfg) {
     if (req.path.includes('/catalog/')) return res.json({ metas: [] });
     if (req.path.includes('/meta/')) return res.json({ meta: null });
@@ -968,21 +968,38 @@ async function injectShortConfig(req, res, next) {
     return res.status(404).send('Config not found');
   }
   req.resolvedCfg = cfg;
-  req.baseConfigPath = '/s/' + req.params.id + '/' + req.params.keyToken;
+  req.baseConfigPath = '/s/' + req.params.sid + '/' + req.params.keyToken;
   req.params.config = Buffer.from(JSON.stringify(cfg)).toString('base64');
   next();
 }
 
-app.get('/s/:id/:keyToken/manifest.json', injectShortConfig, (req, res) => res.json(buildManifest(req.params.config)));
-app.get('/s/:id/:keyToken/configure',     injectShortConfig, (req, res) => res.send(configurePage(req.params.config)));
+app.get('/s/:sid/:keyToken/manifest.json', injectShortConfig, (req, res) => res.json(buildManifest(req.params.config)));
+app.get('/s/:sid/:keyToken/configure',     injectShortConfig, (req, res) => res.send(configurePage(req.params.config)));
 
-app.get('/s/:id/:keyToken/catalog/series/tmdb.bestof.json',          injectShortConfig, (req, res) => handleBestofCatalog(req.resolvedCfg, req, res));
-app.get('/s/:id/:keyToken/catalog/:type/:id/:extras?.json',           injectShortConfig, catalogHandler);
-app.get('/s/:id/:keyToken/meta/movie/:id.json',                       injectShortConfig, metaMovieHandler);
-app.get('/s/:id/:keyToken/meta/series/:id.json',                      injectShortConfig, metaSeriesHandler);
-app.get('/s/:id/:keyToken/episodeVideos/series/:id.json',             injectShortConfig, episodeVideosHandler);
-app.get('/s/:id/:keyToken/poster/:listId.jpg',                        injectShortConfig, posterHandler);
+app.get('/s/:sid/:keyToken/catalog/series/tmdb.bestof.json', injectShortConfig, (req, res) => handleBestofCatalog(req.resolvedCfg, req, res));
 
+app.get('/s/:sid/:keyToken/catalog/:catType/:catId/:extras?.json', injectShortConfig, function(req, res) {
+  req.params.type   = req.params.catType;
+  req.params.id     = req.params.catId;
+  catalogHandler(req, res);
+});
+
+app.get('/s/:sid/:keyToken/meta/movie/:metaId.json', injectShortConfig, function(req, res) {
+  req.params.id = req.params.metaId;
+  metaMovieHandler(req, res);
+});
+
+app.get('/s/:sid/:keyToken/meta/series/:metaId.json', injectShortConfig, function(req, res) {
+  req.params.id = req.params.metaId;
+  metaSeriesHandler(req, res);
+});
+
+app.get('/s/:sid/:keyToken/episodeVideos/series/:epId.json', injectShortConfig, function(req, res) {
+  req.params.id = req.params.epId;
+  episodeVideosHandler(req, res);
+});
+
+app.get('/s/:sid/:keyToken/poster/:listId.jpg', injectShortConfig, posterHandler);
 
 // ─── SHARED CONFIG (key-free, for sharing) ───────────────────────────────────
 app.get('/shared/:id/configure', async function(req, res) {
