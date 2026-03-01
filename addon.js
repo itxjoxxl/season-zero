@@ -409,6 +409,60 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
       return res.json({ metas });
     }
 
+    if (catDef.path === '_mixed_') {
+      // Mixed catalog: bestof lists + TMDB catalog sources combined
+      const customSeasons = cfg.customSeasons || [];
+      const sources = catDef.sources || [];
+      const metas = [];
+      const seen = new Set();
+      for (const src of sources) {
+        try {
+          if (src.kind === 'bestof') {
+            const list = customSeasons.find(l => l.listId === src.listId);
+            if (!list || !list.episodes || !list.episodes.length) continue;
+            const series = await getSeries(list.tmdbId, apiKey);
+            const spec = list.posterSpec;
+            let posterUrl;
+            if (spec && spec.mode === 'url' && spec.url) posterUrl = spec.url;
+            else posterUrl = series.poster_path ? TMDB_IMG_MD + series.poster_path : null;
+            const prefix = list.prefix ? list.prefix + ' ' : '';
+            const label = list.label || 'Curated';
+            const metaId = 'bestof:' + src.listId;
+            if (!seen.has(metaId)) {
+              seen.add(metaId);
+              metas.push({
+                id: metaId, type: 'series',
+                name: prefix + label + (series.name ? ' ' + series.name : ''),
+                poster: posterUrl,
+                background: series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+                description: label + ': ' + list.episodes.length + ' episodes from ' + series.name,
+                releaseInfo: series.first_air_date ? series.first_air_date.substring(0, 4) : '',
+                imdbRating: series.vote_average ? series.vote_average.toFixed(1) : null,
+                genres: (series.genres || []).map(g => g.name),
+              });
+            }
+          } else if (src.kind === 'tmdb') {
+            // TMDB catalog source (e.g. trending, popular, top_rated)
+            const tmdbPath = src.tmdbPath;
+            const tmdbType = src.tmdbType || type;
+            if (!tmdbPath) continue;
+            const data = await tmdb(tmdbPath, apiKey, { page });
+            const items = (data.results || []).slice(0, src.limit || 20);
+            for (const item of items) {
+              const meta = tmdbType === 'movie' ? movieToMeta(item) : seriesToMeta(item);
+              if (meta.poster && !seen.has(meta.id)) {
+                seen.add(meta.id);
+                metas.push(meta);
+              }
+            }
+          }
+        } catch (e) {
+          console.error('[mixed catalog source]', src.kind, e.message);
+        }
+      }
+      return res.json({ metas });
+    }
+
     if (catDef.path === '_bestof_') {
       const customSeasons = cfg.customSeasons || [];
       // Support multiple lists in one catalog via bestofListIds array or single bestofListId
@@ -636,13 +690,14 @@ app.get('/api/hero-backdrops', async function(req, res) {
       tmdb('/trending/movie/week', heroKey),
       tmdb('/trending/tv/week',   heroKey),
     ]);
-    // 15 per row = 30 total across both rows
+    const origin = req.protocol + '://' + req.get('host');
+    // 15 per row = 30 total. Return proxied URLs so the browser never hits TMDB directly.
     const movieBackdrops = (movies.results || []).slice(0, 15)
       .filter(m => m.poster_path)
-      .map(m => ({ type: 'movie', name: m.title || m.original_title, poster: TMDB_IMG_MD + m.poster_path }));
+      .map(m => ({ type: 'movie', name: m.title || m.original_title, poster: origin + '/api/proxy-img?path=' + encodeURIComponent(m.poster_path) }));
     const showBackdrops = (shows.results || []).slice(0, 15)
       .filter(s => s.poster_path)
-      .map(s => ({ type: 'series', name: s.name || s.original_name, poster: TMDB_IMG_MD + s.poster_path }));
+      .map(s => ({ type: 'series', name: s.name || s.original_name, poster: origin + '/api/proxy-img?path=' + encodeURIComponent(s.poster_path) }));
     res.json({ backdrops: [...movieBackdrops, ...showBackdrops] });
   } catch (e) { res.status(500).json({ error: e.message, backdrops: [] }); }
 });
@@ -2149,17 +2204,51 @@ function configurePage(existingConfig) {
     "      if (c.path==='_mdblist_') sub='MDBList &middot; '+c.type;",
     "      else if (c.path==='_imdblist_') sub='IMDB &middot; '+c.type;",
     "      else if (c.path==='_custom_items_') sub='Custom Items &middot; '+c.type+' &middot; '+(c.items&&c.items.length||0)+' item'+((!c.items||c.items.length!==1)?'s':'');",
+    "      else if (c.path==='_bestof_') { var bc=(c.bestofListIds||[]).length; sub='Best Of &middot; '+bc+' list'+(bc!==1?'s':''); }",
+    "      else if (c.path==='_mixed_') { var ms=(c.sources||[]).length; sub='Mixed &middot; '+ms+' source'+(ms!==1?'s':''); }",
     "      else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; sub='TMDB Discover &middot; '+c.type+' &middot; '+sl; }",
     "      var isItems = c.path==='_custom_items_';",
+    "      var isBestof = c.path==='_bestof_' || c.path==='_mixed_';",
     "      var html = '<div class=\"catalog-row catalog-row-custom\" id=\"ccat-'+c.id+'\" data-uidx=\"'+idx+'\" data-uid=\"'+entry.kind+':'+entry.id+'\" draggable=\"true\">'",
     "        + '<span class=\"catalog-drag-handle\">&#8801;</span>'",
     "        + '<div class=\"catalog-row-info\">'",
     "          + '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(c.name)+'\" oninput=\"updateCustomCatName(\\''+c.id+'\\',this.value)\" onclick=\"event.stopPropagation()\" title=\"Tap to rename\"/>'",
     "          + '<div class=\"catalog-row-type\">'+sub+'</div>'",
     "        + '</div>'",
-    "        + (isItems ? '<button class=\"btn btn-ghost btn-sm\" style=\"padding:5px 8px;flex-shrink:0\" onclick=\"event.stopPropagation();toggleCustomCatExpand(\\''+c.id+'\\')\" title=\"Edit items\">&#9998;</button>' : '')",
+    "        + ((isItems||isBestof) ? '<button class=\"btn btn-ghost btn-sm\" style=\"padding:5px 8px;flex-shrink:0\" onclick=\"event.stopPropagation();toggleCustomCatExpand(\\''+c.id+'\\')\" title=\"Edit\">&#9998;</button>' : '')",
     "        + '<button class=\"btn btn-danger btn-sm\" style=\"flex-shrink:0\" onclick=\"event.stopPropagation();removeCustomCatalog(\\''+c.id+'\\')\">&times;</button>';",
-    "      if (isItems) {",
+    "      if (isBestof) {",
+    "        var currentSources = c.path==='_bestof_' ? (c.bestofListIds||[]).map(function(id){return{kind:'bestof',listId:id};}) : (c.sources||[]);",
+    "        var bestofSourceHtml = currentSources.length ? currentSources.map(function(src,si){",
+    "          if (src.kind==='bestof') {",
+    "            var bl=state.customSeasons.find(function(l){return l.listId===src.listId;});",
+    "            var bname=bl?(bl.label||'Best Of')+' — '+(bl.tmdbName||bl.listId):'List '+src.listId;",
+    "            var bph=bl&&bl.tmdbPoster?'<img src=\"'+bl.tmdbPoster+'\" style=\"width:22px;height:33px;object-fit:cover;border-radius:3px;flex-shrink:0\"/>':'<div style=\"width:22px;height:33px;background:var(--surface);border-radius:3px;flex-shrink:0\"></div>';",
+    "            return '<div class=\"cat-item-row\" style=\"gap:8px\">'+bph+'<div class=\"cat-item-info\"><div class=\"cat-item-name\">'+esc(bname)+'</div><div class=\"cat-item-sub\">Curated List</div></div><span class=\"cat-item-del\" onclick=\"removeMixedSource(\\''+c.id+'\\','+si+')\">&#215;</span></div>';",
+    "          } else if (src.kind==='tmdb') {",
+    "            return '<div class=\"cat-item-row\" style=\"gap:8px\"><div style=\"width:22px;height:33px;background:var(--surface);border-radius:3px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:0.8rem\">&#127916;</div><div class=\"cat-item-info\"><div class=\"cat-item-name\">'+esc(src.label||src.tmdbCatalogId||'TMDB')+'</div><div class=\"cat-item-sub\">TMDB Catalog &middot; up to '+(src.limit||20)+' items</div></div><span class=\"cat-item-del\" onclick=\"removeMixedSource(\\''+c.id+'\\','+si+')\">&#215;</span></div>';",
+    "          }",
+    "          return '';",
+    "        }).join('') : '<p style=\"font-size:0.8rem;color:var(--text-mute);margin:4px 0 8px\">No sources yet. Add some below.</p>';",
+    "        html += '<div class=\"custom-catalog-editor\">'",
+    "          + '<div style=\"font-size:0.72rem;color:var(--text-dim);margin-bottom:8px;font-weight:600\">Sources &mdash; &times; to remove</div>'",
+    "          + bestofSourceHtml",
+    "          + '<div style=\"margin-top:12px;border-top:1px solid var(--border);padding-top:12px\">'",
+    "            + '<div style=\"font-size:0.7rem;font-weight:600;color:var(--text-mute);margin-bottom:8px;letter-spacing:0.06em;text-transform:uppercase\">Add Curated List</div>'",
+    "            + (state.customSeasons.length ? state.customSeasons.map(function(list){",
+    "                var already=currentSources.some(function(s){return s.kind==='bestof'&&s.listId===list.listId;});",
+    "                var ph=list.tmdbPoster?'<img src=\"'+list.tmdbPoster+'\" style=\"width:22px;height:33px;object-fit:cover;border-radius:3px;flex-shrink:0\"/>' : '<div style=\"width:22px;height:33px;background:var(--surface2);border-radius:3px;flex-shrink:0\"></div>';",
+    "                return '<div class=\"cat-search-result'+(already?' cat-search-added':'')+'\" onclick=\"addMixedBestofSource(\\''+c.id+'\\',\\''+list.listId+'\\')\">'+ ph +'<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.79rem;font-weight:600;color:var(--text)\">'+esc((list.label||'Best Of')+' — '+(list.tmdbName||''))+'</div><div style=\"font-size:0.68rem;color:var(--text-mute)\">'+list.episodes.length+' ep'+(list.episodes.length!==1?'s':'')+'</div></div><div style=\"font-size:0.73rem;color:'+(already?'var(--gold)':'var(--text-mute)')+'\">'+(already?'&#10003;':'+ Add')+'</div></div>';",
+    "              }).join('') : '<p style=\"font-size:0.75rem;color:var(--text-mute)\">No curated lists yet. Create some in the Lists step.</p>')",
+    "          + '</div>'",
+    "          + '<div style=\"margin-top:12px;border-top:1px solid var(--border);padding-top:12px\">'",
+    "            + '<div style=\"font-size:0.7rem;font-weight:600;color:var(--text-mute);margin-bottom:8px;letter-spacing:0.06em;text-transform:uppercase\">Add TMDB Catalog</div>'",
+    "            + '<div id=\"mixed-tmdb-sources-'+c.id+'\" style=\"display:flex;flex-direction:column;gap:4px\">'",
+"              + renderTmdbSourceOptions(c.id, currentSources)",
+    "            + '</div>'",
+    "          + '</div>'",
+    "        + '</div>';",
+    "      } else if (isItems) {",
     "        var items = c.items || [];",
     "        var itemsHtml = items.length",
     "          ? '<ul class=\"cat-items-list\">' + items.map(function(item, i) {",
@@ -2502,6 +2591,71 @@ function configurePage(existingConfig) {
     "  else window._bestofPickSelection.add(listId);",
     "  renderBestOfCatalogPicker();",
     "}",
+    "// TMDB catalog source options for mixed catalogs",
+    "var TMDB_SOURCE_OPTIONS = [",
+    "  {id:'tmdb.trending_movies',label:'Trending Movies',path:'/trending/movie/week',type:'movie'},",
+    "  {id:'tmdb.popular_movies',label:'Popular Movies',path:'/movie/popular',type:'movie'},",
+    "  {id:'tmdb.top_rated_movies',label:'Top Rated Movies',path:'/movie/top_rated',type:'movie'},",
+    "  {id:'tmdb.trending_series',label:'Trending Series',path:'/trending/tv/week',type:'series'},",
+    "  {id:'tmdb.popular_series',label:'Popular Series',path:'/tv/popular',type:'series'},",
+    "  {id:'tmdb.top_rated_series',label:'Top Rated Series',path:'/tv/top_rated',type:'series'},",
+    "  {id:'tmdb.airing_today',label:'Airing Today',path:'/tv/airing_today',type:'series'},",
+    "  {id:'tmdb.on_the_air',label:'On The Air',path:'/tv/on_the_air',type:'series'},",
+    "  {id:'tmdb.upcoming_movies',label:'Upcoming Movies',path:'/movie/upcoming',type:'movie'},",
+    "  {id:'tmdb.nowplaying_movies',label:'Now Playing',path:'/movie/now_playing',type:'movie'},",
+    "];",
+    "function renderTmdbSourceOptions(catId, currentSources) {",
+    "  return TMDB_SOURCE_OPTIONS.map(function(opt) {",
+    "    var already=currentSources.some(function(s){return s.kind==='tmdb'&&s.tmdbCatalogId===opt.id;});",
+    "    return '<div class=\"cat-search-result'+(already?' cat-search-added':'')+'\" onclick=\"addMixedTmdbSource(\\''+catId+'\\',\\''+opt.id+'\\')\">'",
+    "      +'<div style=\"width:22px;height:33px;background:var(--surface2);border-radius:3px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:0.75rem\">&#127916;</div>'",
+    "      +'<div style=\"flex:1;min-width:0\"><div style=\"font-size:0.79rem;font-weight:600;color:var(--text)\">'+esc(opt.label)+'</div><div style=\"font-size:0.68rem;color:var(--text-mute)\">'+opt.type+'</div></div>'",
+    "      +'<div style=\"font-size:0.73rem;color:'+(already?'var(--gold)':'var(--text-mute)')+'\">'+(already?'&#10003;':'+ Add')+'</div></div>';",
+    "  }).join('');",
+    "}",
+    "function getMixedCatalogSources(cat) {",
+    "  // Normalise: _bestof_ stores bestofListIds, _mixed_ stores sources array",
+    "  if (cat.path === '_bestof_') {",
+    "    return (cat.bestofListIds || []).map(function(id) { return {kind:'bestof', listId:id}; });",
+    "  }",
+    "  return cat.sources || [];",
+    "}",
+    "function setMixedCatalogSources(cat, sources) {",
+    "  // Upgrade _bestof_ to _mixed_ when TMDB sources are added",
+    "  cat.path = '_mixed_';",
+    "  cat.sources = sources;",
+    "  delete cat.bestofListIds;",
+    "}",
+    "function addMixedBestofSource(catId, listId) {",
+    "  var cat = state.customCatalogs.find(function(c){return c.id===catId;}); if(!cat) return;",
+    "  var sources = getMixedCatalogSources(cat);",
+    "  if (sources.some(function(s){return s.kind==='bestof'&&s.listId===listId;})) return;",
+    "  sources = sources.concat([{kind:'bestof',listId:listId}]);",
+    "  setMixedCatalogSources(cat, sources);",
+    "  var wasExp = document.getElementById('ccat-'+catId) && document.getElementById('ccat-'+catId).classList.contains('expanded');",
+    "  renderUnifiedCatalogList();",
+    "  if (wasExp) { setTimeout(function(){ var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); },20); }",
+    "}",
+    "function addMixedTmdbSource(catId, tmdbCatalogId) {",
+    "  var cat = state.customCatalogs.find(function(c){return c.id===catId;}); if(!cat) return;",
+    "  var opt = TMDB_SOURCE_OPTIONS.find(function(o){return o.id===tmdbCatalogId;}); if(!opt) return;",
+    "  var sources = getMixedCatalogSources(cat);",
+    "  if (sources.some(function(s){return s.kind==='tmdb'&&s.tmdbCatalogId===tmdbCatalogId;})) return;",
+    "  sources = sources.concat([{kind:'tmdb',tmdbCatalogId:tmdbCatalogId,label:opt.label,tmdbPath:opt.path,tmdbType:opt.type,limit:20}]);",
+    "  setMixedCatalogSources(cat, sources);",
+    "  var wasExp = document.getElementById('ccat-'+catId) && document.getElementById('ccat-'+catId).classList.contains('expanded');",
+    "  renderUnifiedCatalogList();",
+    "  if (wasExp) { setTimeout(function(){ var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); },20); }",
+    "}",
+    "function removeMixedSource(catId, idx) {",
+    "  var cat = state.customCatalogs.find(function(c){return c.id===catId;}); if(!cat) return;",
+    "  var sources = getMixedCatalogSources(cat);",
+    "  sources.splice(idx, 1);",
+    "  setMixedCatalogSources(cat, sources);",
+    "  var wasExp = document.getElementById('ccat-'+catId) && document.getElementById('ccat-'+catId).classList.contains('expanded');",
+    "  renderUnifiedCatalogList();",
+    "  if (wasExp) { setTimeout(function(){ var el=document.getElementById('ccat-'+catId); if(el) el.classList.add('expanded'); },20); }",
+    "}",
     "function addBestOfCatalog() {",
     "  if (!window._bestofPickSelection || !window._bestofPickSelection.size) return;",
     "  var listIds=Array.from(window._bestofPickSelection);",
@@ -2513,7 +2667,8 @@ function configurePage(existingConfig) {
     "    var labels=listIds.map(function(id){ var l=state.customSeasons.find(function(x){return x.listId===id;}); return l?l.label||'Best Of':''; }).filter(Boolean);",
     "    name=labels.slice(0,2).join(' + ')+(labels.length>2?' + more':'');",
     "  }",
-    "  var newCat={id:'bestofcat.'+Date.now(),name:name,type:'series',path:'_bestof_',bestofListIds:listIds,enabled:true};",
+    "  var sources=listIds.map(function(id){return{kind:'bestof',listId:id};});",
+    "  var newCat={id:'bestofcat.'+Date.now(),name:name,type:'series',path:'_mixed_',sources:sources,enabled:true};",
     "  state.customCatalogs.push(newCat);",
     "  initUnifiedOrder(); state.unifiedOrder.push({kind:'custom',id:newCat.id});",
     "  window._bestofPickSelection=new Set();",
