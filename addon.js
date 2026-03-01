@@ -182,10 +182,18 @@ async function tmdb(path, apiKey, params = {}) {
 function extractId(id) { return id.replace(/^tmdb:/, ''); }
 
 async function getMovie(tmdbId, apiKey) {
-  return tmdb('/movie/' + tmdbId, apiKey, { append_to_response: 'external_ids,release_dates,credits,videos' });
+  return tmdb('/movie/' + tmdbId, apiKey, { append_to_response: 'external_ids,release_dates,credits,videos,images', include_image_language: 'en,null' });
 }
 async function getSeries(tmdbId, apiKey) {
-  return tmdb('/tv/' + tmdbId, apiKey, { append_to_response: 'external_ids,content_ratings,credits' });
+  return tmdb('/tv/' + tmdbId, apiKey, { append_to_response: 'external_ids,content_ratings,credits,images', include_image_language: 'en,null' });
+}
+
+// Pick the best logo from a TMDB images response
+function getBestLogo(images) {
+  const logos = (images && images.logos || [])
+    .filter(l => l.file_path && (!l.iso_639_1 || l.iso_639_1 === 'en'))
+    .sort((a, b) => (b.vote_average || 0) - (a.vote_average || 0));
+  return logos[0] ? 'https://image.tmdb.org/t/p/w500' + logos[0].file_path : null;
 }
 async function getSeason(tmdbId, seasonNum, apiKey) {
   return tmdb('/tv/' + tmdbId + '/season/' + seasonNum, apiKey);
@@ -1549,19 +1557,41 @@ app.get('/api/series-logo', async function(req, res) {
 // ─── META ENDPOINTS ───────────────────────────────────────────────────────────
 async function metaMovieHandler(req, res) {
   const cfg = req.resolvedCfg || parseConfig(req.params.config);
-  const id  = req.params.id;
+  let id  = req.params.id;
   if (!cfg.tmdbApiKey) return res.status(400).json({ err: 'No API key' });
-  if (!id.startsWith('tmdb:')) return res.json({ meta: null });
+
+  let tmdbId = null;
+
+  if (id.startsWith('tmdb:')) {
+    tmdbId = extractId(id);
+  } else if (id.startsWith('tt')) {
+    // IMDB ID — resolve to TMDB
+    try {
+      const found = await tmdb('/find/' + id, cfg.tmdbApiKey, { external_source: 'imdb_id' });
+      const mv = (found.movie_results || [])[0];
+      if (!mv) return res.json({ meta: null });
+      tmdbId = String(mv.id);
+      id = 'tmdb:' + tmdbId;
+    } catch (e) {
+      console.error('[movie meta tt lookup]', e.message);
+      return res.json({ meta: null });
+    }
+  } else {
+    return res.json({ meta: null });
+  }
+
   try {
-    const movie      = await getMovie(extractId(id), cfg.tmdbApiKey);
+    const movie      = await getMovie(tmdbId, cfg.tmdbApiKey);
     const cert       = getMovieCert(movie);
     const director   = (movie.credits && movie.credits.crew || []).find(c => c.job === 'Director');
     const cast       = (movie.credits && movie.credits.cast || []).slice(0, 8).map(c => c.name);
     const trailerKey = (movie.videos && movie.videos.results || []).find(v => v.type === 'Trailer' && v.site === 'YouTube');
+    const logo       = getBestLogo(movie.images);
     res.json({ meta: {
       id, type: 'movie', name: movie.title,
       poster: movie.poster_path ? TMDB_IMG_MD + movie.poster_path : null,
       background: movie.backdrop_path ? TMDB_IMG_LG + movie.backdrop_path : null,
+      logo: logo || undefined,
       description: movie.overview,
       releaseInfo: movie.release_date ? movie.release_date.substring(0, 4) : '',
       runtime: movie.runtime ? movie.runtime + ' min' : null,
@@ -1594,6 +1624,7 @@ async function metaSeriesHandler(req, res) {
       const cert    = getSeriesCert(series);
       const cast    = (series.credits && series.credits.cast || []).slice(0, 8).map(c => c.name);
       const imdbId  = series.external_ids && series.external_ids.imdb_id;
+      const logo    = getBestLogo(series.images);
       const allEps  = await getAllEpisodes(list.tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
       const bestOfEps = [];
       for (const ref of list.episodes) {
@@ -1622,6 +1653,7 @@ async function metaSeriesHandler(req, res) {
         name:        prefix + label + (series.name ? ' ' + series.name : ''),
         poster:      posterUrl,
         background:  series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+        logo:        logo || undefined,
         description: bestOfEps.length + ' episodes \u2014 ' + label + '\n\n' + (series.overview || ''),
         releaseInfo, videos,
         runtime:       series.episode_run_time && series.episode_run_time[0] ? series.episode_run_time[0] + ' min' : null,
@@ -1637,7 +1669,22 @@ async function metaSeriesHandler(req, res) {
     }
   }
 
-  if (!id.startsWith('tmdb:')) return res.json({ meta: null });
+  if (!id.startsWith('tmdb:')) {
+    if (id.startsWith('tt')) {
+      // IMDB ID — resolve to TMDB
+      try {
+        const found = await tmdb('/find/' + id, cfg.tmdbApiKey, { external_source: 'imdb_id' });
+        const tv = (found.tv_results || [])[0];
+        if (!tv) return res.json({ meta: null });
+        id = 'tmdb:' + tv.id;
+      } catch (e) {
+        console.error('[series meta tt lookup]', e.message);
+        return res.json({ meta: null });
+      }
+    } else {
+      return res.json({ meta: null });
+    }
+  }
   const tmdbId = extractId(id);
   const topN   = parseInt(cfg.topN) || 20;
   try {
@@ -1698,10 +1745,12 @@ async function metaSeriesHandler(req, res) {
     const startYear   = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
     const endYear     = series.last_air_date   ? series.last_air_date.substring(0, 4)  : '';
     const releaseInfo = series.status === 'Ended' && endYear ? startYear + '-' + endYear : startYear;
+    const logo        = getBestLogo(series.images);
     res.json({ meta: {
       id, type: 'series', name: series.name,
       poster:        series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
       background:    series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+      logo:          logo || undefined,
       description:   series.overview, releaseInfo, videos,
       runtime:       series.episode_run_time && series.episode_run_time[0] ? series.episode_run_time[0] + ' min' : null,
       genres:        (series.genres || []).map(g => g.name),
