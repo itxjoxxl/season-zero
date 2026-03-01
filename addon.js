@@ -153,11 +153,6 @@ const DEFAULT_CATALOGS = [
   { id: 'tmdb.on_the_air',        type: 'series', name: 'On The Air',         path: '/tv/on_the_air',       enabled: false },
 ];
 
-function parseConfig(str) {
-  if (!str) return {};
-  const resolved = resolveConfig(str);
-  return resolved ? resolved.cfg : {};
-}
 
 async function tmdb(path, apiKey, params = {}) {
   const url = new URL(TMDB_BASE + path);
