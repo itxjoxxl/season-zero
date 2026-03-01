@@ -1,6 +1,121 @@
 const express = require('express');
 const axios = require('axios');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const zlib = require('zlib');
+
+// ─── CONFIG STORE ─────────────────────────────────────────────────────────────
+// API keys are NEVER stored server-side. The key travels in the URL only,
+// as a compressed base64 segment that only the user's browser ever handles.
+//
+// URL format (short):   /s/{configId}/{keyToken}/manifest.json
+//   configId  = 8-char hash ID → stored in Upstash (preferred) or filesystem
+//   keyToken  = compressed base64 of {tmdbApiKey, topN, showAutoSeason}
+//
+// Legacy inline format: /{fullBase64Config}/manifest.json  (backwards compat)
+//
+// Storage priority: Upstash Redis (persistent across deploys) → filesystem (dev)
+
+// ── Upstash REST helper ────────────────────────────────────────────────────────
+const UPSTASH_URL   = process.env.UPSTASH_REDIS_URL   || null;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_TOKEN || null;
+
+async function upstashSet(key, value) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  try {
+    await axios.post(UPSTASH_URL + '/set/' + encodeURIComponent(key),
+      JSON.stringify(value),
+      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' }, timeout: 5000 }
+    );
+    return true;
+  } catch(e) { console.warn('[GoodTaste] Upstash set failed:', e.message); return false; }
+}
+
+async function upstashGet(key) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+  try {
+    const r = await axios.get(UPSTASH_URL + '/get/' + encodeURIComponent(key),
+      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN }, timeout: 5000 }
+    );
+    if (r.data && r.data.result != null) return JSON.parse(r.data.result);
+    return null;
+  } catch(e) { console.warn('[GoodTaste] Upstash get failed:', e.message); return null; }
+}
+
+// ── Filesystem fallback ────────────────────────────────────────────────────────
+const CONFIGS_DIR = path.join(__dirname, 'configs');
+try { if (!fs.existsSync(CONFIGS_DIR)) fs.mkdirSync(CONFIGS_DIR, { recursive: true }); }
+catch(e) { console.warn('[GoodTaste] Could not create configs dir:', e.message); }
+
+function fsWriteConfig(id, obj) {
+  try { fs.writeFileSync(path.join(CONFIGS_DIR, id + '.json'), JSON.stringify(obj), 'utf8'); return true; }
+  catch(e) { return false; }
+}
+function fsReadConfig(id) {
+  try { return JSON.parse(fs.readFileSync(path.join(CONFIGS_DIR, id + '.json'), 'utf8')); }
+  catch(e) { return null; }
+}
+
+// ── Save / load (Upstash preferred, fs fallback) ───────────────────────────────
+// cfgObj must NOT contain tmdbApiKey — callers strip it before calling here.
+async function saveConfig(cfgObj) {
+  const json = JSON.stringify(cfgObj);
+  const id = crypto.createHash('sha256').update(json).digest('base64url').slice(0, 8);
+  const saved = await upstashSet('gt:cfg:' + id, json);
+  if (!saved) fsWriteConfig(id, cfgObj);   // filesystem fallback
+  return id;
+}
+
+async function loadConfig(id) {
+  if (!/^[A-Za-z0-9_-]{6,12}$/.test(id)) return null;
+  const fromUpstash = await upstashGet('gt:cfg:' + id);
+  if (fromUpstash) return fromUpstash;
+  return fsReadConfig(id);   // filesystem fallback
+}
+
+// ── Compression helpers (server-side, for legacy inline tokens) ────────────────
+function deflateB64(str) {
+  return new Promise((resolve, reject) => {
+    zlib.deflateRaw(Buffer.from(str, 'utf8'), (err, buf) => {
+      if (err) reject(err);
+      else resolve(buf.toString('base64url'));
+    });
+  });
+}
+function inflateB64(token) {
+  try {
+    // Try deflate-compressed base64url first
+    const buf = Buffer.from(token, 'base64url');
+    return JSON.parse(zlib.inflateRawSync(buf).toString('utf8'));
+  } catch(e) {
+    // Fall back to plain base64 (legacy)
+    try { return JSON.parse(Buffer.from(token, 'base64').toString('utf8')); }
+    catch(e2) { return null; }
+  }
+}
+
+// ── parseConfig: handles all token formats ─────────────────────────────────────
+// For short-URL requests, key is injected separately — see mergeKey() below.
+function parseConfig(token) {
+  if (!token) return {};
+  // Plain base64 / compressed base64 inline config (legacy)
+  const obj = inflateB64(token);
+  return obj || {};
+}
+
+// Merge a keyToken (compressed base64 of {tmdbApiKey, topN, showAutoSeason})
+// back into a config object loaded from the store.
+function decodeKeyToken(keyToken) {
+  if (!keyToken) return {};
+  try {
+    const buf = Buffer.from(keyToken, 'base64url');
+    return JSON.parse(zlib.inflateRawSync(buf).toString('utf8'));
+  } catch(e) {
+    try { return JSON.parse(Buffer.from(keyToken, 'base64').toString('utf8')); }
+    catch(e2) { return {}; }
+  }
+}
 
 // Load boost presets from separate file (edit boosts.js to add/change boosts)
 let BOOST_PRESETS = [];
@@ -39,8 +154,9 @@ const DEFAULT_CATALOGS = [
 ];
 
 function parseConfig(str) {
-  try { return JSON.parse(Buffer.from(str, 'base64').toString('utf8')); }
-  catch { return {}; }
+  if (!str) return {};
+  const resolved = resolveConfig(str);
+  return resolved ? resolved.cfg : {};
 }
 
 async function tmdb(path, apiKey, params = {}) {
@@ -310,8 +426,7 @@ app.get('/',          (req, res) => res.redirect('/configure'));
 // FIX: Support /:config/configure for editing an existing install
 app.get('/configure', (req, res) => res.send(configurePage(null)));
 app.get('/:config/configure', (req, res) => res.send(configurePage(req.params.config)));
-// Shared configurations (API key stripped, show name/desc at top)
-app.get('/shared/:config/configure', (req, res) => res.send(configurePage(req.params.config, true)));
+
 
 // ─── BEST OF CATALOG ─────────────────────────────────────────────────────────
 app.get('/:config/catalog/series/tmdb.bestof.json', async function(req, res) {
@@ -813,6 +928,75 @@ app.get('/api/share-encode', function(req, res) {
     const encoded = Buffer.from(JSON.stringify(shareable)).toString('base64');
     res.json({ encoded });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── SAVE CONFIG ─────────────────────────────────────────────────────────────
+// Body must NOT contain tmdbApiKey — the client strips it before posting.
+// Returns { id } — a short 8-char hash ID.
+app.post('/api/save-config', express.json(), async function(req, res) {
+  const body = req.body;
+  if (!body || typeof body !== 'object') return res.status(400).json({ error: 'invalid config' });
+  // Double-check: refuse to store any API key
+  const safe = Object.assign({}, body);
+  delete safe.tmdbApiKey;
+  try {
+    const id = await saveConfig(safe);
+    res.json({ id });
+  } catch(e) {
+    console.error('[GoodTaste] save-config error:', e.message);
+    res.status(500).json({ error: 'Failed to save config' });
+  }
+});
+
+// ─── SHORT URL ROUTES (/s/:id/:keyToken/...) ─────────────────────────────────
+// :keyToken is a compressed base64 of {tmdbApiKey, topN, showAutoSeason}
+// It is provided by the client and never stored server-side.
+
+async function resolveShortRequest(id, keyToken) {
+  const stored = await loadConfig(id);
+  if (!stored) return null;
+  const keyData = decodeKeyToken(keyToken || '');
+  // Merge key back into config for this request only — never persisted
+  return Object.assign({}, stored, keyData);
+}
+
+app.get('/s/:id/:keyToken/manifest.json', async function(req, res) {
+  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
+  if (!cfg) return res.status(404).json({ error: 'Config not found' });
+  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
+  res.json(buildManifest(b64));
+});
+
+app.get('/s/:id/:keyToken/configure', async function(req, res) {
+  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
+  if (!cfg) return res.redirect('/configure');
+  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
+  res.send(configurePage(b64));
+});
+
+app.get('/s/:id/:keyToken/catalog/:type/:catid/:extras?.json', async function(req, res) {
+  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
+  if (!cfg) return res.json({ metas: [] });
+  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
+  const extras = req.params.extras ? '/' + req.params.extras : '';
+  return res.redirect('/' + b64 + '/catalog/' + req.params.type + '/' + req.params.catid + extras + '.json');
+});
+
+app.get('/s/:id/:keyToken/meta/:type/:metaid.json', async function(req, res) {
+  const cfg = await resolveShortRequest(req.params.id, req.params.keyToken);
+  if (!cfg) return res.json({ meta: null });
+  const b64 = Buffer.from(JSON.stringify(cfg)).toString('base64');
+  return res.redirect('/' + b64 + '/meta/' + req.params.type + '/' + req.params.metaid + '.json');
+});
+
+// ─── SHARED CONFIG (key-free, for sharing) ───────────────────────────────────
+app.get('/shared/:id/configure', async function(req, res) {
+  // Support both old base64 shared links and new short IDs
+  const id = req.params.id;
+  let cfg = await loadConfig(id);   // short ID path
+  if (cfg) return res.send(configurePage(Buffer.from(JSON.stringify(cfg)).toString('base64'), true));
+  // Legacy base64
+  return res.send(configurePage(id, true));
 });
 
 // Static backdrops removed — hero uses only colored placeholders until TMDB API posters load
@@ -2449,7 +2633,7 @@ function configurePage(existingConfig, isShared) {
     "      var sub='';",
     "      if (c.path==='_mdblist_') sub='MDBList &middot; '+c.type;",
     "      else if (c.path==='_imdblist_') sub='IMDB &middot; '+c.type;",
-    "      else if (c.path==='_custom_items_') sub='Custom Items &middot; '+c.type+' &middot; '+(c.items&&c.items.length||0)+' item'+((!c.items||c.items.length!==1)?'s':'');",
+    "      else if (c.path==='_custom_items_') { var _ic=(c.items&&c.items.length||0); var _bc=(c.bestofListIds&&c.bestofListIds.length||0); var _tc=_ic+_bc; sub='Custom Items &middot; '+c.type+' &middot; '+_tc+' item'+(_tc!==1?'s':'')+(_bc>0?' ('+_bc+' list'+(_bc!==1?'s':'')+')':''); }",
     "      else { var sl=(c.params&&sortLabels[c.params.sort_by])||'Popular'; sub='TMDB Discover &middot; '+c.type+' &middot; '+sl; }",
     "      var isItems = c.path==='_custom_items_';",
     "      var isBoost = !!c._boostId;",
@@ -3492,30 +3676,64 @@ function configurePage(existingConfig, isShared) {
     "",
     "function toggleSzeroExpand() { var card = document.getElementById('szero-card'); if (card) card.classList.toggle('expanded'); }",
     "",
-    "function buildInstallPage() {",
+    "// ── Client-side compression ──────────────────────────────────────────────",
+    "async function compressToBase64url(str) {",
+    "  try {",
+    "    var bytes = new TextEncoder().encode(str);",
+    "    var cs = new CompressionStream('deflate-raw');",
+    "    var writer = cs.writable.getWriter();",
+    "    var reader = cs.readable.getReader();",
+    "    writer.write(bytes); writer.close();",
+    "    var chunks = []; var done = false;",
+    "    while (!done) { var chunk = await reader.read(); if (chunk.done) done=true; else chunks.push(chunk.value); }",
+    "    var total = chunks.reduce(function(a,c){return a+c.length;},0);",
+    "    var merged = new Uint8Array(total); var offset=0;",
+    "    chunks.forEach(function(c){ merged.set(c,offset); offset+=c.length; });",
+    "    var binary = Array.from(merged).map(function(b){return String.fromCharCode(b);}).join('');",
+    "    return btoa(binary).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');",
+    "  } catch(e) {",
+    "    return btoa(unescape(encodeURIComponent(str))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');",
+    "  }",
+    "}",
+    "",
+    "function buildConfigFlat(includeKey) {",
     "  var flat=state.customSeasons.map(function(list){",
-    "    // Store posterSpec (mode + settings) instead of base64 data URL to keep config URL small.",
-    "    // The server will generate the poster on-demand and Stremio will cache it by URL.",
-    "    var posterSpec=null;",
-    "    var mode=list.posterMode||'default';",
-    "    if(mode==='banner'){",
-    "      posterSpec={mode:'banner',pos:list.bannerPos||'bottom',barColor:list.bannerColor||'#000000',opacity:list.bannerOpacity!=null?list.bannerOpacity:0.75,textColor:list.bannerTextColor||'#ffffff'};",
-    "    } else if(mode==='logo'){",
-    "      posterSpec={mode:'logo',bgColor:list.logoBgColor||'#111111',textColor:list.logoTextColor||'#ffffff'};",
-    "    } else if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){",
-    "      posterSpec={mode:'url',url:list.posterUrl};",
-    "    }",
+    "    var posterSpec=null; var mode=list.posterMode||'default';",
+    "    if(mode==='banner'){ posterSpec={mode:'banner',pos:list.bannerPos||'bottom',barColor:list.bannerColor||'#000000',opacity:list.bannerOpacity!=null?list.bannerOpacity:0.75,textColor:list.bannerTextColor||'#ffffff'}; }",
+    "    else if(mode==='logo'){ posterSpec={mode:'logo',bgColor:list.logoBgColor||'#111111',textColor:list.logoTextColor||'#ffffff'}; }",
+    "    else if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){ posterSpec={mode:'url',url:list.posterUrl}; }",
     "    return { listId:list.listId, tmdbId:list.tmdbId, tmdbName:list.tmdbName||'', label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
     "  });",
+    "  var cfg={topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
+    "  if(includeKey) cfg.tmdbApiKey=state.apiKey;",
+    "  return cfg;",
+    "}",
+    "",
+    "function buildInstallPage() {",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
-    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
-    "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
-    "  var manifestUrl=window.location.origin+'/'+encoded+'/manifest.json';",
-    "  // Also expose the edit URL",
-    "  var editUrl=window.location.origin+'/'+encoded+'/configure';",
-    "  document.getElementById('manifest-url').value=manifestUrl;",
-    "  document.getElementById('edit-url').value=editUrl;",
+    "  var manifestUrlEl=document.getElementById('manifest-url');",
+    "  var editUrlEl=document.getElementById('edit-url');",
+    "  // Immediate fallback: uncompressed inline base64 (with key, legacy format)",
+    "  var cfgFull=buildConfigFlat(true);",
+    "  var b64=btoa(unescape(encodeURIComponent(JSON.stringify(cfgFull))));",
+    "  manifestUrlEl.value=window.location.origin+'/'+b64+'/manifest.json';",
+    "  editUrlEl.value=window.location.origin+'/'+b64+'/configure';",
+    "  // Async: save key-stripped config, encode key separately, build short URL",
+    "  (async function(){",
+    "    try {",
+    "      var cfgNoKey=buildConfigFlat(false);",
+    "      // Key token: compressed base64url of just the key data — never sent to server",
+    "      var keyData={tmdbApiKey:state.apiKey,topN:state.topN,showAutoSeason:state.showAutoSeason};",
+    "      var keyToken=await compressToBase64url(JSON.stringify(keyData));",
+    "      var r=await fetch('/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfgNoKey)});",
+    "      var d=await r.json();",
+    "      if(d.id){",
+    "        manifestUrlEl.value=window.location.origin+'/s/'+d.id+'/'+keyToken+'/manifest.json';",
+    "        editUrlEl.value=window.location.origin+'/s/'+d.id+'/'+keyToken+'/configure';",
+    "      }",
+    "    } catch(e){}",
+    "  })();",
     "  var listCount=state.customSeasons.length;",
     "  var showCount=new Set(state.customSeasons.map(function(l){ return l.tmdbId; })).size;",
     "  var enabledDefaultCount=DEFAULT_CATALOGS.filter(function(d){ var ov=state.catalogEnabled[d.id]; return ov!==undefined?ov:d.enabled; }).length;",
@@ -3678,21 +3896,17 @@ function configurePage(existingConfig, isShared) {
     "  var desc=document.getElementById('share-desc-input');",
     "  var titleVal=title?title.value.trim():'';",
     "  var descVal=desc?desc.value.trim():'';",
-    "  // Build current config",
-    "  var flat=state.customSeasons.map(function(list){",
-    "    var posterSpec=null;",
-    "    var mode=list.posterMode||'default';",
-    "    if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){ posterSpec={mode:'url',url:list.posterUrl}; }",
-    "    return { listId:list.listId, tmdbId:list.tmdbId, tmdbName:list.tmdbName||'', label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
-    "  });",
-    "  var cfg={tmdbApiKey:state.apiKey, topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
-    "  var encoded=btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));",
-    "  var r=await fetch('/api/share-encode?config='+encodeURIComponent(encoded)+'&shareTitle='+encodeURIComponent(titleVal)+'&shareDesc='+encodeURIComponent(descVal));",
-    "  var d=await r.json();",
-    "  if(!d.encoded){showToast('Share failed');return;}",
-    "  var shareUrl=window.location.origin+'/shared/'+d.encoded+'/configure';",
-    "  var out=document.getElementById('share-url-out'); if(out){out.value=shareUrl;out.style.display='block';}",
-    "  var btn=document.getElementById('share-copy-btn'); if(btn){btn.style.display='inline-flex';}",
+    "  // Share config has no API key — recipient adds their own",
+    "  var shareCfg=buildConfigFlat(false);",
+    "  shareCfg._shareTitle=titleVal; shareCfg._shareDesc=descVal;",
+    "  try {",
+    "    var r=await fetch('/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(shareCfg)});",
+    "    var d=await r.json();",
+    "    if(!d.id){showToast('Share failed');return;}",
+    "    var shareUrl=window.location.origin+'/shared/'+d.id+'/configure';",
+    "    var out=document.getElementById('share-url-out'); if(out){out.value=shareUrl;out.style.display='block';}",
+    "    var btn=document.getElementById('share-copy-btn'); if(btn){btn.style.display='inline-flex';}",
+    "  } catch(e){showToast('Share failed');}",
     "}",
     "function copyShareUrl(){",
     "  var out=document.getElementById('share-url-out'); if(!out) return;",
@@ -4062,4 +4276,10 @@ try {
 app.listen(PORT, function() {
   console.log('GoodTaste addon running on port ' + PORT);
   console.log('Configure: http://localhost:' + PORT + '/configure');
+  if (UPSTASH_URL && UPSTASH_TOKEN) {
+    console.log('[GoodTaste] Upstash Redis configured — configs will persist across restarts.');
+  } else {
+    console.log('[GoodTaste] No Upstash credentials found — configs stored in: ' + CONFIGS_DIR);
+    console.log('[GoodTaste] Set UPSTASH_REDIS_URL + UPSTASH_REDIS_TOKEN env vars for persistent short URLs.');
+  }
 });
