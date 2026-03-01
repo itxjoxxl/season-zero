@@ -182,7 +182,11 @@ function buildManifest(config) {
     for (const entry of cfg.defaultCatalogOrder) {
       const kind = entry.kind || 'default';
       const id   = entry.id || entry;
-      if (kind === 'default' && defaultMap.has(id) && !seen.has('d:'+id)) {
+      if (kind === 'bestof' && id === 'tmdb.bestof' && customSeasons.length > 0 && !seen.has('bestof:tmdb.bestof')) {
+        const bestofName = (cfg.catalogNames && cfg.catalogNames['tmdb.bestof']) ? cfg.catalogNames['tmdb.bestof'] : '\u2728 Curated Lists';
+        allCatalogs.push({ id: 'tmdb.bestof', type: 'series', name: bestofName, extra: [] });
+        seen.add('bestof:tmdb.bestof');
+      } else if (kind === 'default' && defaultMap.has(id) && !seen.has('d:'+id)) {
         const d = defaultMap.get(id);
         const rawName = cfg.catalogNames && cfg.catalogNames[id] ? cfg.catalogNames[id] : d.name;
         const displayName = rawName.replace(/\s+(movies?|series|shows?)$/i, '').trim() || rawName;
@@ -193,12 +197,16 @@ function buildManifest(config) {
         // FIX: strip suffix from custom catalog names in manifest
         const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
         // FIX: for _custom_items_ catalogs with mixed types, register for both movie and series
-        if (c.path === '_custom_items_' && c.items && c.items.length) {
-          const hasMovies = c.items.some(i => i.itemType === 'movie');
-          const hasSeries = c.items.some(i => i.itemType === 'series');
+        if (c.path === '_custom_items_' && (c.items || c.bestofListIds)) {
+          const items = c.items || [];
+          const hasBestof = c.bestofListIds && c.bestofListIds.length > 0;
+          const hasMovies = items.some(i => i.itemType === 'movie');
+          const hasSeries = items.some(i => i.itemType === 'series') || hasBestof;
           if (hasMovies && hasSeries) {
             allCatalogs.push({ id: c.id, type: 'movie',  name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
             allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+          } else if (hasSeries) {
+            allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
           } else {
             allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
           }
@@ -218,12 +226,16 @@ function buildManifest(config) {
     customCatalogs.forEach(c => {
       if (!seen.has('c:'+c.id)) {
         const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
-        if (c.path === '_custom_items_' && c.items && c.items.length) {
-          const hasMovies = c.items.some(i => i.itemType === 'movie');
-          const hasSeries = c.items.some(i => i.itemType === 'series');
+        if (c.path === '_custom_items_' && (c.items || c.bestofListIds)) {
+          const items = c.items || [];
+          const hasBestof = c.bestofListIds && c.bestofListIds.length > 0;
+          const hasMovies = items.some(i => i.itemType === 'movie');
+          const hasSeries = items.some(i => i.itemType === 'series') || hasBestof;
           if (hasMovies && hasSeries) {
             allCatalogs.push({ id: c.id, type: 'movie',  name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
             allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+          } else if (hasSeries) {
+            allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
           } else {
             allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
           }
@@ -240,12 +252,16 @@ function buildManifest(config) {
     });
     customCatalogs.forEach(c => {
       const cleanName = (c.name || 'Custom').replace(/\s+(movies?|series|shows?)$/i, '').trim() || c.name;
-      if (c.path === '_custom_items_' && c.items && c.items.length) {
-        const hasMovies = c.items.some(i => i.itemType === 'movie');
-        const hasSeries = c.items.some(i => i.itemType === 'series');
+      if (c.path === '_custom_items_' && (c.items || c.bestofListIds)) {
+        const items = c.items || [];
+        const hasBestof = c.bestofListIds && c.bestofListIds.length > 0;
+        const hasMovies = items.some(i => i.itemType === 'movie');
+        const hasSeries = items.some(i => i.itemType === 'series') || hasBestof;
         if (hasMovies && hasSeries) {
           allCatalogs.push({ id: c.id, type: 'movie',  name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
           allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'skip', isRequired: false }] });
+        } else if (hasSeries) {
+          allCatalogs.push({ id: c.id, type: 'series', name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
         } else {
           allCatalogs.push({ id: c.id, type: c.type, name: cleanName, extra: [{ name: 'genre', isRequired: false }, { name: 'skip', isRequired: false }] });
         }
@@ -261,7 +277,12 @@ function buildManifest(config) {
   );
 
   if (customSeasons.length > 0) {
-    allCatalogs.push({ id: 'tmdb.bestof', type: 'series', name: '\u2728 Curated Lists', extra: [] });
+    // Only add if not already placed via defaultCatalogOrder loop
+    const alreadyAdded = allCatalogs.some(c => c.id === 'tmdb.bestof');
+    if (!alreadyAdded) {
+      const bestofName = (cfg.catalogNames && cfg.catalogNames['tmdb.bestof']) ? cfg.catalogNames['tmdb.bestof'] : '\u2728 Curated Lists';
+      allCatalogs.push({ id: 'tmdb.bestof', type: 'series', name: bestofName, extra: [] });
+    }
   }
 
   return {
@@ -509,6 +530,38 @@ app.get('/:config/catalog/:type/:id/:extras?.json', async function(req, res) {
             if (m.poster) metas.push(m);
           }
         } catch(e) { /* skip */ }
+      }
+      // Also resolve bestofListIds as series entries (they are always series type)
+      if (type === 'series' && catDef.bestofListIds && catDef.bestofListIds.length) {
+        const customSeasons = cfg.customSeasons || [];
+        for (const bestofListId of catDef.bestofListIds) {
+          const list = customSeasons.find(l => l.listId === bestofListId);
+          if (!list || !list.episodes || !list.episodes.length) continue;
+          try {
+            const series = await getSeries(list.tmdbId, apiKey);
+            const spec = list.posterSpec;
+            let posterUrl;
+            if (spec && spec.mode && spec.mode !== 'default') {
+              if (spec.mode === 'url' && spec.url) posterUrl = spec.url;
+              else posterUrl = req.protocol + '://' + req.get('host') + '/' + req.params.config + '/poster/' + list.listId + '.jpg';
+            } else {
+              posterUrl = series.poster_path ? TMDB_IMG_MD + series.poster_path : null;
+            }
+            const prefix = list.prefix ? list.prefix + ' ' : '';
+            const label = list.label || 'Curated';
+            const name = prefix + label + (list.tmdbName ? ' \u2014 ' + series.name : '');
+            metas.push({
+              id: 'bestof:' + bestofListId, type: 'series',
+              name,
+              poster: posterUrl,
+              background: series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
+              description: label + ': ' + list.episodes.length + ' episodes from ' + series.name,
+              releaseInfo: series.first_air_date ? series.first_air_date.substring(0, 4) : '',
+              imdbRating: series.vote_average ? series.vote_average.toFixed(1) : null,
+              genres: (series.genres || []).map(g => g.name),
+            });
+          } catch(e) { /* skip */ }
+        }
       }
       return res.json({ metas });
     }
@@ -2339,6 +2392,14 @@ function configurePage(existingConfig, isShared) {
     "function renderUnifiedCatalogList() {",
     "  syncListCatalogs();",
     "  initUnifiedOrder();",
+    "  // Ensure the bestof sentinel entry is present when there are curated lists",
+    "  if (state.customSeasons.length > 0) {",
+    "    if (!state.unifiedOrder.find(function(o){ return o.kind==='bestof'&&o.id==='tmdb.bestof'; })) {",
+    "      state.unifiedOrder.unshift({kind:'bestof',id:'tmdb.bestof'});",
+    "    }",
+    "  } else {",
+    "    state.unifiedOrder = state.unifiedOrder.filter(function(o){ return !(o.kind==='bestof'&&o.id==='tmdb.bestof'); });",
+    "  }",
     "  DEFAULT_CATALOGS.forEach(function(c) {",
     "    if (!state.unifiedOrder.find(function(o){ return o.kind==='default'&&o.id===c.id; })) {",
     "      state.unifiedOrder.push({kind:'default',id:c.id});",
@@ -2350,6 +2411,7 @@ function configurePage(existingConfig, isShared) {
     "    }",
     "  });",
     "  state.unifiedOrder = state.unifiedOrder.filter(function(o) {",
+    "    if (o.kind==='bestof') return state.customSeasons.length > 0;",
     "    if (o.kind==='default') return !!DEFAULT_CATALOGS.find(function(c){ return c.id===o.id; });",
     "    return !!state.customCatalogs.find(function(c){ return c.id===o.id; });",
     "  });",
@@ -2357,7 +2419,17 @@ function configurePage(existingConfig, isShared) {
     "  if (!el) return;",
     "  var sortLabels={'popularity.desc':'Popular','vote_average.desc':'Top Rated','release_date.desc':'Newest','revenue.desc':'Revenue'};",
     "  el.innerHTML = state.unifiedOrder.map(function(entry, idx) {",
-    "    if (entry.kind==='default') {",
+    "    if (entry.kind==='bestof') {",
+    "      var displayName = state.catalogNames['tmdb.bestof'] || '\\u2728 Curated Lists';",
+    "      return '<div class=\"catalog-row\" data-uidx=\"'+idx+'\" data-uid=\"bestof:tmdb.bestof\" draggable=\"true\">'",
+    "        + '<span class=\"catalog-drag-handle\">&#8801;</span>'",
+    "        + '<div class=\"catalog-row-info\">'",
+    "          + '<input class=\"catalog-row-name-input\" type=\"text\" value=\"'+esc(displayName)+'\" placeholder=\"\\u2728 Curated Lists\" oninput=\"setCatalogName(\\'tmdb.bestof\\',this.value)\" title=\"Tap to rename\"/>'",
+    "          + '<div class=\"catalog-row-type\">Curated Lists &mdash; '+state.customSeasons.length+' list'+(state.customSeasons.length!==1?'s':'')+'</div>'",
+    "        + '</div>'",
+    "        + '<span style=\"font-size:0.7rem;color:var(--text-mute);padding:0 6px;flex-shrink:0\" title=\"Auto-generated from your curated lists\">auto</span>'",
+    "        + '</div>';",
+    "    } else if (entry.kind==='default') {",
     "      var c = DEFAULT_CATALOGS.find(function(x){ return x.id===entry.id; });",
     "      if (!c) return '';",
     "      var checked = state.catalogEnabled[c.id]!==undefined ? state.catalogEnabled[c.id] : c.enabled;",
@@ -2402,6 +2474,20 @@ function configurePage(existingConfig, isShared) {
     "                + '</li>';",
     "            }).join('') + '</ul>'",
     "          : '<p style=\"font-size:0.8rem;color:var(--text-mute);margin:4px 0 8px\">No items. Search below to add.</p>';",
+    "        // Also show curated lists picker for combined catalogs",
+    "        var hasBestofLists = state.customSeasons.length > 0;",
+    "        var bestofListIds = c.bestofListIds || [];",
+    "        var bestofSection = '';",
+    "        if (hasBestofLists) {",
+    "          bestofSection += '<div style=\"margin-top:12px;padding-top:10px;border-top:1px solid var(--border)\">'",
+    "            + '<div style=\"font-size:0.72rem;font-weight:600;letter-spacing:0.07em;text-transform:uppercase;color:var(--text-mute);margin-bottom:8px\">Included Curated Lists</div>'",
+    "            + state.customSeasons.map(function(lst) {",
+    "                var isIn = bestofListIds.indexOf(lst.listId) !== -1;",
+    "                var ph = lst.tmdbPoster ? '<img src=\"'+esc(lst.tmdbPoster)+'\" style=\"width:24px;height:36px;object-fit:cover;border-radius:3px;flex-shrink:0\" loading=\"lazy\"/>' : '<div style=\"width:24px;height:36px;background:var(--surface);border-radius:3px;flex-shrink:0\"></div>';",
+    "                return '<div style=\"display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;border:1.5px solid '+(isIn?'var(--gold)':'var(--border)')+';background:'+(isIn?'var(--gold-dim)':'transparent')+';margin-bottom:4px\" onclick=\"toggleBestofListInCat(\\''+c.id+'\\',\\''+lst.listId+'\\')\">'+ph+'<div style=\"flex:1;min-width:0;font-size:0.78rem;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis\">'+esc((lst.label||'Best Of')+' \\u2014 '+lst.tmdbName)+'</div><div style=\"font-size:0.72rem;color:'+(isIn?'var(--gold)':'var(--text-mute)')+'\">'+(isIn?'&#10003;':'+ Add')+'</div></div>';",
+    "              }).join('')",
+    "            + '</div>';",
+    "        }",
     "        html += '<div class=\"custom-catalog-editor\">'",
     "          + '<div style=\"font-size:0.72rem;color:var(--text-dim);margin-bottom:8px;font-weight:600\">Items &mdash; drag to reorder, &times; to remove</div>'",
     "          + itemsHtml",
@@ -2409,6 +2495,7 @@ function configurePage(existingConfig, isShared) {
     "            + '<input type=\"text\" id=\"catitems-search-'+c.id+'\" placeholder=\"Search to add '+c.type+'s...\" oninput=\"debounceCatItemSearch(\\''+c.id+'\\',\\''+c.type+'\\',this.value)\" autocomplete=\"off\" style=\"font-size:0.82rem\"/>'",
     "            + '<div id=\"catitems-results-'+c.id+'\" style=\"margin-top:4px;max-height:200px;overflow-y:auto\"></div>'",
     "          + '</div>'",
+    "          + bestofSection",
     "          + '</div>';",
     "      } else {",
     "        // Edit panel for TMDB-discover, MDBList, IMDB, bestof catalogs",
@@ -3616,7 +3703,7 @@ function configurePage(existingConfig, isShared) {
     "",
     // Init on page load — load existing config first so apiKey is available for hero backgrounds
     "loadExistingConfig();",
-    "if (!EXISTING_CONFIG) loadHeroBackgrounds();",
+    "loadHeroBackgrounds();",
   ].join('\n');
 
   const editModeBanner = isShared && shareTitle
