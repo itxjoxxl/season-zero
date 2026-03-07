@@ -18,8 +18,11 @@ const zlib = require('zlib');
 // Storage priority: Upstash Redis (persistent across deploys) → filesystem (dev)
 
 // ── Upstash REST helper ────────────────────────────────────────────────────────
-const UPSTASH_URL   = process.env.UPSTASH_REDIS_URL   || null;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_TOKEN || null;
+// Upstash REST API requires HTTPS URLs. UPSTASH_REDIS_REST_URL is the correct REST env var name.
+// UPSTASH_REDIS_URL is a redis:// TCP URL and cannot be used with the HTTP REST API.
+// We fall back to the old name so existing Render env vars keep working.
+const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL   || process.env.UPSTASH_REDIS_URL   || null;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_TOKEN || null;
 
 // Upstash REST API: pipeline endpoint sends all commands in one HTTP request
 // which saves bandwidth and reduces command count.
@@ -4861,7 +4864,12 @@ app.listen(PORT, function() {
   console.log('GoodTaste addon running on port ' + PORT);
   console.log('Configure: http://localhost:' + PORT + '/configure');
   if (UPSTASH_URL && UPSTASH_TOKEN) {
-    console.log('[GoodTaste] Upstash Redis configured — configs will persist across restarts.');
+    if (UPSTASH_URL.startsWith('redis://') || UPSTASH_URL.startsWith('rediss://')) {
+      console.error('[GoodTaste] ERROR: UPSTASH_REDIS_REST_URL is a redis:// TCP URL, not an HTTPS REST URL.');
+      console.error('[GoodTaste] Configs will NOT persist. Set UPSTASH_REDIS_REST_URL to the https:// REST URL from your Upstash console.');
+    } else {
+      console.log('[GoodTaste] Upstash Redis configured — configs will persist across restarts.');
+    }
   } else {
     console.log('[GoodTaste] No Upstash credentials found — configs stored in: ' + CONFIGS_DIR);
     console.log('[GoodTaste] Set UPSTASH_REDIS_URL + UPSTASH_REDIS_TOKEN env vars for persistent short URLs.');
