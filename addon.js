@@ -10,107 +10,32 @@ const zlib = require('zlib');
 // as a compressed base64 segment that only the user's browser ever handles.
 //
 // URL format (short):   /s/{configId}/{keyToken}/manifest.json
-//   configId  = 8-char hash ID → stored in Upstash (preferred) or filesystem
+//   configId  = 8-char hash ID → stored on the persistent disk
 //   keyToken  = compressed base64 of {tmdbApiKey, topN, showAutoSeason}
 //
 // Legacy inline format: /{fullBase64Config}/manifest.json  (backwards compat)
 //
-// Storage priority: Upstash Redis (persistent across deploys) → filesystem (dev)
+// On Render: mount a Persistent Disk at CONFIGS_DIR (default: ./configs)
+// and configs survive all deploys automatically.
 
-// ── Upstash REST helper ────────────────────────────────────────────────────────
-// Upstash REST API requires HTTPS URLs. UPSTASH_REDIS_REST_URL is the correct REST env var name.
-// UPSTASH_REDIS_URL is a redis:// TCP URL and cannot be used with the HTTP REST API.
-// We fall back to the old name so existing Render env vars keep working.
-const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL   || process.env.UPSTASH_REDIS_URL   || null;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_TOKEN || null;
-
-// Upstash REST API: pipeline endpoint sends all commands in one HTTP request
-// which saves bandwidth and reduces command count.
-async function upstashPipeline(commands) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
-  try {
-    const r = await axios.post(UPSTASH_URL + '/pipeline',
-      commands,
-      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' }, timeout: 8000 }
-    );
-    return r.data;
-  } catch(e) { console.warn('[GoodTaste] Upstash pipeline failed:', e.message); return null; }
-}
-
-async function upstashSet(key, value) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
-  try {
-    // Upstash REST pipeline: [["SET", "key", "value"]]
-    const serialized = JSON.stringify(value);
-    const result = await upstashPipeline([['SET', key, serialized]]);
-    if (result && Array.isArray(result) && result[0] && result[0].result === 'OK') return true;
-    // Fallback: direct endpoint — body must be JSON array ["value"]
-    const r = await axios.post(
-      `${UPSTASH_URL}/set/${encodeURIComponent(key)}`,
-      [serialized],
-      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' }, timeout: 5000 }
-    );
-    return !!(r.data && r.data.result === 'OK');
-  } catch(e) { console.warn('[GoodTaste] Upstash set failed:', e.message); return false; }
-}
-
-async function upstashGet(key) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
-  try {
-    const result = await upstashPipeline([['GET', key]]);
-    if (result && Array.isArray(result) && result[0] && result[0].result != null) {
-      return JSON.parse(result[0].result);
-    }
-    // Fallback: direct GET endpoint
-    const r = await axios.get(
-      `${UPSTASH_URL}/get/${encodeURIComponent(key)}`,
-      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN }, timeout: 5000 }
-    );
-    if (r.data && r.data.result != null) return JSON.parse(r.data.result);
-    return null;
-  } catch(e) { console.warn('[GoodTaste] Upstash get failed:', e.message); return null; }
-}
-
-// ── Filesystem fallback ────────────────────────────────────────────────────────
-const CONFIGS_DIR = path.join(__dirname, 'configs');
+const CONFIGS_DIR = process.env.CONFIGS_DIR || path.join(__dirname, 'configs');
 try { if (!fs.existsSync(CONFIGS_DIR)) fs.mkdirSync(CONFIGS_DIR, { recursive: true }); }
 catch(e) { console.warn('[GoodTaste] Could not create configs dir:', e.message); }
 
-function fsWriteConfig(id, obj) {
-  try { fs.writeFileSync(path.join(CONFIGS_DIR, id + '.json'), JSON.stringify(obj), 'utf8'); return true; }
-  catch(e) { return false; }
+function saveConfig(cfgObj) {
+  const json = JSON.stringify(cfgObj);
+  const id = crypto.createHash('sha256').update(json).digest('base64url').slice(0, 8);
+  try { fs.writeFileSync(path.join(CONFIGS_DIR, id + '.json'), json, 'utf8'); } catch(e) { console.warn('[GoodTaste] saveConfig failed:', e.message); }
+  return id;
 }
-function fsReadConfig(id) {
+
+function loadConfig(id) {
+  if (!/^[A-Za-z0-9_-]{6,12}$/.test(id)) return null;
   try { return JSON.parse(fs.readFileSync(path.join(CONFIGS_DIR, id + '.json'), 'utf8')); }
   catch(e) { return null; }
 }
 
-// ── Save / load (Upstash preferred, fs fallback) ───────────────────────────────
-// cfgObj must NOT contain tmdbApiKey — callers strip it before calling here.
-async function saveConfig(cfgObj) {
-  const json = JSON.stringify(cfgObj);
-  const id = crypto.createHash('sha256').update(json).digest('base64url').slice(0, 8);
-  const saved = await upstashSet('gt:cfg:' + id, cfgObj);  // pass object; upstashSet handles serialization
-  if (!saved) fsWriteConfig(id, cfgObj);   // filesystem fallback
-  return id;
-}
-
-async function loadConfig(id) {
-  if (!/^[A-Za-z0-9_-]{6,12}$/.test(id)) return null;
-  const fromUpstash = await upstashGet('gt:cfg:' + id);
-  if (fromUpstash) return fromUpstash;
-  return fsReadConfig(id);   // filesystem fallback
-}
-
 // ── Compression helpers (server-side, for legacy inline tokens) ────────────────
-function deflateB64(str) {
-  return new Promise((resolve, reject) => {
-    zlib.deflateRaw(Buffer.from(str, 'utf8'), (err, buf) => {
-      if (err) reject(err);
-      else resolve(buf.toString('base64url'));
-    });
-  });
-}
 function inflateB64(token) {
   try {
     // Try deflate-compressed base64url first
@@ -989,14 +914,13 @@ app.get('/api/share-encode', function(req, res) {
 // ─── SAVE CONFIG ─────────────────────────────────────────────────────────────
 // Body must NOT contain tmdbApiKey — the client strips it before posting.
 // Returns { id } — a short 8-char hash ID.
-app.post('/api/save-config', express.json(), async function(req, res) {
+app.post('/api/save-config', express.json(), function(req, res) {
   const body = req.body;
   if (!body || typeof body !== 'object') return res.status(400).json({ error: 'invalid config' });
-  // Double-check: refuse to store any API key
   const safe = Object.assign({}, body);
   delete safe.tmdbApiKey;
   try {
-    const id = await saveConfig(safe);
+    const id = saveConfig(safe);
     res.json({ id });
   } catch(e) {
     console.error('[GoodTaste] save-config error:', e.message);
@@ -1008,15 +932,15 @@ app.post('/api/save-config', express.json(), async function(req, res) {
 // Resolves config from store + decodes key token, then calls the same named
 // handler functions used by /:config/ routes. No redirects, no re-dispatch.
 
-async function resolveShortRequest(id, keyToken) {
-  const stored = await loadConfig(id);
+function resolveShortRequest(id, keyToken) {
+  const stored = loadConfig(id);
   if (!stored) return null;
   const keyData = decodeKeyToken(keyToken || '');
   return Object.assign({}, stored, keyData);
 }
 
-async function injectShortConfig(req, res, next) {
-  const cfg = await resolveShortRequest(req.params.sid, req.params.keyToken);
+function injectShortConfig(req, res, next) {
+  const cfg = resolveShortRequest(req.params.sid, req.params.keyToken);
   if (!cfg) {
     if (req.path.includes('/catalog/')) return res.json({ metas: [] });
     if (req.path.includes('/meta/')) return res.json({ meta: null });
@@ -1061,7 +985,7 @@ app.get('/s/:sid/:keyToken/poster/:listId.jpg', injectShortConfig, posterHandler
 // New: /shared/:id serves a dedicated landing page with preview + install/customize options
 app.get('/shared/:id', async function(req, res) {
   const id = req.params.id;
-  let cfg = await loadConfig(id);
+  let cfg = loadConfig(id);
   if (!cfg) {
     try { cfg = JSON.parse(Buffer.from(id, 'base64').toString('utf8')); } catch(e) { cfg = null; }
   }
@@ -1073,9 +997,8 @@ app.get('/shared/:id', async function(req, res) {
 });
 
 app.get('/shared/:id/configure', async function(req, res) {
-  // Support both old base64 shared links and new short IDs
   const id = req.params.id;
-  let cfg = await loadConfig(id);   // short ID path
+  let cfg = loadConfig(id);
   if (cfg) return res.send(configurePage(Buffer.from(JSON.stringify(cfg)).toString('base64'), true));
   // Legacy base64
   return res.send(configurePage(id, true));
@@ -4863,15 +4786,6 @@ try {
 app.listen(PORT, function() {
   console.log('GoodTaste addon running on port ' + PORT);
   console.log('Configure: http://localhost:' + PORT + '/configure');
-  if (UPSTASH_URL && UPSTASH_TOKEN) {
-    if (UPSTASH_URL.startsWith('redis://') || UPSTASH_URL.startsWith('rediss://')) {
-      console.error('[GoodTaste] ERROR: UPSTASH_REDIS_REST_URL is a redis:// TCP URL, not an HTTPS REST URL.');
-      console.error('[GoodTaste] Configs will NOT persist. Set UPSTASH_REDIS_REST_URL to the https:// REST URL from your Upstash console.');
-    } else {
-      console.log('[GoodTaste] Upstash Redis configured — configs will persist across restarts.');
-    }
-  } else {
-    console.log('[GoodTaste] No Upstash credentials found — configs stored in: ' + CONFIGS_DIR);
-    console.log('[GoodTaste] Set UPSTASH_REDIS_URL + UPSTASH_REDIS_TOKEN env vars for persistent short URLs.');
-  }
+  console.log('[GoodTaste] Configs stored on disk: ' + CONFIGS_DIR);
+  console.log('[GoodTaste] On Render: mount a Persistent Disk at this path to survive deploys.');
 });
