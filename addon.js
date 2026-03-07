@@ -384,7 +384,7 @@ function buildManifest(config) {
     description: 'Curated episode lists, full TMDB metadata, catalogs, and search.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
     catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
-    resources:   ['catalog', 'meta'],
+    resources:   ['catalog', 'meta', 'episodeVideos'],
     types:       ['movie', 'series'],
     idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
     behaviorHints: { configurable: true, configurationRequired: !cfg.tmdbApiKey },
@@ -1825,6 +1825,10 @@ async function metaMovieHandler(req, res) {
       console.error('[movie meta tt lookup]', e.message);
       return res.json({ meta: null });
     }
+  } else if (/^\d+$/.test(id)) {
+    // Bare numeric TMDB ID (used by some apps like Vidi)
+    tmdbId = id;
+    id = 'tmdb:' + tmdbId;
   } else {
     return res.json({ meta: null });
   }
@@ -1954,6 +1958,9 @@ async function metaSeriesHandler(req, res) {
         console.error('[series meta tt lookup]', e.message);
         return res.json({ meta: null });
       }
+    } else if (/^\d+$/.test(id)) {
+      // Bare numeric TMDB ID (used by some apps like Vidi)
+      id = 'tmdb:' + id;
     } else {
       return res.json({ meta: null });
     }
@@ -2063,6 +2070,30 @@ async function episodeVideosHandler(req, res) {
   const cfg    = req.resolvedCfg || parseConfig(req.params.config);
   const id     = req.params.id;
   if (!cfg.tmdbApiKey) return res.json({ videos: [] });
+
+  // Handle bestof:listId requests (used by apps like Omni that call episodeVideos for series)
+  if (id.startsWith('bestof:')) {
+    const listId        = id.slice('bestof:'.length);
+    const customSeasons = cfg.customSeasons || [];
+    const list          = customSeasons.find(l => l.listId === listId);
+    if (!list || !list.episodes || !list.episodes.length) return res.json({ videos: [] });
+    try {
+      const series   = await getSeries(list.tmdbId, cfg.tmdbApiKey);
+      const imdbId   = series.external_ids && series.external_ids.imdb_id || null;
+      const allEps   = await getAllEpisodes(list.tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
+      const bestOfEps = [];
+      for (const ref of list.episodes) {
+        const ep = allEps.find(e => e.season === ref.season && e.episode === ref.episode);
+        if (ep) bestOfEps.push(ep);
+      }
+      const videos = buildBestOfVideos(bestOfEps, imdbId, list.tmdbId);
+      return res.json({ videos });
+    } catch (e) {
+      console.error('[episodeVideos bestof]', e.message);
+      return res.json({ videos: [] });
+    }
+  }
+
   const parts = id.split(':');
   if (parts[0] !== 'tmdb' || parts.length < 4) return res.json({ videos: [] });
   const tmdbId     = parts[1];
@@ -2867,6 +2898,8 @@ function configurePage(existingConfig, isShared) {
     "  }",
     "  // Re-render list cards to show enriched names and posters",
     "  renderCustomSeasonsList();",
+    "  // Refresh the share card parade now that stills are populated",
+    "  updateStartShareCard();",
     "}",
     "",
 
@@ -4462,6 +4495,18 @@ function configurePage(existingConfig, isShared) {
       </div>
     </div>
 
+    <div class="card">
+      <div class="card-eyebrow">Step 1 of 4</div>
+      <div class="card-title">Connect to TMDB</div>
+      <div class="card-sub">Enter your free TMDB API key to get started. GoodTaste uses TMDB to fetch metadata, search shows, and resolve episodes.</div>
+      <div class="field">
+        <label>TMDB API Key</label>
+        <input type="password" id="apiKey" placeholder="Paste your key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter') validateApiKey()"/>
+        <p class="hint">Free key at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> &rarr; API &rarr; API Key</p>
+      </div>
+      <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>
+    </div>
+
     <!-- Share Your Taste card — only visible when a config is loaded -->
     <div class="card" id="start-share-card" style="display:none;margin-bottom:1rem">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:0.8rem">
@@ -4482,18 +4527,6 @@ function configurePage(existingConfig, isShared) {
         <button class="btn btn-ghost btn-sm" id="start-share-copy-btn" onclick="copyStartShareUrl()" style="display:none">Copy Link</button>
       </div>
       <input type="text" id="start-share-url-out" readonly style="display:none;margin-top:10px;font-size:0.7rem;color:var(--text-mute);font-family:DM Mono,monospace"/>
-    </div>
-
-    <div class="card">
-      <div class="card-eyebrow">Step 1 of 4</div>
-      <div class="card-title">Connect to TMDB</div>
-      <div class="card-sub">Enter your free TMDB API key to get started. GoodTaste uses TMDB to fetch metadata, search shows, and resolve episodes.</div>
-      <div class="field">
-        <label>TMDB API Key</label>
-        <input type="password" id="apiKey" placeholder="Paste your key here..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter') validateApiKey()"/>
-        <p class="hint">Free key at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org/settings/api</a> &rarr; API &rarr; API Key</p>
-      </div>
-      <button class="btn btn-primary btn-lg" style="width:100%" onclick="validateApiKey()" id="btn-validate">Continue &rarr;</button>
     </div>
   </div>
 
