@@ -1875,9 +1875,7 @@ async function metaMovieHandler(req, res) {
       director: directorObj ? directorObj.name : null,
       certification: cert || null,
       trailers,
-      videos: trailers,
       links: imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
-      behaviorHints: { defaultVideoId: null },
     }});
   } catch (e) {
     console.error('[movie meta]', e.message);
@@ -1938,7 +1936,6 @@ async function metaSeriesHandler(req, res) {
         imdbRating:    series.vote_average ? series.vote_average.toFixed(1) : null,
         cast, certification: cert || null,
         links:         imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
-        behaviorHints: { defaultVideoId: null },
       }});
     } catch (e) {
       console.error('[bestof meta]', e.message);
