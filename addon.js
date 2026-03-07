@@ -222,7 +222,7 @@ function seriesToMeta(s) {
   };
 }
 
-function buildBestOfVideos(bestOfEps, imdbId, tmdbId, patchBestOf) {
+function buildBestOfVideos(bestOfEps, imdbId, tmdbId) {
   return bestOfEps.map(function(ep, i) {
     const rank = i + 1;
     const sLabel = String(ep.season).padStart(2, '0');
@@ -232,15 +232,10 @@ function buildBestOfVideos(bestOfEps, imdbId, tmdbId, patchBestOf) {
     const videoId = imdbId
       ? imdbId + ':' + ep.season + ':' + ep.episode
       : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
-    // patchBestOf: use real season/episode numbers so apps that group by season
-    // can render the episode list correctly (e.g. Omni). Default off to avoid
-    // breaking other apps that rely on the season:1/rank layout.
-    const outSeason  = patchBestOf ? ep.season  : 1;
-    const outEpisode = patchBestOf ? ep.episode : rank;
     return {
       id: videoId,
       title: '#' + rank + ' \u2014 S' + sLabel + 'E' + eLabel + ' \u2014 ' + ep.name,
-      season: outSeason, episode: outEpisode,
+      season: 1, episode: rank,
       overview: ratingLine + (ep.overview || ''),
       thumbnail: ep.still || null,
       released: ep.air_date ? new Date(ep.air_date) : null,
@@ -1911,7 +1906,7 @@ async function metaSeriesHandler(req, res) {
         const ep = allEps.find(e => e.season === ref.season && e.episode === ref.episode);
         if (ep) bestOfEps.push(ep);
       }
-      const videos      = buildBestOfVideos(bestOfEps, imdbId, list.tmdbId, !!cfg.patchBestOf);
+      const videos      = buildBestOfVideos(bestOfEps, imdbId, list.tmdbId);
       const startYear   = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
       const endYear     = series.last_air_date   ? series.last_air_date.substring(0, 4)  : '';
       const releaseInfo = series.status === 'Ended' && endYear ? startYear + '-' + endYear : startYear;
@@ -2088,7 +2083,7 @@ async function episodeVideosHandler(req, res) {
         const ep = allEps.find(e => e.season === ref.season && e.episode === ref.episode);
         if (ep) bestOfEps.push(ep);
       }
-      const videos = buildBestOfVideos(bestOfEps, imdbId, list.tmdbId, !!cfg.patchBestOf);
+      const videos = buildBestOfVideos(bestOfEps, imdbId, list.tmdbId);
       return res.json({ videos });
     } catch (e) {
       console.error('[episodeVideos bestof]', e.message);
@@ -2759,7 +2754,7 @@ function configurePage(existingConfig, isShared) {
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
     "var EXISTING_CONFIG = " + existingConfigJson + ";",
     "var state = {",
-    "  apiKey: '', topN: 20, showAutoSeason: false, patchBestOf: false,",
+    "  apiKey: '', topN: 20, showAutoSeason: false,",
     "  customSeasons: [], catalogEnabled: {}, catalogNames: {}, customCatalogs: [], defaultCatalogOrder: null",
     "};",
     "var modalData = { listId: null, tmdbId: null, allEpisodes: [], filteredSeason: 'all', selected: new Set() };",
@@ -2776,7 +2771,7 @@ function configurePage(existingConfig, isShared) {
     "  state.apiKey = cfg.tmdbApiKey || '';",
     "  state.topN = cfg.topN || 20;",
     "  state.showAutoSeason = !!cfg.showAutoSeason;",
-    "  state.patchBestOf = !!cfg.patchBestOf;",
+    
     "  state.customSeasons = cfg.customSeasons || [];",
     "  state.catalogEnabled = cfg.catalogEnabled || {};",
     "  state.catalogNames = cfg.catalogNames || {};",
@@ -2790,8 +2785,7 @@ function configurePage(existingConfig, isShared) {
     "  if (topNInp) topNInp.value = state.topN;",
     "  var szeroChk = document.getElementById('showAutoSeason');",
     "  if (szeroChk) szeroChk.checked = state.showAutoSeason;",
-    "  var patchChk = document.getElementById('patchBestOf');",
-    "  if (patchChk) patchChk.checked = state.patchBestOf;",
+    
     "  // Always render lists and catalogs so shared config shows them",
     "  renderDefaultCatalogs();",
     "  renderCustomSeasonsList();",
@@ -4197,7 +4191,7 @@ function configurePage(existingConfig, isShared) {
     "    else if(mode==='url'&&list.posterUrl&&!list.posterUrl.startsWith('data:')){ posterSpec={mode:'url',url:list.posterUrl}; }",
     "    return { listId:list.listId, tmdbId:list.tmdbId, tmdbName:list.tmdbName||'', label:list.label||'Best Of', prefix:list.prefix||'', posterSpec:posterSpec, episodes:list.episodes.map(function(e){ return {season:e.season,episode:e.episode}; }) };",
     "  });",
-    "  var cfg={topN:state.topN, showAutoSeason:state.showAutoSeason, patchBestOf:state.patchBestOf, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
+    "  var cfg={topN:state.topN, showAutoSeason:state.showAutoSeason, customSeasons:flat, catalogEnabled:state.catalogEnabled, catalogNames:state.catalogNames, customCatalogs:state.customCatalogs, defaultCatalogOrder:state.unifiedOrder};",
     "  if(includeKey) cfg.tmdbApiKey=state.apiKey;",
     "  return cfg;",
     "}",
@@ -4205,7 +4199,7 @@ function configurePage(existingConfig, isShared) {
     "function buildInstallPage() {",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
     "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
-    "  state.patchBestOf=document.getElementById('patchBestOf').checked;",
+    
     "  var manifestUrlEl=document.getElementById('manifest-url');",
     "  var editUrlEl=document.getElementById('edit-url');",
     "  // Immediate fallback: uncompressed inline base64 (with key, legacy format)",
@@ -4577,19 +4571,7 @@ function configurePage(existingConfig, isShared) {
           <div class="catalog-row" style="flex:1;min-width:200px;margin-bottom:0"><div class="catalog-row-info"><div style="font-size:0.87rem;font-weight:600;color:var(--text)">Enable Season Zero</div><div class="catalog-row-type">Off by default</div></div><label class="toggle"><input type="checkbox" id="showAutoSeason"/><span class="toggle-slider"></span></label></div>
         </div>
         <div class="szero-warning"><strong>Note:</strong> Streaming from Season Zero may not work on all platforms.</div>
-        <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
-          <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;">
-            <div style="flex:1;min-width:200px">
-              <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-                <div style="font-size:0.87rem;font-weight:600;color:var(--text)">Patch Best Of for Omni</div>
-                <span class="beta-badge">Beta</span>
-              </div>
-              <div style="font-size:0.75rem;color:var(--text-mute);line-height:1.4">Uses real season &amp; episode numbers in Best Of lists so Omni can render the episode list correctly.</div>
-              <div class="szero-warning" style="margin-top:8px">&#9888; <strong>Only enable for Omni.</strong> This will break Best Of episode display in other apps.</div>
-            </div>
-            <label class="toggle" style="margin-top:2px"><input type="checkbox" id="patchBestOf"/><span class="toggle-slider"></span></label>
-          </div>
-        </div>
+
       </div>
     </div>
     <div class="nav-row">
