@@ -229,12 +229,12 @@ function buildBestOfVideos(bestOfEps, imdbId, tmdbId, patchBestOf) {
     const eLabel = String(ep.episode).padStart(2, '0');
     const ratingLine = ep.vote_average > 0
       ? ep.vote_average.toFixed(1) + '/10  (' + ep.vote_count.toLocaleString() + ' votes)\n\n' : '';
+    // Always use real season/episode in the stream ID so stream addons can resolve them.
+    // When patchBestOf=false we still use real IDs — the season/episode fields on the
+    // video object are set to season:1/rank for apps that need a flat list.
     const videoId = imdbId
       ? imdbId + ':' + ep.season + ':' + ep.episode
       : 'tmdb:' + tmdbId + ':' + ep.season + ':' + ep.episode;
-    // patchBestOf: use real season/episode numbers so apps that group by season
-    // can render the episode list correctly (e.g. Omni). Default off to avoid
-    // breaking other apps that rely on the season:1/rank layout.
     const outSeason  = patchBestOf ? ep.season  : 1;
     const outEpisode = patchBestOf ? ep.episode : rank;
     return {
@@ -243,7 +243,7 @@ function buildBestOfVideos(bestOfEps, imdbId, tmdbId, patchBestOf) {
       season: outSeason, episode: outEpisode,
       overview: ratingLine + (ep.overview || ''),
       thumbnail: ep.still || null,
-      released: ep.air_date ? new Date(ep.air_date) : null,
+      released: ep.air_date ? ep.air_date : null,
     };
   });
 }
@@ -389,7 +389,10 @@ function buildManifest(config) {
     description: 'Curated episode lists, full TMDB metadata, catalogs, and search.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
     catalogs:    cfg.tmdbApiKey ? allCatalogs : [],
-    resources:   ['catalog', 'meta'],
+    resources:   [
+      'catalog',
+      { name: 'meta', types: ['movie', 'series'], idPrefixes: ['tmdb:', 'bestof:'] },
+    ],
     types:       ['movie', 'series'],
     idPrefixes:  ['tmdb:', 'bestof:', 'tt'],
     behaviorHints: { configurable: true, configurationRequired: !cfg.tmdbApiKey },
@@ -1905,11 +1908,27 @@ async function metaSeriesHandler(req, res) {
       const cast    = (series.credits && series.credits.cast || []).slice(0, 8).map(c => c.name);
       const imdbId  = series.external_ids && series.external_ids.imdb_id;
       const logo    = getBestLogo(series.images);
-      const allEps  = await getAllEpisodes(list.tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
+      // Only fetch the seasons we actually need (not all seasons)
+      const neededSeasons = [...new Set(list.episodes.map(e => e.season))];
+      const seasonData = {};
+      await Promise.all(neededSeasons.map(async s => {
+        try {
+          const sd = await getSeason(list.tmdbId, s, cfg.tmdbApiKey);
+          seasonData[s] = sd.episodes || [];
+        } catch(e) { seasonData[s] = []; }
+      }));
       const bestOfEps = [];
       for (const ref of list.episodes) {
-        const ep = allEps.find(e => e.season === ref.season && e.episode === ref.episode);
-        if (ep) bestOfEps.push(ep);
+        const epList = seasonData[ref.season] || [];
+        const ep = epList.find(e => e.episode_number === ref.episode);
+        if (ep) bestOfEps.push({
+          season: ref.season, episode: ref.episode,
+          name: ep.name || ('S' + String(ref.season).padStart(2,'0') + 'E' + String(ref.episode).padStart(2,'0')),
+          overview: ep.overview || '',
+          still: ep.still_path ? TMDB_IMG_SM + ep.still_path : null,
+          vote_average: ep.vote_average || 0, vote_count: ep.vote_count || 0,
+          air_date: ep.air_date,
+        });
       }
       const videos      = buildBestOfVideos(bestOfEps, imdbId, list.tmdbId, !!cfg.patchBestOf);
       const startYear   = series.first_air_date ? series.first_air_date.substring(0, 4) : '';
@@ -1928,16 +1947,20 @@ async function metaSeriesHandler(req, res) {
       } else {
         posterUrl = series.poster_path ? TMDB_IMG_MD + series.poster_path : null;
       }
+      const bestofGenres = (series.genres || []).map(g => g.name);
+      const bestofDesc = (series.overview || '').trim()
+        ? label + ': ' + bestOfEps.length + ' episodes\n\n' + series.overview
+        : label + ': ' + bestOfEps.length + ' hand-picked episodes from ' + (series.name || 'this series') + '.';
       return res.json({ meta: {
         id: 'bestof:' + listId, type: 'series',
         name:        prefix + label + (series.name ? ' ' + series.name : ''),
         poster:      posterUrl,
         background:  series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
         logo:        logo || undefined,
-        description: bestOfEps.length + ' episodes \u2014 ' + label + '\n\n' + (series.overview || ''),
+        description: bestofDesc,
         releaseInfo, videos,
         runtime:       series.episode_run_time && series.episode_run_time[0] ? series.episode_run_time[0] + ' min' : null,
-        genres:        (series.genres || []).map(g => g.name),
+        genres:        bestofGenres.length ? bestofGenres : ['Drama'],
         imdbRating:    series.vote_average ? series.vote_average.toFixed(1) : null,
         cast, certification: cert || null,
         links:         imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
@@ -2015,7 +2038,7 @@ async function metaSeriesHandler(req, res) {
             season: s, episode: ep.episode_number,
             overview: ep.overview || '',
             thumbnail: ep.still_path ? TMDB_IMG_SM + ep.still_path : null,
-            released: ep.air_date ? new Date(ep.air_date) : null,
+            released: ep.air_date ? ep.air_date : null,
             rating: ep.vote_average ? ep.vote_average.toFixed(1) : null,
           });
         }
@@ -2036,7 +2059,7 @@ async function metaSeriesHandler(req, res) {
           season: 0, episode: rank,
           overview: ratingLine + (ep.overview || ''),
           thumbnail: ep.still || null,
-          released: ep.air_date ? new Date(ep.air_date) : null,
+          released: ep.air_date ? ep.air_date : null,
         });
       });
     }
@@ -2067,6 +2090,28 @@ async function metaSeriesHandler(req, res) {
 }
 app.get('/:config/meta/series/:id.json', metaSeriesHandler);
 
+// ─── DEBUG: test bestof meta directly in browser ─────────────────────────────
+// Visit /debug/bestof?config=YOUR_CONFIG_TOKEN to see what the meta returns
+app.get('/debug/bestof', async function(req, res) {
+  const cfg = req.query.config ? parseConfig(req.query.config) : null;
+  if (!cfg || !cfg.tmdbApiKey) return res.json({ error: 'Pass ?config=YOUR_CONFIG_BASE64 in the URL' });
+  const lists = cfg.customSeasons || [];
+  if (!lists.length) return res.json({ error: 'No customSeasons in config', cfg });
+  const results = [];
+  for (const list of lists) {
+    try {
+      const neededSeasons = [...new Set(list.episodes.map(e => e.season))];
+      const seasonData = {};
+      await Promise.all(neededSeasons.map(async s => {
+        try { const sd = await getSeason(list.tmdbId, s, cfg.tmdbApiKey); seasonData[s] = (sd.episodes||[]).length; }
+        catch(e) { seasonData[s] = 'ERROR: ' + e.message; }
+      }));
+      results.push({ listId: list.listId, tmdbId: list.tmdbId, label: list.label, episodeRefs: list.episodes.length, neededSeasons, seasonEpCounts: seasonData });
+    } catch(e) { results.push({ listId: list.listId, error: e.message }); }
+  }
+  res.json({ lists: results });
+});
+
 // ─── EPISODE VIDEOS ───────────────────────────────────────────────────────────
 async function episodeVideosHandler(req, res) {
   const cfg    = req.resolvedCfg || parseConfig(req.params.config);
@@ -2082,11 +2127,27 @@ async function episodeVideosHandler(req, res) {
     try {
       const series   = await getSeries(list.tmdbId, cfg.tmdbApiKey);
       const imdbId   = series.external_ids && series.external_ids.imdb_id || null;
-      const allEps   = await getAllEpisodes(list.tmdbId, cfg.tmdbApiKey, series.number_of_seasons || 1);
+      // Only fetch seasons we need
+      const neededSeasons = [...new Set(list.episodes.map(e => e.season))];
+      const seasonData = {};
+      await Promise.all(neededSeasons.map(async s => {
+        try {
+          const sd = await getSeason(list.tmdbId, s, cfg.tmdbApiKey);
+          seasonData[s] = sd.episodes || [];
+        } catch(e) { seasonData[s] = []; }
+      }));
       const bestOfEps = [];
       for (const ref of list.episodes) {
-        const ep = allEps.find(e => e.season === ref.season && e.episode === ref.episode);
-        if (ep) bestOfEps.push(ep);
+        const epList = seasonData[ref.season] || [];
+        const ep = epList.find(e => e.episode_number === ref.episode);
+        if (ep) bestOfEps.push({
+          season: ref.season, episode: ref.episode,
+          name: ep.name || ('S' + String(ref.season).padStart(2,'0') + 'E' + String(ref.episode).padStart(2,'0')),
+          overview: ep.overview || '',
+          still: ep.still_path ? TMDB_IMG_SM + ep.still_path : null,
+          vote_average: ep.vote_average || 0, vote_count: ep.vote_count || 0,
+          air_date: ep.air_date,
+        });
       }
       const videos = buildBestOfVideos(bestOfEps, imdbId, list.tmdbId, !!cfg.patchBestOf);
       return res.json({ videos });
@@ -2759,7 +2820,7 @@ function configurePage(existingConfig, isShared) {
     "var DEFAULT_CATALOGS = " + defaultCatalogsJson + ";",
     "var EXISTING_CONFIG = " + existingConfigJson + ";",
     "var state = {",
-    "  apiKey: '', topN: 20, showAutoSeason: false, patchBestOf: false,",
+    "  apiKey: '', topN: 20, showAutoSeason: false, patchBestOf: true,",
     "  customSeasons: [], catalogEnabled: {}, catalogNames: {}, customCatalogs: [], defaultCatalogOrder: null",
     "};",
     "var modalData = { listId: null, tmdbId: null, allEpisodes: [], filteredSeason: 'all', selected: new Set() };",
@@ -4566,6 +4627,24 @@ function configurePage(existingConfig, isShared) {
       <div class="section-header"><span class="section-label">Your Lists</span></div>
       <div id="custom-seasons-list"><div class="empty-state">No shows yet. Search above to get started.</div></div>
     </div>
+    <div class="szero-card" id="settings-card" style="margin-bottom:0.75rem">
+      <div class="szero-header" onclick="this.parentElement.querySelector('.szero-body').style.display=this.parentElement.querySelector('.szero-body').style.display==='none'?'block':'none';this.querySelector('.szero-expand-icon').style.transform=this.parentElement.querySelector('.szero-body').style.display==='none'?'rotate(-90deg)':'rotate(0deg)'">
+        <div class="szero-header-left"><div><div class="szero-title-row"><span class="szero-title-text">&#9881;&#65039; Settings</span></div><div class="szero-desc">Best Of display options and app compatibility.</div></div></div>
+        <span class="szero-expand-icon" style="transition:transform 0.2s">&#9660;</span>
+      </div>
+      <div class="szero-body" style="display:none">
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+          <div style="flex:1;min-width:200px">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <div style="font-size:0.87rem;font-weight:600;color:var(--text)">Sort Best Of by Season</div>
+              <span class="beta-badge">Beta</span>
+            </div>
+            <div style="font-size:0.75rem;color:var(--text-mute);line-height:1.4">Groups Best Of episodes into their real seasons instead of a single combined list. On by default — works across Stremio, Omni, Nuvio, and Vidi. Disable only if you see duplicate seasons.</div>
+          </div>
+          <label class="toggle" style="margin-top:2px"><input type="checkbox" id="patchBestOf"/><span class="toggle-slider"></span></label>
+        </div>
+      </div>
+    </div>
     <div class="szero-card" id="szero-card">
       <div class="szero-header" onclick="toggleSzeroExpand()">
         <div class="szero-header-left"><div><div class="szero-title-row"><span class="szero-title-text">Season Zero</span><span class="beta-badge">Beta</span></div><div class="szero-desc">Auto-adds top-rated episodes of every series to a Season 0.</div></div></div>
@@ -4577,19 +4656,6 @@ function configurePage(existingConfig, isShared) {
           <div class="catalog-row" style="flex:1;min-width:200px;margin-bottom:0"><div class="catalog-row-info"><div style="font-size:0.87rem;font-weight:600;color:var(--text)">Enable Season Zero</div><div class="catalog-row-type">Off by default</div></div><label class="toggle"><input type="checkbox" id="showAutoSeason"/><span class="toggle-slider"></span></label></div>
         </div>
         <div class="szero-warning"><strong>Note:</strong> Streaming from Season Zero may not work on all platforms.</div>
-        <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
-          <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;">
-            <div style="flex:1;min-width:200px">
-              <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-                <div style="font-size:0.87rem;font-weight:600;color:var(--text)">Patch Best Of for Omni</div>
-                <span class="beta-badge">Beta</span>
-              </div>
-              <div style="font-size:0.75rem;color:var(--text-mute);line-height:1.4">Uses real season &amp; episode numbers in Best Of lists so Omni can render the episode list correctly.</div>
-              <div class="szero-warning" style="margin-top:8px">&#9888; <strong>Only enable for Omni.</strong> This will break Best Of episode display in other apps.</div>
-            </div>
-            <label class="toggle" style="margin-top:2px"><input type="checkbox" id="patchBestOf"/><span class="toggle-slider"></span></label>
-          </div>
-        </div>
       </div>
     </div>
     <div class="nav-row">
