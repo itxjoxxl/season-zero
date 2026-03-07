@@ -21,21 +21,46 @@ const zlib = require('zlib');
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_URL   || null;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_TOKEN || null;
 
+// Upstash REST API: pipeline endpoint sends all commands in one HTTP request
+// which saves bandwidth and reduces command count.
+async function upstashPipeline(commands) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+  try {
+    const r = await axios.post(UPSTASH_URL + '/pipeline',
+      commands,
+      { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' }, timeout: 8000 }
+    );
+    return r.data;
+  } catch(e) { console.warn('[GoodTaste] Upstash pipeline failed:', e.message); return null; }
+}
+
 async function upstashSet(key, value) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
   try {
-    await axios.post(UPSTASH_URL + '/set/' + encodeURIComponent(key),
-      JSON.stringify(value),
+    // Upstash REST pipeline: [["SET", "key", "value"]]
+    const serialized = JSON.stringify(value);
+    const result = await upstashPipeline([['SET', key, serialized]]);
+    if (result && Array.isArray(result) && result[0] && result[0].result === 'OK') return true;
+    // Fallback: direct endpoint — body must be JSON array ["value"]
+    const r = await axios.post(
+      `${UPSTASH_URL}/set/${encodeURIComponent(key)}`,
+      [serialized],
       { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' }, timeout: 5000 }
     );
-    return true;
+    return !!(r.data && r.data.result === 'OK');
   } catch(e) { console.warn('[GoodTaste] Upstash set failed:', e.message); return false; }
 }
 
 async function upstashGet(key) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
   try {
-    const r = await axios.get(UPSTASH_URL + '/get/' + encodeURIComponent(key),
+    const result = await upstashPipeline([['GET', key]]);
+    if (result && Array.isArray(result) && result[0] && result[0].result != null) {
+      return JSON.parse(result[0].result);
+    }
+    // Fallback: direct GET endpoint
+    const r = await axios.get(
+      `${UPSTASH_URL}/get/${encodeURIComponent(key)}`,
       { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN }, timeout: 5000 }
     );
     if (r.data && r.data.result != null) return JSON.parse(r.data.result);
@@ -185,7 +210,7 @@ async function getMovie(tmdbId, apiKey) {
   return tmdb('/movie/' + tmdbId, apiKey, { append_to_response: 'external_ids,release_dates,credits,videos,images', include_image_language: 'en,null' });
 }
 async function getSeries(tmdbId, apiKey) {
-  return tmdb('/tv/' + tmdbId, apiKey, { append_to_response: 'external_ids,content_ratings,credits,images', include_image_language: 'en,null' });
+  return tmdb('/tv/' + tmdbId, apiKey, { append_to_response: 'external_ids,content_ratings,credits,videos,images', include_image_language: 'en,null' });
 }
 
 // Pick the best logo from a TMDB images response
@@ -426,7 +451,7 @@ function buildManifest(config) {
 
   return {
     id:          'community.goodtaste-tmdb',
-    version:     '5.0.0',
+    version:     '5.1.0',
     name:        'GoodTaste',
     description: 'Curated episode lists, full TMDB metadata, catalogs, and search.',
     logo:        'https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_1-5bdc75aaebeb75dc7ae79426ddd9be3b2be1e342510f8202baf6bffa71d7f5c4.svg',
@@ -1030,6 +1055,20 @@ app.get('/s/:sid/:keyToken/episodeVideos/series/:epId.json', injectShortConfig, 
 app.get('/s/:sid/:keyToken/poster/:listId.jpg', injectShortConfig, posterHandler);
 
 // ─── SHARED CONFIG (key-free, for sharing) ───────────────────────────────────
+// New: /shared/:id serves a dedicated landing page with preview + install/customize options
+app.get('/shared/:id', async function(req, res) {
+  const id = req.params.id;
+  let cfg = await loadConfig(id);
+  if (!cfg) {
+    try { cfg = JSON.parse(Buffer.from(id, 'base64').toString('utf8')); } catch(e) { cfg = null; }
+  }
+  if (!cfg) return res.status(404).send('<h2>Shared config not found</h2>');
+  // Enrich episode thumbnails using the server-side hero API key (best-effort, non-blocking)
+  let enrichedSeasons = cfg.customSeasons || [];
+  try { enrichedSeasons = await enrichSharedThumbs(cfg.customSeasons || []); } catch(e) { /* use as-is */ }
+  res.send(sharedLandingPage(id, cfg, enrichedSeasons));
+});
+
 app.get('/shared/:id/configure', async function(req, res) {
   // Support both old base64 shared links and new short IDs
   const id = req.params.id;
@@ -1039,9 +1078,293 @@ app.get('/shared/:id/configure', async function(req, res) {
   return res.send(configurePage(id, true));
 });
 
+// ─── SHARED LANDING PAGE ─────────────────────────────────────────────────────
+// Enrich episode stills using the server-side hero API key so the parade has
+// thumbnails even when the sharer didn't enrich them locally.
+async function enrichSharedThumbs(customSeasons) {
+  const heroKey = process.env.GOODTASTE_HERO_API_KEY || process.env.TMDB_API_KEY || null;
+  if (!heroKey || !customSeasons.length) return customSeasons;
+  // Group by tmdbId to avoid redundant fetches
+  const byShow = {};
+  customSeasons.forEach(list => {
+    if (!byShow[list.tmdbId]) byShow[list.tmdbId] = [];
+    byShow[list.tmdbId].push(list);
+  });
+  const enriched = customSeasons.map(l => Object.assign({}, l, { episodes: (l.episodes || []).map(e => Object.assign({}, e)) }));
+  const enrichedByShow = {};
+  enriched.forEach(l => {
+    if (!enrichedByShow[l.tmdbId]) enrichedByShow[l.tmdbId] = [];
+    enrichedByShow[l.tmdbId].push(l);
+  });
+  await Promise.all(Object.keys(byShow).map(async tmdbId => {
+    try {
+      // Only fetch if any episode is missing a still
+      const lists = enrichedByShow[tmdbId];
+      const needsEnrich = lists.some(l => l.episodes.some(e => !e.still));
+      if (!needsEnrich) return;
+      const series = await getSeries(tmdbId, heroKey);
+      const totalSeasons = series.number_of_seasons || 1;
+      const allEps = await getAllEpisodes(tmdbId, heroKey, totalSeasons);
+      const epMap = {};
+      allEps.forEach(ep => { epMap[ep.season + ':' + ep.episode] = ep; });
+      lists.forEach(list => {
+        list.episodes = list.episodes.map(ep => {
+          if (ep.still) return ep;
+          const full = epMap[ep.season + ':' + ep.episode];
+          return full ? Object.assign({}, ep, { still: full.still, name: ep.name || full.name }) : ep;
+        });
+      });
+    } catch(e) { /* skip show on error */ }
+  }));
+  return enriched;
+}
+
+function sharedLandingPage(shareId, cfg, enrichedSeasons) {
+  const shareTitle = cfg._shareTitle || 'GoodTaste Configuration';
+  const shareDesc  = cfg._shareDesc  || '';
+  const customSeasons = enrichedSeasons || cfg.customSeasons || [];
+  const customCatalogs = cfg.customCatalogs || [];
+  const listCount = customSeasons.length;
+  const showCount = new Set(customSeasons.map(l => l.tmdbId)).size;
+  const DEFAULT_CAT_IDS = [
+    'tmdb.trending_movies','tmdb.popular_movies','tmdb.top_rated_movies','tmdb.upcoming_movies','tmdb.nowplaying_movies',
+    'tmdb.trending_series','tmdb.popular_series','tmdb.top_rated_series','tmdb.airing_today','tmdb.on_the_air'
+  ];
+  const DEFAULT_ENABLED = ['tmdb.trending_movies','tmdb.popular_movies','tmdb.top_rated_movies','tmdb.trending_series','tmdb.popular_series','tmdb.top_rated_series'];
+  const enabledDefaultCount = DEFAULT_CAT_IDS.filter(id => {
+    const ov = cfg.catalogEnabled && cfg.catalogEnabled[id];
+    if (ov === false) return false;
+    if (ov === true) return true;
+    return DEFAULT_ENABLED.includes(id);
+  }).length;
+  const customCatCount = customCatalogs.length;
+  const topN = cfg.topN || 20;
+  const showAutoSeason = cfg.showAutoSeason !== false;
+
+  // Collect episode thumbnails for the parade
+  const allThumbs = [];
+  customSeasons.forEach(list => (list.episodes || []).forEach(ep => allThumbs.push(ep.still || null)));
+
+  const paradeHtml = allThumbs.length
+    ? `<div class="ep-parade" style="display:flex;margin:1rem 0"><div class="ep-parade-track">${
+        allThumbs.concat(allThumbs).map(src => src
+          ? `<img class="parade-thumb" src="${src}" alt="" loading="eager" onload="this.style.opacity='0.7'" style="opacity:0;transition:opacity 0.6s ease"/>`
+          : `<div class="parade-thumb no-img" style="display:flex;align-items:center;justify-content:center;font-size:1.1rem;border:1px solid #1c1c1c">&#127902;</div>`
+        ).join('')
+      }</div></div>`
+    : '';
+
+  // Condensed summary for landing page
+  const summaryHtml = `
+    <div class="summary-row"><span class="summary-label">Default catalogs</span><span class="summary-value accent">${enabledDefaultCount} enabled</span></div>
+    ${customCatCount > 0 ? `<div class="summary-row"><span class="summary-label">Custom catalogs</span><span class="summary-value accent">${customCatCount}</span></div>` : ''}
+    <div class="summary-row"><span class="summary-label">Season Zero</span><span class="summary-value">${showAutoSeason ? `On · top ${topN}` : 'Off'}</span></div>
+    ${listCount > 0 ? `<div class="summary-row"><span class="summary-label">Curated lists</span><span class="summary-value accent">${listCount} list${listCount !== 1 ? 's' : ''} · ${showCount} show${showCount !== 1 ? 's' : ''}</span></div>` : ''}
+  `;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>${shareTitle} — GoodTaste</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#080808;--surface:#0f0f0f;--surface2:#161616;--border:#1c1c1c;--border2:#252525;--text:#e8e8e8;--text-dim:#888;--text-mute:#444;--gold:#f0c040;--gold-dim:rgba(240,192,64,0.12);--gold-border:rgba(240,192,64,0.25);--radius:12px;--transition:0.22s cubic-bezier(0.4,0,0.2,1)}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased}
+.topbar{background:rgba(8,8,8,0.92);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);padding:0 2rem;height:60px;display:flex;align-items:center;position:sticky;top:0;z-index:100}
+.topbar-brand{font-family:'Playfair Display',serif;font-weight:700;font-size:1.1rem;color:#fff}
+.topbar-brand span{color:var(--gold)}
+.main{max-width:680px;margin:0 auto;padding:2.5rem 1.5rem 6rem}
+.hero-wrap{position:relative;overflow:hidden;border-radius:18px;min-height:280px;display:flex;align-items:center;justify-content:center;margin-bottom:1.5rem;border:1px solid var(--border)}
+.hero-bg{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.hero-bg-row{position:absolute;left:0;right:0;display:flex;gap:0;height:52%;animation:bgScroll 38s linear infinite;will-change:transform}
+.hero-bg-row.row2{top:calc(50% + 4px);height:50%;animation-direction:reverse;animation-duration:49s}
+@keyframes bgScroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.hero-bg-item{flex-shrink:0;height:100%;width:130px;padding:0 3px;transform:skewX(-8deg)}
+.hero-bg-item img{width:100%;height:100%;object-fit:cover;border-radius:8px;opacity:0;transition:opacity 1s ease;display:block}
+.hero-bg-item img.loaded{opacity:0.55}
+.hero-bg-overlay{position:absolute;inset:0;background:linear-gradient(to bottom,rgba(8,8,8,0.6) 0%,rgba(8,8,8,0.1) 30%,rgba(8,8,8,0.1) 70%,rgba(8,8,8,1) 100%);z-index:1}
+.hero{position:relative;z-index:2;text-align:center;padding:2rem 1.5rem 1.5rem;width:100%}
+.hero-logo{font-family:'Playfair Display',serif;font-size:2.6rem;font-weight:700;color:#fff;letter-spacing:-0.03em;margin-bottom:0.2rem;line-height:1}
+.hero-logo span{color:var(--gold)}
+.hero-tagline{font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0;letter-spacing:0.04em;text-transform:uppercase;font-weight:500}
+.share-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(240,192,64,0.1);border:1px solid rgba(240,192,64,0.25);color:var(--gold);font-size:0.72rem;font-weight:600;padding:4px 12px;border-radius:20px;margin-top:0.8rem;letter-spacing:0.03em}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.5rem;margin-bottom:1rem}
+.share-title{font-family:'Playfair Display',serif;font-size:1.35rem;font-weight:700;color:#fff;margin-bottom:0.3rem}
+.share-desc{font-size:0.82rem;color:var(--text-dim);margin-bottom:1rem;line-height:1.5}
+.summary-row{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:8px;background:var(--surface2);border:1px solid var(--border);margin-bottom:6px;font-size:0.8rem}
+.summary-label{color:var(--text-dim)}
+.summary-value{color:#fff;font-weight:600;font-family:'DM Mono',monospace;font-size:0.76rem}
+.summary-value.accent{color:var(--gold)}
+.ep-parade{display:flex;gap:6px;overflow:hidden;margin:1rem 0;mask-image:linear-gradient(to right,transparent,black 8%,black 92%,transparent);-webkit-mask-image:linear-gradient(to right,transparent,black 8%,black 92%,transparent)}
+.ep-parade-track{display:flex;gap:6px;animation:scroll 30s linear infinite;flex-shrink:0}
+@keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.parade-thumb{width:80px;height:45px;border-radius:6px;object-fit:cover;flex-shrink:0;background:var(--surface2)}
+.parade-thumb.no-img{display:flex;align-items:center;justify-content:center;font-size:1.1rem;border:1px solid var(--border)}
+.section-label{font-size:0.65rem;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;color:var(--text-mute);margin-bottom:8px}
+.field{margin-bottom:1rem}
+.field label{display:block;font-size:0.78rem;font-weight:600;color:var(--text-dim);margin-bottom:6px;letter-spacing:0.02em}
+input{width:100%;background:var(--surface2);border:1px solid var(--border2);border-radius:var(--radius);color:var(--text);padding:11px 14px;font-size:0.87rem;font-family:'DM Sans',sans-serif;transition:border-color var(--transition),box-shadow var(--transition);outline:none}
+input:focus{border-color:var(--gold);box-shadow:0 0 0 3px var(--gold-dim)}
+input[type=password]{letter-spacing:0.12em}
+.btn-row{display:flex;gap:10px;margin-top:1.2rem;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:12px 24px;border-radius:var(--radius);font-size:0.87rem;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;border:none;transition:all var(--transition)}
+.btn-primary{background:var(--gold);color:#000}
+.btn-primary:hover{opacity:0.88;transform:translateY(-1px)}
+.btn-ghost{background:transparent;border:1px solid var(--border2);color:var(--text-dim)}
+.btn-ghost:hover{border-color:var(--text-dim);color:var(--text)}
+.btn-full{width:100%}
+.hint{font-size:0.72rem;color:var(--text-mute);margin-top:6px}
+.hint a{color:var(--gold);text-decoration:none}
+.spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(0,0,0,0.2);border-top-color:rgba(0,0,0,0.7);border-radius:50%;animation:spin 0.7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.err-msg{font-size:0.78rem;color:#e05252;margin-top:8px;display:none}
+</style>
+</head>
+<body>
+<div class="topbar"><div class="topbar-brand">Good<span>Taste</span></div></div>
+<div class="main">
+  <div class="hero-wrap">
+    <div class="hero-bg">
+      <div class="hero-bg-row" id="hero-bg-row1"></div>
+      <div class="hero-bg-row row2" id="hero-bg-row2"></div>
+      <div class="hero-bg-overlay"></div>
+    </div>
+    <div class="hero">
+      <div class="hero-logo">Good<span>Taste</span></div>
+      <div class="hero-tagline">Curated Stremio Addon</div>
+      <div class="share-badge">Shared Configuration</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="share-title">${shareTitle}</div>
+    ${shareDesc ? `<div class="share-desc">${shareDesc}</div>` : ''}
+    ${paradeHtml}
+    ${summaryHtml}
+  </div>
+
+  <div class="card">
+    <div class="section-label">Add Your TMDB API Key</div>
+    <div style="font-size:0.82rem;color:var(--text-dim);margin-bottom:1rem;line-height:1.5">Enter your free TMDB key to use this shared configuration. Your key stays in your browser only — it's never stored on the server.</div>
+    <div class="field">
+      <label>TMDB API Key</label>
+      <input type="password" id="apiKeyInput" placeholder="Paste your key here..." autocomplete="off" spellcheck="false"/>
+      <p class="hint">Free key at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org → Settings → API</a></p>
+    </div>
+    <div class="err-msg" id="errMsg">Invalid API key — please check and try again.</div>
+    <div class="btn-row">
+      <button class="btn btn-primary" style="flex:1" id="btn-install" onclick="doInstall()">
+        <span id="btn-install-label">Install</span>
+      </button>
+      <button class="btn btn-ghost" style="flex:1" id="btn-customize" onclick="doCustomize()">Customize</button>
+    </div>
+    <div style="font-size:0.7rem;color:var(--text-mute);margin-top:10px;line-height:1.5;text-align:center">
+      <strong>Install</strong> — adds to Stremio instantly with this config &nbsp;·&nbsp;
+      <strong>Customize</strong> — opens the editor so you can tweak before installing
+    </div>
+  </div>
+</div>
+
+<script>
+var SHARE_ID = ${JSON.stringify(shareId)};
+var heroLoaded = false;
+
+// Load hero backgrounds without API key
+(async function loadHero() {
+  try {
+    var r = await fetch('/api/start-hero');
+    var d = await r.json();
+    if (d.useFallback || (!d.row1 && !d.row2)) return;
+    function fillRow(rowId, posters) {
+      var el = document.getElementById(rowId); if (!el) return;
+      var doubled = posters.concat(posters);
+      el.innerHTML = doubled.map(function(p) {
+        return '<div class="hero-bg-item"><img src="' + p + '" alt="" loading="lazy" onload="this.classList.add(\\'loaded\\')"/></div>';
+      }).join('');
+    }
+    fillRow('hero-bg-row1', d.row1 || []);
+    fillRow('hero-bg-row2', d.row2 || []);
+  } catch(e) {}
+})();
+
+async function validateKey(key) {
+  try {
+    var r = await fetch('/api/hero-backdrops?apiKey=' + encodeURIComponent(key));
+    var d = await r.json();
+    return d.backdrops && d.backdrops.length > 0;
+  } catch(e) { return false; }
+}
+
+async function doInstall() {
+  var key = document.getElementById('apiKeyInput').value.trim();
+  var errEl = document.getElementById('errMsg');
+  errEl.style.display = 'none';
+  if (!key) { errEl.textContent = 'Please enter your TMDB API key.'; errEl.style.display = 'block'; return; }
+  var btn = document.getElementById('btn-install');
+  btn.disabled = true;
+  document.getElementById('btn-install-label').innerHTML = '<span class="spinner"></span> Validating\u2026';
+  var valid = await validateKey(key);
+  if (!valid) {
+    btn.disabled = false;
+    document.getElementById('btn-install-label').textContent = 'Install';
+    errEl.textContent = 'Invalid API key — please check and try again.';
+    errEl.style.display = 'block';
+    return;
+  }
+  // Build short URL: key token + config ID
+  try {
+    var bytes = new TextEncoder().encode(JSON.stringify({tmdbApiKey:key,topN:${topN},showAutoSeason:${showAutoSeason}}));
+    var cs = new CompressionStream('deflate-raw');
+    var writer = cs.writable.getWriter();
+    var reader = cs.readable.getReader();
+    writer.write(bytes); writer.close();
+    var chunks = []; var done = false;
+    while (!done) { var chunk = await reader.read(); if (chunk.done) done=true; else chunks.push(chunk.value); }
+    var total = chunks.reduce(function(a,c){return a+c.length;},0);
+    var merged = new Uint8Array(total); var off=0;
+    chunks.forEach(function(c){ merged.set(c,off); off+=c.length; });
+    var binary = Array.from(merged).map(function(b){return String.fromCharCode(b);}).join('');
+    var keyToken = btoa(binary).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+    var manifestUrl = window.location.origin + '/s/' + SHARE_ID + '/' + keyToken + '/manifest.json';
+    window.location.href = manifestUrl.replace(/^https?:\\/\\//, 'stremio://');
+  } catch(e) {
+    // Fallback: inline base64
+    var cfg = ${JSON.stringify(Object.assign({}, cfg, { tmdbApiKey: null }))};
+    cfg.tmdbApiKey = key;
+    var b64 = btoa(unescape(encodeURIComponent(JSON.stringify(cfg))));
+    window.location.href = ('stremio://' + window.location.host + '/' + b64 + '/manifest.json');
+  }
+}
+
+function doCustomize() {
+  var key = document.getElementById('apiKeyInput').value.trim();
+  var url = window.location.origin + '/shared/' + SHARE_ID + '/configure';
+  if (key) url += '?apiKey=' + encodeURIComponent(key);
+  window.location.href = url;
+}
+</script>
+</body>
+</html>`;
+}
+
+
 // Static backdrops removed — hero uses only colored placeholders until TMDB API posters load
 app.get('/api/static-backdrops', function(req, res) {
   res.json({ posters: [] });
+});
+
+// ─── BANNER API ───────────────────────────────────────────────────────────────
+// Set GOODTASTE_BANNER env var on Render to show a message at the top of the
+// home page without redeploying. Optionally set GOODTASTE_BANNER_URL for a link.
+// Example:  GOODTASTE_BANNER="v5.1 is live — check out the new Share feature!"
+//           GOODTASTE_BANNER_URL="https://github.com/you/goodtaste/releases"
+app.get('/api/banner', function(req, res) {
+  const text = process.env.GOODTASTE_BANNER || '';
+  const url  = process.env.GOODTASTE_BANNER_URL || '';
+  res.json({ text, url });
 });
 
 // Proxy a single TMDB image server-side (no API key needed, avoids hotlink blocking)
@@ -1583,28 +1906,52 @@ async function metaMovieHandler(req, res) {
   try {
     const movie      = await getMovie(tmdbId, cfg.tmdbApiKey);
     const cert       = getMovieCert(movie);
-    const director   = (movie.credits && movie.credits.crew || []).find(c => c.job === 'Director');
-    const cast       = (movie.credits && movie.credits.cast || []).slice(0, 8).map(c => c.name);
-    const trailerKey = (movie.videos && movie.videos.results || []).find(v => v.type === 'Trailer' && v.site === 'YouTube');
-    const logo       = getBestLogo(movie.images);
+    const directorObj = (movie.credits && movie.credits.crew || []).find(c => c.job === 'Director');
+    const castObjs   = (movie.credits && movie.credits.cast || []).slice(0, 8);
+    const cast       = castObjs.map(c => c.name);
+    // Trailers — YouTube preferred, also grab teasers as fallback
+    const videoResults = (movie.videos && movie.videos.results || []);
+    const trailerVid  = videoResults.find(v => v.type === 'Trailer' && v.site === 'YouTube')
+                     || videoResults.find(v => v.site === 'YouTube');
+    const trailers    = trailerVid ? [{ source: 'yt', type: 'Trailer', ytId: trailerVid.key }] : [];
+    const logo        = getBestLogo(movie.images);
+    const imdbId      = movie.external_ids && movie.external_ids.imdb_id;
+
+    // People images for cast (fetch in parallel, best-effort)
+    let castWithImages = null;
+    try {
+      const peopleData = await Promise.all(
+        castObjs.slice(0, 5).map(async c => {
+          const img = c.profile_path ? TMDB_IMG_SM + c.profile_path : null;
+          return { name: c.name, imageUrl: img };
+        })
+      );
+      castWithImages = peopleData;
+    } catch(e) { /* skip */ }
+
     res.json({ meta: {
-      id, type: 'movie', name: movie.title,
+      id, type: 'movie',
+      name: movie.title || movie.original_title,
       poster: movie.poster_path ? TMDB_IMG_MD + movie.poster_path : null,
       background: movie.backdrop_path ? TMDB_IMG_LG + movie.backdrop_path : null,
       logo: logo || undefined,
-      description: movie.overview,
+      description: movie.overview || '',
       releaseInfo: movie.release_date ? movie.release_date.substring(0, 4) : '',
       runtime: movie.runtime ? movie.runtime + ' min' : null,
       genres: (movie.genres || []).map(g => g.name),
       imdbRating: movie.vote_average ? movie.vote_average.toFixed(1) : null,
-      cast, director: director ? director.name : null, certification: cert || null,
-      trailers: trailerKey ? [{ source: 'yt', type: 'Trailer', ytId: trailerKey.key }] : [],
-      links: movie.external_ids && movie.external_ids.imdb_id
-        ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + movie.external_ids.imdb_id }] : [],
+      cast,
+      castWithImages: castWithImages || undefined,
+      director: directorObj ? directorObj.name : null,
+      certification: cert || null,
+      trailers,
+      videos: trailers,
+      links: imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
+      behaviorHints: { defaultVideoId: null },
     }});
   } catch (e) {
     console.error('[movie meta]', e.message);
-    res.status(500).json({ err: e.message });
+    res.status(500).json({ meta: null, err: e.message });
   }
 }
 app.get('/:config/meta/movie/:id.json', metaMovieHandler);
@@ -1690,8 +2037,25 @@ async function metaSeriesHandler(req, res) {
   try {
     const series = await getSeries(tmdbId, cfg.tmdbApiKey);
     const cert   = getSeriesCert(series);
-    const cast   = (series.credits && series.credits.cast || []).slice(0, 8).map(c => c.name);
+    const castObjs = (series.credits && series.credits.cast || []).slice(0, 8);
+    const cast   = castObjs.map(c => c.name);
     const imdbId = series.external_ids && series.external_ids.imdb_id || null;
+
+    // Trailers
+    const videoResults = (series.videos && series.videos.results || []);
+    const trailerVid  = videoResults.find(v => v.type === 'Trailer' && v.site === 'YouTube')
+                     || videoResults.find(v => v.site === 'YouTube');
+    const trailers    = trailerVid ? [{ source: 'yt', type: 'Trailer', ytId: trailerVid.key }] : [];
+
+    // Cast images (from profile_path)
+    let castWithImages = null;
+    try {
+      castWithImages = castObjs.slice(0, 5).map(c => ({
+        name: c.name,
+        imageUrl: c.profile_path ? TMDB_IMG_SM + c.profile_path : null,
+      }));
+    } catch(e) { /* skip */ }
+
     const videos = [];
 
     // Build list of seasons to fetch: include season 0 (Specials) if TMDB lists it
@@ -1751,11 +2115,14 @@ async function metaSeriesHandler(req, res) {
       poster:        series.poster_path   ? TMDB_IMG_MD + series.poster_path   : null,
       background:    series.backdrop_path ? TMDB_IMG_LG + series.backdrop_path : null,
       logo:          logo || undefined,
-      description:   series.overview, releaseInfo, videos,
+      description:   series.overview || '', releaseInfo, videos,
       runtime:       series.episode_run_time && series.episode_run_time[0] ? series.episode_run_time[0] + ' min' : null,
       genres:        (series.genres || []).map(g => g.name),
       imdbRating:    series.vote_average ? series.vote_average.toFixed(1) : null,
-      cast, certification: cert || null,
+      cast,
+      castWithImages: castWithImages || undefined,
+      trailers,
+      certification: cert || null,
       links: imdbId ? [{ name: 'IMDb', category: 'imdb', url: 'https://www.imdb.com/title/' + imdbId }] : [],
     }});
   } catch (e) {
@@ -2077,6 +2444,23 @@ function configurePage(existingConfig, isShared) {
       gap: 10px;
     }
     .edit-mode-banner strong { font-weight: 700; }
+
+    .site-banner {
+      background: rgba(240,192,64,0.07);
+      border: 1px solid rgba(240,192,64,0.2);
+      border-radius: 10px;
+      padding: 10px 16px;
+      margin-bottom: 1rem;
+      font-size: 0.8rem;
+      color: rgba(240,192,64,0.9);
+      display: none;
+      align-items: center;
+      gap: 8px;
+      line-height: 1.45;
+    }
+    .site-banner.visible { display: flex; }
+    .site-banner a { color: var(--gold); text-decoration: underline; text-underline-offset: 2px; }
+    .site-banner-icon { font-size: 0.9rem; flex-shrink: 0; }
 
     .card {
       background: var(--surface);
@@ -2459,6 +2843,57 @@ function configurePage(existingConfig, isShared) {
     "  }",
     "  // Always load boost gallery so it's ready (for edit/share mode)",
     "  loadBoostGallery();",
+    "  // Show 'Share Your Taste' card on start page if config has any content",
+    "  updateStartShareCard();",
+    "}",
+    "",
+    "function updateStartShareCard() {",
+    "  var card = document.getElementById('start-share-card'); if (!card) return;",
+    "  var hasContent = state.customSeasons.length > 0 || state.customCatalogs.length > 0;",
+    "  card.style.display = hasContent ? 'block' : 'none';",
+    "  if (!hasContent) return;",
+    "  // Build condensed summary",
+    "  var listCount = state.customSeasons.length;",
+    "  var showCount = new Set(state.customSeasons.map(function(l){return l.tmdbId;})).size;",
+    "  var enabledDefaultCount = DEFAULT_CATALOGS.filter(function(d){var ov=state.catalogEnabled[d.id];return ov!==undefined?ov:d.enabled;}).length;",
+    "  var customCatCount = state.customCatalogs.length;",
+    "  var topN = state.topN || 20;",
+    "  var summaryEl = document.getElementById('start-share-summary'); if (!summaryEl) return;",
+    "  summaryEl.innerHTML =",
+    "    '<div class=\"summary-row\" style=\"padding:6px 10px;font-size:0.76rem\"><span class=\"summary-label\">Default catalogs</span><span class=\"summary-value accent\">'+enabledDefaultCount+' enabled</span></div>'+",
+    "    (customCatCount > 0 ? '<div class=\"summary-row\" style=\"padding:6px 10px;font-size:0.76rem\"><span class=\"summary-label\">Custom catalogs</span><span class=\"summary-value accent\">'+customCatCount+'</span></div>' : '')+",
+    "    '<div class=\"summary-row\" style=\"padding:6px 10px;font-size:0.76rem\"><span class=\"summary-label\">Season Zero</span><span class=\"summary-value accent\">'+(state.showAutoSeason?'On \\u00b7 top '+topN:'Off')+'</span></div>'+",
+    "    (listCount > 0 ? '<div class=\"summary-row\" style=\"padding:6px 10px;font-size:0.76rem\"><span class=\"summary-label\">Curated lists</span><span class=\"summary-value accent\">'+listCount+' list'+(listCount!==1?'s':'')+' \\u00b7 '+showCount+' show'+(showCount!==1?'s':'')+'</span></div>' : '');",
+    "  // Episode parade",
+    "  var allThumbs = [];",
+    "  state.customSeasons.forEach(function(list){ list.episodes.forEach(function(ep){ allThumbs.push(ep.still||null); }); });",
+    "  var paradeEl = document.getElementById('start-share-preview-parade');",
+    "  if (paradeEl && allThumbs.length) {",
+    "    var thumbsHtml = allThumbs.concat(allThumbs).map(function(src){ return src ? '<img class=\"parade-thumb\" src=\"'+src+'\" alt=\"\" loading=\"lazy\" onload=\"this.style.opacity=\\'0.7\\'\" style=\"opacity:0\"/>' : '<div class=\"parade-thumb no-img\">&#127902;</div>'; }).join('');",
+    "    paradeEl.innerHTML = '<div class=\"ep-parade\" style=\"display:flex\"><div class=\"ep-parade-track\">'+thumbsHtml+'</div></div>';",
+    "    paradeEl.style.display = 'block';",
+    "  }",
+    "}",
+    "",
+    "async function buildStartShareLink() {",
+    "  var titleVal = (document.getElementById('start-share-title')||{value:''}).value.trim();",
+    "  var descVal  = (document.getElementById('start-share-desc')||{value:''}).value.trim();",
+    "  var shareCfg = buildConfigFlat(false);",
+    "  shareCfg._shareTitle = titleVal; shareCfg._shareDesc = descVal;",
+    "  try {",
+    "    var r = await fetch('/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(shareCfg)});",
+    "    var d = await r.json();",
+    "    if (!d.id){showToast('Share failed');return;}",
+    "    var shareUrl = window.location.origin+'/shared/'+d.id;",
+    "    var out = document.getElementById('start-share-url-out'); if(out){out.value=shareUrl;out.style.display='block';}",
+    "    var btn = document.getElementById('start-share-copy-btn'); if(btn){btn.style.display='inline-flex';}",
+    "  } catch(e){showToast('Share failed');}",
+    "}",
+    "function copyStartShareUrl(){",
+    "  var out=document.getElementById('start-share-url-out'); if(!out) return;",
+    "  out.select();",
+    "  try{document.execCommand('copy');}catch(e){navigator.clipboard&&navigator.clipboard.writeText(out.value);}",
+    "  showToast('Share link copied!');",
     "}",
     "",
     "// After loading existing config, fetch episode stills for all shows so thumbnails display",
@@ -3834,8 +4269,8 @@ function configurePage(existingConfig, isShared) {
     "  var customCatCount=state.customCatalogs.length;",
     "  document.getElementById('install-summary').innerHTML=",
     "    '<div class=\"summary-row\"><span class=\"summary-label\">Default catalogs</span><span class=\"summary-value accent\">'+enabledDefaultCount+' enabled</span></div>'+",
-    "    '<div class=\"summary-row\"><span class=\"summary-label\">Custom catalogs</span><span class=\"summary-value\">'+(customCatCount>0?customCatCount:'None')+'</span></div>'+",
-    "    '<div class=\"summary-row\"><span class=\"summary-label\">Season Zero</span><span class=\"summary-value\">'+(state.showAutoSeason?'On \u00b7 top '+state.topN:'Off')+'</span></div>'+",
+    "    '<div class=\"summary-row\"><span class=\"summary-label\">Custom catalogs</span><span class=\"summary-value accent\">'+(customCatCount>0?customCatCount:'None')+'</span></div>'+",
+    "    '<div class=\"summary-row\"><span class=\"summary-label\">Season Zero</span><span class=\"summary-value accent\">'+(state.showAutoSeason?'On \u00b7 top '+state.topN:'Off')+'</span></div>'+",
     "    '<div class=\"summary-row\" style=\"margin-bottom:1.4rem\"><span class=\"summary-label\">Curated lists</span><span class=\"summary-value accent\">'+(listCount>0?listCount+' list'+(listCount!==1?'s':'')+' across '+showCount+' show'+(showCount!==1?'s':''):'None')+'</span></div>';",
     "  var allThumbs=[];",
     "  state.customSeasons.forEach(function(list){ list.episodes.forEach(function(ep){ allThumbs.push(ep.still||null); }); });",
@@ -3997,7 +4432,7 @@ function configurePage(existingConfig, isShared) {
     "    var r=await fetch('/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(shareCfg)});",
     "    var d=await r.json();",
     "    if(!d.id){showToast('Share failed');return;}",
-    "    var shareUrl=window.location.origin+'/shared/'+d.id+'/configure';",
+    "    var shareUrl=window.location.origin+'/shared/'+d.id;",
     "    var out=document.getElementById('share-url-out'); if(out){out.value=shareUrl;out.style.display='block';}",
     "    var btn=document.getElementById('share-copy-btn'); if(btn){btn.style.display='inline-flex';}",
     "  } catch(e){showToast('Share failed');}",
@@ -4010,8 +4445,39 @@ function configurePage(existingConfig, isShared) {
     "}",
     "",
     // Init on page load — load existing config first so apiKey is available for hero backgrounds
+    // ── Site Banner (from GOODTASTE_BANNER env var) ──",
+    "async function loadSiteBanner() {",
+    "  try {",
+    "    var r = await fetch('/api/banner');",
+    "    var d = await r.json();",
+    "    if (!d.text) return;",
+    "    var bannerEl = document.getElementById('site-banner');",
+    "    var textEl   = document.getElementById('site-banner-text');",
+    "    if (!bannerEl || !textEl) return;",
+    "    textEl.innerHTML = d.url",
+    "      ? esc(d.text) + ' <a href=\"' + esc(d.url) + '\" target=\"_blank\" rel=\"noopener\">Learn more &rarr;</a>'",
+    "      : esc(d.text);",
+    "    bannerEl.classList.add('visible');",
+    "  } catch(e) {}",
+    "}",
+    "",
     "loadExistingConfig();",
     "loadHeroBackgrounds();",
+    "loadSiteBanner();",
+    "// Pre-fill API key from ?apiKey= query param (from shared landing page)",
+    "(function() {",
+    "  var params = new URLSearchParams(window.location.search);",
+    "  var qKey = params.get('apiKey');",
+    "  if (qKey) {",
+    "    var inp = document.getElementById('apiKey');",
+    "    if (inp && !inp.value) { inp.value = qKey; state.apiKey = qKey; }",
+    "    // Clean URL so key isn't visible in address bar",
+    "    if (window.history && window.history.replaceState) {",
+    "      var clean = window.location.pathname + window.location.hash;",
+    "      window.history.replaceState(null, '', clean);",
+    "    }",
+    "  }",
+    "})();",
   ].join('\n');
 
   const editModeBanner = isShared && shareTitle
@@ -4049,6 +4515,7 @@ function configurePage(existingConfig, isShared) {
   <!-- PAGE 1: Connect -->
   <div class="page active" id="page-1">
     ${editModeBanner}
+    <div class="site-banner" id="site-banner"><span class="site-banner-icon">&#128276;</span><span id="site-banner-text"></span></div>
     <div class="hero-wrap">
       <div class="hero-bg">
         <div class="hero-bg-row" id="hero-bg-row1"></div>
@@ -4068,6 +4535,29 @@ function configurePage(existingConfig, isShared) {
         </div>
       </div>
     </div>
+
+    <!-- Share Your Taste card — only visible when a config is loaded -->
+    <div class="card" id="start-share-card" style="display:none;margin-bottom:1rem">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:0.8rem">
+        <div style="font-size:1.3rem">🔗</div>
+        <div>
+          <div style="font-size:0.88rem;font-weight:700;color:#fff">Share Your Taste <span style="display:inline-flex;align-items:center;background:rgba(240,192,64,0.1);border:1px solid rgba(240,192,64,0.3);color:var(--gold);font-size:0.52rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;padding:1px 5px;border-radius:3px;vertical-align:middle;margin-left:4px">NEW</span></div>
+          <div style="font-size:0.75rem;color:var(--text-mute);margin-top:2px">Share your config with friends — they add their own API key</div>
+        </div>
+      </div>
+      <div id="start-share-preview-parade" style="display:none;margin-bottom:0.8rem"></div>
+      <div id="start-share-summary" style="margin-bottom:0.8rem"></div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+        <input type="text" id="start-share-title" placeholder="Give your config a name (optional)" style="flex:1;min-width:160px;font-size:0.82rem"/>
+        <input type="text" id="start-share-desc" placeholder="Short description (optional)" style="flex:1;font-size:0.82rem"/>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-ghost btn-sm" onclick="buildStartShareLink()">&#128279; Generate Share Link</button>
+        <button class="btn btn-ghost btn-sm" id="start-share-copy-btn" onclick="copyStartShareUrl()" style="display:none">Copy Link</button>
+      </div>
+      <input type="text" id="start-share-url-out" readonly style="display:none;margin-top:10px;font-size:0.7rem;color:var(--text-mute);font-family:DM Mono,monospace"/>
+    </div>
+
     <div class="card">
       <div class="card-eyebrow">Step 1 of 4</div>
       <div class="card-title">Connect to TMDB</div>
