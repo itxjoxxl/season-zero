@@ -2775,8 +2775,8 @@ function configurePage(existingConfig, isShared) {
     "  var cfg = EXISTING_CONFIG;",
     "  state.apiKey = cfg.tmdbApiKey || '';",
     "  state.topN = cfg.topN || 20;",
-    "  state.showAutoSeason = !!cfg.showAutoSeason;
-  state.patchBestOf = !!cfg.patchBestOf;",
+    "  state.showAutoSeason = !!cfg.showAutoSeason;",
+    "  state.patchBestOf = !!cfg.patchBestOf;",
     "  state.customSeasons = cfg.customSeasons || [];",
     "  state.catalogEnabled = cfg.catalogEnabled || {};",
     "  state.catalogNames = cfg.catalogNames || {};",
@@ -4204,8 +4204,8 @@ function configurePage(existingConfig, isShared) {
     "",
     "function buildInstallPage() {",
     "  state.topN=parseInt(document.getElementById('topN').value)||20;",
-    "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;
-  state.patchBestOf=document.getElementById('patchBestOf').checked;",
+    "  state.showAutoSeason=document.getElementById('showAutoSeason').checked;",
+    "  state.patchBestOf=document.getElementById('patchBestOf').checked;",
     "  var manifestUrlEl=document.getElementById('manifest-url');",
     "  var editUrlEl=document.getElementById('edit-url');",
     "  // Immediate fallback: uncompressed inline base64 (with key, legacy format)",
